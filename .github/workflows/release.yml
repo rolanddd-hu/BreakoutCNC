@@ -1,0 +1,70 @@
+name: Release
+
+# Push a version tag to publish a GitHub Release with the Windows zip:
+#   git tag v0.1 && git push origin v0.1
+# The tag must match project(VERSION ...) in CMakeLists.txt; the release notes come from CHANGELOG.md.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -B build -A x64
+
+      - name: Check tag matches the CMake version
+        shell: bash
+        run: |
+          version=$(grep -m1 -o 'BREAKOUTCNC_VERSION_STRING "[^"]*"' build/generated/breakout_version.h | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match project version $version in CMakeLists.txt"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Script engine tests
+        working-directory: build/Release
+        run: ./script_engine_test
+
+      - name: Huanyang VFD tests
+        working-directory: build/Release
+        run: ./huanyang_vfd_test
+
+      - name: Package
+        run: cmake --build build --config Release --target package
+
+      - name: Release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          # The "## <version> ..." section, up to the next "## " heading
+          awk -v v="$VERSION" '
+            /^## / { if (found) exit; if ($2 == v) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## $VERSION' section"
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "build/BreakoutCNC-$VERSION-win64.zip" \
+            --title "BreakoutCNC $VERSION" \
+            --notes-file release_notes.md \
+            --verify-tag

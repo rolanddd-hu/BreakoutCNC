@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            # Multi-config generator: binaries land in build/Release
+            bin_dir: build/Release
+          - name: Linux
+            os: ubuntu-latest
+            bin_dir: build
+          - name: macOS
+            os: macos-latest
+            bin_dir: build
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols libgl-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -B build -A x64
+
+      - name: Configure (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # The tests load scripts/ relative to the working directory, which CMake copies next to the binaries.
+      # They never touch hardware (rnr_hid_test is a hardware tool and is not run here).
+      - name: Script engine tests
+        working-directory: ${{ matrix.bin_dir }}
+        run: ./script_engine_test
+
+      - name: Huanyang VFD tests
+        working-directory: ${{ matrix.bin_dir }}
+        run: ./huanyang_vfd_test
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --target package
+
+      - name: Upload release zip
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: BreakoutCNC-win64
+          path: build/BreakoutCNC-*-win64.zip
+          if-no-files-found: error

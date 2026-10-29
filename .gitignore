@@ -1,0 +1,30 @@
+# Build output
+/build/
+/out/
+/cmake-build-*/
+CMakeUserPresets.json
+
+# IDE / editor
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+
+# Runtime files written next to the executables
+imgui.ini
+*_settings.ini
+*_settings.ini.bak
+*_settings.ini.tmp
+
+# Local AI session log (see AGENTS.md)
+/WORKFLOW_STATUS.md
+
+# Vendor binaries, decompilations and personal machine profiles never go into the repository
+*.dll
+*.exe
+*.zip
+*.dat
+*_decompiled.c
+*.asm
+/docs/Mach3*.xml
