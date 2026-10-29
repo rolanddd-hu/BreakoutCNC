@@ -306,7 +306,16 @@ void MachineController::applyConfig(const MachineConfig& cfg) {
     reparseLoadedProgramIfNeeded();
 }
 
-void MachineController::reparseLoadedProgramIfNeeded() {
+void MachineController::reparseLoadedProgramIfNeeded(bool wait) {
+    // A caller that waits (applyConfig) only returns once the program matches the new configuration, even
+    // when the worker thread had already started the re-parse
+    std::unique_lock<std::mutex> reparse_lock(reparse_mutex_, std::defer_lock);
+    if (wait) {
+        reparse_lock.lock();
+    } else if (!reparse_lock.try_lock()) {
+        return;
+    }
+
     std::shared_ptr<const std::string> text;
     gcode::ParseOptions opts;
     std::array<double, 4> work_offset{};
@@ -3938,8 +3947,9 @@ void MachineController::workerLoop() {
             telemetry_.commanded_feed_mm_min = base_cmd_feed * (telemetry_.feed_override_pct / 100.0);
         }
 
-        // A deferred configuration change may require re-parsing the loaded program (outside the lock)
-        reparseLoadedProgramIfNeeded();
+        // A deferred configuration change may require re-parsing the loaded program (outside the lock).
+        // Never blocks the tick: if a re-parse is already running, the flag is checked again next tick.
+        reparseLoadedProgramIfNeeded(false);
 
         // Never "catch up" with a burst of ticks after a stall
         const auto now = Clock::now();

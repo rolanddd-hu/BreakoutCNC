@@ -193,7 +193,8 @@ private:
     void refillJobQueueLocked();
     void replanFromQueueTailLocked();
     void setProgramLocked(std::shared_ptr<const gcode::ParseResult> program);
-    void reparseLoadedProgramIfNeeded(); // Takes the lock itself; parses outside it
+    // Takes the lock itself; parses outside it. wait = false (worker tick): skip if another re-parse is running
+    void reparseLoadedProgramIfNeeded(bool wait = true);
 
     // Homing
     void startNextHomingAxisLocked();
@@ -209,6 +210,8 @@ private:
     void continueHoleCenterLocked();
 
     mutable std::mutex mutex_;
+    // Serializes program re-parses so a slower, older one can never replace a newer result; taken before mutex_
+    std::mutex reparse_mutex_;
     MachineConfig config_{};
     MachineConfig pending_config_{};
     bool          has_pending_config_ = false;

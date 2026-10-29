@@ -3,6 +3,11 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## Unreleased
+
+- Fixed: after a settings change that re-checks the loaded program (tool length mode, G4 dwell units), the program
+  could keep its old warnings / dwell times when the controller's background thread re-parsed it at the same time.
+
 ## 0.1 - first public release (GPL-3.0-or-later)
 
 First public release. Experimental: test carefully on your own machine before trusting it with real work.
