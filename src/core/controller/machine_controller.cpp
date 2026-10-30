@@ -59,6 +59,12 @@ void sanitizeConfig(MachineConfig& c) {
     if (c.probe.probe_pin > 12) c.probe.probe_pin = 0;
     c.spindle_ramp_up_s   = std::clamp(std::isfinite(c.spindle_ramp_up_s) ? c.spindle_ramp_up_s : 0.0, 0.0, 30.0);
     c.spindle_ramp_down_s = std::clamp(std::isfinite(c.spindle_ramp_down_s) ? c.spindle_ramp_down_s : 0.0, 0.0, 30.0);
+    if (!c.is_mill) {
+        // A torch / laser switches instantly: a spin-down delay (e.g. imported from a Mach3 profile) would keep
+        // OUT1 on after M5 and ramp the PWM output with spindle RPM values
+        c.spindle_ramp_up_s   = 0.0;
+        c.spindle_ramp_down_s = 0.0;
+    }
     if (c.vfd.max_rpm == 0) c.vfd.max_rpm = 24000;
     if (c.vfd.min_rpm > c.vfd.max_rpm) c.vfd.min_rpm = c.vfd.max_rpm;
     if (!(c.vfd.max_freq_hz > 0.0f)) c.vfd.max_freq_hz = 400.0f;
@@ -1190,10 +1196,12 @@ void MachineController::setSpindleSpeedRpm(uint32_t rpm) {
 
     // 0-1000 duty cycle for the 0-10V AVI output on the RnR USB board
     target_spindle_pwm_duty_    = rpmToDuty(clamped_rpm, max_limit);
-    telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
-
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+    // BreakoutCut: the PWM output is the laser power, set only by the laser code (never from an RPM)
+    if (config_.is_mill) {
+        telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
+        if (board_->isOpen() && !telemetry_.simulator_mode) {
+            board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+        }
     }
     if (config_.vfd.enabled) {
         vfd_controller_.setRpm(clampRpm(clamped_rpm));
@@ -1207,10 +1215,12 @@ void MachineController::resetSpindleSpeedOverride() {
 
     const uint32_t max_limit = (config_.vfd.enabled && config_.vfd.max_rpm > 0) ? config_.vfd.max_rpm : 24000;
     target_spindle_pwm_duty_    = rpmToDuty(telemetry_.commanded_spindle_rpm, max_limit);
-    telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
-
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+    // BreakoutCut: the PWM output is the laser power, set only by the laser code (never from an RPM)
+    if (config_.is_mill) {
+        telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
+        if (board_->isOpen() && !telemetry_.simulator_mode) {
+            board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+        }
     }
     if (config_.vfd.enabled) {
         vfd_controller_.setRpm(telemetry_.commanded_spindle_rpm);
@@ -2216,7 +2226,7 @@ bool MachineController::loadGCodeString(const std::string& gcode_text) {
             telemetry_.spindle_override_active = false;
             const uint32_t max_rpm = (config_.vfd.enabled && config_.vfd.max_rpm > 0) ? config_.vfd.max_rpm : 24000;
             target_spindle_pwm_duty_ = rpmToDuty(seg.spindle_rpm, max_rpm);
-            telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
+            if (config_.is_mill) telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
             if (config_.vfd.enabled) {
                 vfd_controller_.setRpm(seg.spindle_rpm);
             }
@@ -2393,9 +2403,11 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
         telemetry_.spindle_override_active = false;
         const uint32_t max_rpm = (config_.vfd.enabled && config_.vfd.max_rpm > 0) ? config_.vfd.max_rpm : 24000;
         target_spindle_pwm_duty_ = rpmToDuty(rpm, max_rpm);
-        telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
-        if (board_->isOpen() && !telemetry_.simulator_mode) {
-            board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+        if (config_.is_mill) { // BreakoutCut: S is laser power, applied by the laser code, not a PWM duty
+            telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
+            if (board_->isOpen() && !telemetry_.simulator_mode) {
+                board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+            }
         }
         if (config_.vfd.enabled) {
             vfd_controller_.setRpm(rpm);
@@ -2687,7 +2699,7 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
             telemetry_.commanded_spindle_rpm = target_spindle_rpm;
             const uint32_t max_rpm = (config_.vfd.enabled && config_.vfd.max_rpm > 0) ? config_.vfd.max_rpm : 24000;
             target_spindle_pwm_duty_ = rpmToDuty(target_spindle_rpm, max_rpm);
-            telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
+            if (config_.is_mill) telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
             if (config_.vfd.enabled) {
                 vfd_controller_.setRpm(target_spindle_rpm);
             }
@@ -3607,7 +3619,7 @@ bool MachineController::sendQueuedSliceLocked() {
             telemetry_.commanded_spindle_rpm = next_slice.spindle_rpm;
             const uint32_t max_rpm = (config_.vfd.enabled && config_.vfd.max_rpm > 0) ? config_.vfd.max_rpm : 24000;
             target_spindle_pwm_duty_ = rpmToDuty(next_slice.spindle_rpm, max_rpm);
-            telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
+            if (config_.is_mill) telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
             if (config_.vfd.enabled) {
                 vfd_controller_.setRpm(next_slice.spindle_rpm);
             }

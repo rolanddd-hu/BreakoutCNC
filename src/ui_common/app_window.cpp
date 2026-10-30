@@ -224,6 +224,10 @@ static void fitWindowToWorkArea(GLFWwindow* window);
 AppWindow::AppWindow(const std::string& title, int width, int height)
     : title_(title), saved_window_w_(width), saved_window_h_(height)
 {
+    // Visible in a terminal (Linux / macOS) or the CI log when the window or OpenGL context cannot be created
+    glfwSetErrorCallback([](int code, const char* description) {
+        std::fprintf(stderr, "GLFW error %d: %s\n", code, description ? description : "");
+    });
     if (!glfwInit()) {
         return;
     }
@@ -386,6 +390,27 @@ AppWindow::AppWindow(const std::string& title, int width, int height)
                 }
             }
         }
+    });
+    glfwSetDropCallback(window_, [](GLFWwindow* win, int count, const char** paths) {
+        auto* self = static_cast<AppWindow*>(glfwGetWindowUserPointer(win));
+        if (!self || !self->on_file_dropped_ || count < 1 || !paths[0]) return;
+        std::string path = paths[0]; // Only one program can be loaded: the first file wins
+#ifdef _WIN32
+        // GLFW gives UTF-8; std::ifstream(std::string) and the file dialog use the ANSI code page
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, paths[0], -1, nullptr, 0);
+        if (wlen > 0) {
+            std::wstring wide(static_cast<size_t>(wlen), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, paths[0], -1, wide.data(), wlen);
+            const int alen = WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (alen > 0) {
+                std::string ansi(static_cast<size_t>(alen), '\0');
+                WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, ansi.data(), alen, nullptr, nullptr);
+                ansi.resize(static_cast<size_t>(alen) - 1);
+                path = std::move(ansi);
+            }
+        }
+#endif
+        self->on_file_dropped_(path);
     });
 }
 

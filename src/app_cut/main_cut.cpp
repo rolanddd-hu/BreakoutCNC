@@ -6,6 +6,7 @@
 #include "ui_common/dro_panel.h"
 #include "ui_common/io_status_bar.h"
 #include "ui_common/gcode_panel.h"
+#include "ui_common/app_dir.h"
 #include "ui_common/scripting_panel.h"
 #include "ui_common/workspace_panel.h"
 #include "ui_common/file_dialog.h"
@@ -24,7 +25,12 @@
 
 using namespace rnr;
 
-int main(int /*argc*/, char** /*argv*/) {
+int main(int argc, char** argv) {
+    // Before anything reads the settings file, scripts/ or resources/ (all next to the executable)
+    const std::string arg_file = ui::enterExecutableDirectory(argc, argv);
+    // --smoke-test (CI): never touch USB devices (simulator), run the demo job briefly, exit without saving
+    const bool smoke_test = ui::hasCommandLineFlag(argc, argv, "--smoke-test");
+    if (smoke_test) core::RnRController::setHardwareAccessEnabled(false);
     const std::string settings_file = "breakout_cut_settings.ini";
     config::PersistentSettings saved_settings{};
 
@@ -177,15 +183,10 @@ int main(int /*argc*/, char** /*argv*/) {
     if (!saved_settings.ui.last_gcode_file_path.empty() &&
         std::filesystem::exists(saved_settings.ui.last_gcode_file_path))
     {
-        std::ifstream ifs(saved_settings.ui.last_gcode_file_path);
-        if (ifs) {
-            std::ostringstream ss;
-            ss << ifs.rdbuf();
-            if (controller.loadGCodeString(ss.str())) {
-                loaded_filename     = saved_settings.ui.last_gcode_file_path;
-                persisted_file_path = saved_settings.ui.last_gcode_file_path;
-            }
-        }
+        // Parsed in the background on the first frame, so the window appears right away; remembered even if
+        // the app is closed before the parse finishes
+        persisted_file_path = saved_settings.ui.last_gcode_file_path;
+        gcode_panel.queueFileToLoad(persisted_file_path, false);
     }
 
     const auto initial_program = controller.getProgram();
@@ -197,6 +198,7 @@ int main(int /*argc*/, char** /*argv*/) {
     controller.setOperationMode(current_op_mode);
 
     auto saveCurrentSettings = [&]() {
+        if (smoke_test) return; // A smoke test never changes the settings next to the executable
         const auto tel = controller.getTelemetry();
         saved_settings.machine = controller.getConfig();
         window.getWindowGeometry(
@@ -273,8 +275,10 @@ int main(int /*argc*/, char** /*argv*/) {
         saved_settings.machine.operation_mode = new_mode;
         controller.setOperationMode(new_mode);
         updateWindowCaptionForMode(new_mode);
-        // Swap the built-in demo to the one for the new mode; a user's own program stays loaded
-        if ((loaded_filename == kPlasmaDemoName || loaded_filename == kLaserDemoName) &&
+        // Swap the built-in demo to the one for the new mode; a user's own program stays loaded (also one that
+        // is still being parsed in the background)
+        if (!gcode_panel.isLoading() && persisted_file_path.empty() &&
+            (loaded_filename == kPlasmaDemoName || loaded_filename == kLaserDemoName) &&
             loadDemoProgram(new_mode, loaded_filename))
         {
             const auto prog = controller.getProgram();
@@ -299,6 +303,12 @@ int main(int /*argc*/, char** /*argv*/) {
         markSettingsDirty();
     });
 
+    // A G-code file given on the command line ("Open with" / double-click) or dropped onto the window
+    if (!arg_file.empty()) {
+        gcode_panel.queueFileToLoad(arg_file);
+    }
+    window.setOnFileDropped([&](const std::string& path) { gcode_panel.queueFileToLoad(path); });
+
     bool show_exit_confirm_modal = false;
     bool force_close = false;
     window.setCloseInterceptor(
@@ -320,7 +330,23 @@ int main(int /*argc*/, char** /*argv*/) {
         saveCurrentSettings();
     });
 
+    if (smoke_test) ImGui::GetIO().IniFilename = nullptr; // No imgui.ini either
+    int  smoke_frames = 0;
+    bool smoke_failed = false;
+
     int exit_code = window.runLoop([&]() {
+        if (smoke_test) {
+            ++smoke_frames;
+            if (smoke_frames == 10 && controller.resetFromEStop()) controller.startJob();
+            if (smoke_frames == 240) { // ~4 s at 60 FPS
+                const auto t = controller.getTelemetry();
+                smoke_failed = (t.active_segment_index == 0);
+                std::printf("Smoke test %s: %d frames, demo job at segment %zu\n", smoke_failed ? "FAILED" : "passed",
+                            smoke_frames, t.active_segment_index);
+                std::fflush(stdout);
+                window.closeWindow();
+            }
+        }
         // Global keyboard E-Stop: ESC always halts the machine, whatever has keyboard focus
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             controller.triggerEStop();
@@ -434,15 +460,14 @@ int main(int /*argc*/, char** /*argv*/) {
                 loaded_filename,
                 parse_res.pierce_count,
                 parse_res.total_cut_length_mm,
-                [&](const std::string& path, const std::string& content) {
-                    if (controller.loadGCodeString(content)) {
-                        loaded_filename     = path;
-                        persisted_file_path = path;
-                        const auto pr_ptr = controller.getProgram();
-                        const auto& pr = *pr_ptr;
-                        viewport.fitToBounds(pr.bbox_min_mm, pr.bbox_max_mm);
-                        markSettingsDirty();
-                    }
+                [&](const std::string& path, const std::string& /*content*/) {
+                    // Called once the panel has loaded the program (parsed on a background thread)
+                    loaded_filename     = path;
+                    persisted_file_path = path;
+                    const auto pr_ptr = controller.getProgram();
+                    const auto& pr = *pr_ptr;
+                    viewport.fitToBounds(pr.bbox_min_mm, pr.bbox_max_mm);
+                    markSettingsDirty();
                 });
             ImGui::EndChild();
 
@@ -1993,5 +2018,5 @@ int main(int /*argc*/, char** /*argv*/) {
     // Ensure E-Stop is engaged and automatically persist all settings on exit
     controller.triggerEStop();
     saveCurrentSettings();
-    return exit_code;
+    return smoke_failed ? 2 : exit_code;
 }

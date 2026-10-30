@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 # Release version: the single place to change it (window titles and .exe file properties use it)
-project(BreakoutCNC VERSION 0.2 LANGUAGES C CXX)
+project(BreakoutCNC VERSION 0.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -145,6 +145,8 @@ endif()
 # 5. Shared UI Components (rnr_ui_common)
 add_library(rnr_ui_common STATIC
     src/ui_common/app_window.cpp
+    src/ui_common/app_dir.cpp
+    src/ui_common/diagnostics_report.cpp
     src/ui_common/toolpath_viewport.cpp
     src/ui_common/dro_panel.cpp
     src/ui_common/io_status_bar.cpp
@@ -231,18 +233,33 @@ add_dependencies(BreakoutMill deploy_scripts deploy_resources)
 add_dependencies(BreakoutCut deploy_scripts deploy_resources)
 
 # 10. Release package: cmake --build build --config Release --target package -> build/BreakoutCNC-<version>-win64.zip
+#     (Linux / macOS: a .tar.gz, see the CPack settings below)
 # Only what end users need: no test / diagnostic executables, settings files or libraries.
 install(TARGETS BreakoutMill BreakoutCut RUNTIME DESTINATION .)
 install(DIRECTORY scripts/ DESTINATION scripts)
 install(DIRECTORY resources/icons/ DESTINATION resources/icons)
 install(FILES README.md LICENSE CHANGELOG.md THIRD_PARTY_NOTICES.md DESTINATION .)
-install(FILES docs/HARDWARE_VALIDATION_CHECKLIST.md DESTINATION docs)
+install(FILES docs/HARDWARE_VALIDATION_CHECKLIST.md docs/USER_GUIDE.md DESTINATION docs)
+install(DIRECTORY docs/images/ DESTINATION docs/images) # Screenshots used by the user guide
 
-set(CPACK_GENERATOR ZIP)
 set(CPACK_PACKAGE_NAME BreakoutCNC)
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 if(WIN32)
+    set(CPACK_GENERATOR ZIP)
     set(CPACK_SYSTEM_NAME win64)
+else()
+    # .tar.gz keeps the executables' permission bits (-> BreakoutCNC-<version>-linux-x86_64.tar.gz / -macos.tar.gz)
+    set(CPACK_GENERATOR TGZ)
+    if(APPLE)
+        list(LENGTH CMAKE_OSX_ARCHITECTURES _osx_arch_count)
+        if(_osx_arch_count GREATER 1)
+            set(CPACK_SYSTEM_NAME macos-universal)
+        else()
+            set(CPACK_SYSTEM_NAME macos-${CMAKE_SYSTEM_PROCESSOR})
+        endif()
+    else()
+        set(CPACK_SYSTEM_NAME linux-${CMAKE_SYSTEM_PROCESSOR})
+    endif()
 endif()
 set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_SYSTEM_NAME}")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)

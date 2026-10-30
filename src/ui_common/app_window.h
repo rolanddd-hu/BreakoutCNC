@@ -53,6 +53,9 @@ public:
     void setOnCloseCallback(std::function<void()> on_close) { on_close_callback_ = std::move(on_close); }
     void closeWindow() noexcept;
 
+    // A file dropped onto the window (path in the same encoding std::ifstream / the file dialog use)
+    void setOnFileDropped(std::function<void(const std::string&)> on_drop) { on_file_dropped_ = std::move(on_drop); }
+
     const std::string& getTitle() const noexcept { return title_; }
     void setTitle(const std::string& title);
 
@@ -78,6 +81,7 @@ private:
     std::function<bool()> can_close_predicate_;
     std::function<void()> on_close_blocked_;
     std::function<void()> on_close_callback_;
+    std::function<void(const std::string&)> on_file_dropped_;
     static ImFont* s_gcode_font_;
     static ImFont* s_dro_font_;
     static ImFont* s_badge_font_top_;

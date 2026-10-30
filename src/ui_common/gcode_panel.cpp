@@ -23,7 +23,7 @@ void GCodeProgramPanel::render(
     perf::ScopedTimer perf_timer("G-code list + cycle buttons");
     const auto program = controller.getProgram(); // Snapshot stays valid even if a new file is loaded meanwhile
     const auto& gcode_lines = program->lines;
-    updateLineNumberCache(gcode_lines, loaded_filename);
+    updateLineNumberCache(gcode_lines);
     const bool is_running = (telemetry.state == core::ControllerState::RunningGCode ||
                              telemetry.state == core::ControllerState::DwellPierce);
 
@@ -57,21 +57,10 @@ void GCodeProgramPanel::render(
                     const bool is_cutting = (telemetry.state == core::ControllerState::RunningGCode ||
                                              telemetry.state == core::ControllerState::DwellPierce);
                     if (!is_cutting) {
-                        std::ifstream ifs(active_file_path_);
-                        if (ifs) {
-                            std::ostringstream ss;
-                            ss << ifs.rdbuf();
-                            std::string new_content = ss.str();
-                            if (!new_content.empty()) {
-                                last_file_write_time_ = cur_time;
-                                if (on_file_approved_) {
-                                    on_file_approved_(active_file_path_, new_content);
-                                    selected_line_           = 0;
-                                    prev_active_line_        = 0;
-                                    scroll_to_top_requested_ = true;
-                                }
-                            }
-                        }
+                        // Re-read and parsed on the worker; an empty (half-saved) file fails to load and leaves
+                        // the current program in place
+                        last_file_write_time_ = cur_time;
+                        requestLoadFile(active_file_path_, false);
                     }
                 }
             }
@@ -140,11 +129,18 @@ void GCodeProgramPanel::render(
         std::filesystem::path p(loaded_filename);
         display_filename = p.filename().string();
     }
-    ImGui::TextDisabled("Next:#%04zu | %s (%zu pierces, %.0fmm)",
-                        telemetry.active_gcode_line_index + 1,
-                        display_filename.empty() ? "(none)" : display_filename.c_str(),
-                        pierce_count,
-                        total_cut_length_mm);
+    if (isLoading()) {
+        // Short text on purpose: this line shares the row with the cycle buttons and does not wrap
+        // load_job_.path is never written by the worker, so reading it here is safe
+        const std::string loading_name = std::filesystem::path(load_job_.path).filename().string();
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f), "Loading %s...", loading_name.c_str());
+    } else {
+        ImGui::TextDisabled("Next:#%04zu | %s (%zu pierces, %.0fmm)",
+                            telemetry.active_gcode_line_index + 1,
+                            display_filename.empty() ? "(none)" : display_filename.c_str(),
+                            pierce_count,
+                            total_cut_length_mm);
+    }
 
     // 1b. Prominent Manual Tool Change (M6) Prompt Banner when waiting for operator tool change
     if (is_tool_change) {
@@ -324,9 +320,7 @@ void GCodeProgramPanel::render(
                 controller.setNextGCodeLine(i);
             }
 
-            const auto& pld = (i < parsed_display_lines_.size())
-                                  ? parsed_display_lines_[i]
-                                  : ParsedLineDisplay{};
+            const ParsedLineDisplay pld = formatLine(gcode_lines[i], i);
 
             // 2b. Line Number Column (distinct color from G-code command)
             char num_buf[32];
@@ -463,9 +457,101 @@ void GCodeProgramPanel::render(
     const std::function<void(const std::string& path, const std::string& content)>& on_file_approved)
 {
     on_file_approved_ = on_file_approved;
+    controller_ = &controller;
+    pollBackgroundLoad();
+    if (!queued_file_path_.empty()) {
+        const std::string path = std::move(queued_file_path_);
+        queued_file_path_.clear();
+        requestLoadFile(path, queued_file_check_);
+    }
     render(controller, telemetry, loaded_filename, pierce_count, total_cut_length_mm, [this]() {
         promptLoadFileDialog(on_file_approved_);
     });
+}
+
+GCodeProgramPanel::~GCodeProgramPanel() {
+    if (load_thread_.joinable()) load_thread_.join(); // Closing during a load: let the parse finish
+}
+
+void GCodeProgramPanel::requestLoad(const std::string& path, std::string content) {
+    LoadJob job;
+    job.path    = path;
+    job.content = std::move(content);
+    startLoadJob(std::move(job));
+}
+
+void GCodeProgramPanel::requestLoadFile(const std::string& path, bool check_machine_type) {
+    LoadJob job;
+    job.path               = path;
+    job.read_file          = true;
+    job.check_machine_type = check_machine_type;
+    startLoadJob(std::move(job));
+}
+
+void GCodeProgramPanel::startLoadJob(LoadJob job) {
+    if (!controller_) return;
+    if (load_thread_.joinable()) {
+        has_next_load_ = true; // The newest request wins
+        next_load_job_ = std::move(job);
+        return;
+    }
+    load_job_      = std::move(job);
+    load_ok_       = false;
+    load_mismatch_ = false;
+    load_done_.store(false);
+    // The worker only touches load_job_ / load_ok_ / load_mismatch_ / load_check_ until it sets load_done_.
+    // loadGCodeString() parses without holding the controller lock and refuses while a job runs.
+    load_thread_ = std::thread([this, ctrl = controller_, machine_type = machine_type_] {
+        auto& j = load_job_;
+        bool readable = true;
+        if (j.read_file) {
+            std::ifstream ifs(j.path); // Same as the Load File dialog: an unreadable file is ignored
+            if (ifs) {
+                std::ostringstream ss;
+                ss << ifs.rdbuf();
+                j.content = ss.str();
+            } else {
+                readable = false;
+            }
+        }
+        if (readable && j.check_machine_type) {
+            load_check_    = gcode::GCodeParser::checkMachineCompatibility(j.content, machine_type);
+            load_mismatch_ = load_check_.has_mismatch;
+        }
+        if (readable && !load_mismatch_) {
+            load_ok_ = ctrl->loadGCodeString(j.content);
+        }
+        load_done_.store(true, std::memory_order_release);
+    });
+}
+
+void GCodeProgramPanel::pollBackgroundLoad() {
+    if (!load_thread_.joinable() || !load_done_.load(std::memory_order_acquire)) return;
+    load_thread_.join();
+    if (load_mismatch_) {
+        // Same dialog as a mismatching file from Load File: "Load File Anyway" loads it without the check
+        pending_file_path_    = load_job_.path;
+        pending_file_content_ = std::move(load_job_.content);
+        pending_mismatch_     = load_check_;
+        show_mismatch_modal_  = true;
+    } else if (load_ok_) {
+        if (load_job_.read_file) {
+            active_file_path_ = load_job_.path; // Watched for external edits like any loaded file
+            std::error_code ec;
+            last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
+            has_file_write_time_  = !ec;
+        }
+        if (on_file_approved_) on_file_approved_(load_job_.path, load_job_.content);
+        selected_line_           = 0;
+        prev_active_line_        = 0;
+        scroll_to_top_requested_ = true;
+    }
+    load_job_ = LoadJob{};
+    if (has_next_load_) {
+        has_next_load_ = false;
+        startLoadJob(std::move(next_load_job_));
+        next_load_job_ = LoadJob{};
+    }
 }
 
 void GCodeProgramPanel::promptLoadFileDialog(
@@ -474,15 +560,7 @@ void GCodeProgramPanel::promptLoadFileDialog(
     on_file_approved_ = on_file_approved;
     std::string path = ui::openGCodeFileDialog();
     if (path.empty()) return;
-
-    std::ifstream ifs(path);
-    if (!ifs) return;
-
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    std::string content = ss.str();
-
-    checkAndPromptGCodeFile(path, content, on_file_approved);
+    requestLoadFile(path, true); // Read, machine-type check and parse on the worker thread
 }
 
 void GCodeProgramPanel::checkAndPromptGCodeFile(
@@ -497,12 +575,7 @@ void GCodeProgramPanel::checkAndPromptGCodeFile(
         std::error_code ec;
         last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
         has_file_write_time_ = !ec;
-        if (on_file_approved_) {
-            on_file_approved_(file_path, gcode_content);
-            selected_line_           = 0;
-            prev_active_line_        = 0;
-            scroll_to_top_requested_ = true;
-        }
+        requestLoad(file_path, gcode_content);
     } else {
         pending_file_path_    = file_path;
         pending_file_content_ = gcode_content;
@@ -832,12 +905,7 @@ void GCodeProgramPanel::renderMismatchModal() {
             std::error_code ec;
             last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
             has_file_write_time_ = !ec;
-            if (on_file_approved_) {
-                on_file_approved_(pending_file_path_, pending_file_content_);
-                selected_line_           = 0;
-                prev_active_line_        = 0;
-                scroll_to_top_requested_ = true;
-            }
+            requestLoad(pending_file_path_, std::move(pending_file_content_));
             pending_file_path_.clear();
             pending_file_content_.clear();
             ImGui::CloseCurrentPopup();
@@ -883,70 +951,65 @@ float GCodeProgramPanel::calculateDesiredHeight(float max_available_h, bool is_t
     return non_scroll_h + exact_scroll_h;
 }
 
-void GCodeProgramPanel::updateLineNumberCache(const std::vector<std::string>& gcode_lines, const std::string& filename) {
-    if (gcode_lines.size() == last_parsed_lines_count_ && filename == last_parsed_filename_ && !parsed_display_lines_.empty()) {
+namespace {
+// Position of the digits of a leading "N<digits>" word (e.g. N100), or npos
+size_t fileLineNumberDigits(const std::string& line, size_t& end_digit) {
+    const size_t idx = line.find_first_not_of(" \t");
+    if (idx == std::string::npos || (line[idx] != 'N' && line[idx] != 'n')) return std::string::npos;
+    size_t d_idx = idx + 1;
+    while (d_idx < line.size() && (line[d_idx] == ' ' || line[d_idx] == '\t')) d_idx++;
+    if (d_idx >= line.size() || !std::isdigit(static_cast<unsigned char>(line[d_idx]))) return std::string::npos;
+    end_digit = d_idx;
+    while (end_digit < line.size() && std::isdigit(static_cast<unsigned char>(line[end_digit]))) end_digit++;
+    return d_idx;
+}
+} // namespace
+
+GCodeProgramPanel::ParsedLineDisplay GCodeProgramPanel::formatLine(const std::string& raw, size_t index) const {
+    ParsedLineDisplay pld;
+    if (has_file_line_numbers_) {
+        size_t end_digit = 0;
+        const size_t d_idx = fileLineNumberDigits(raw, end_digit);
+        if (d_idx != std::string::npos) {
+            pld.line_num_str = "N" + raw.substr(d_idx, end_digit - d_idx);
+            const size_t rest_idx = raw.find_first_not_of(" \t", end_digit);
+            pld.command_str = (rest_idx != std::string::npos) ? raw.substr(rest_idx) : "";
+        } else {
+            pld.command_str = raw;
+        }
+    } else {
+        char buf[24]; // fits any size_t
+        std::snprintf(buf, sizeof(buf), "%04zu", index + 1);
+        pld.line_num_str = buf;
+        pld.command_str  = raw;
+    }
+    const size_t semi  = pld.command_str.find(';');
+    const size_t paren = pld.command_str.find('(');
+    pld.comment_pos = std::min(semi, paren);
+    return pld;
+}
+
+void GCodeProgramPanel::updateLineNumberCache(const std::vector<std::string>& gcode_lines) {
+    // A new program comes with a new lines buffer: rescan only then (no allocations, a few ms for 650k lines)
+    if (gcode_lines.data() == line_scan_data_ && gcode_lines.size() == line_scan_count_) {
         return;
     }
-    last_parsed_lines_count_ = gcode_lines.size();
-    last_parsed_filename_    = filename;
-    parsed_display_lines_.clear();
-    parsed_display_lines_.resize(gcode_lines.size());
+    line_scan_data_  = gcode_lines.data();
+    line_scan_count_ = gcode_lines.size();
 
-    // 1. Check if the file contains line numbers before g-codes (e.g. N100, N110, N140)
-    size_t n_lines_count = 0;
+    // Does the file number its lines (N100, N110, ...)? Then those numbers are shown instead of 0001, 0002, ...
+    has_file_line_numbers_ = false;
+    size_t max_num_chars = 4;
     for (const auto& line : gcode_lines) {
-        size_t idx = line.find_first_not_of(" \t");
-        if (idx != std::string::npos && (line[idx] == 'N' || line[idx] == 'n')) {
-            size_t d_idx = idx + 1;
-            while (d_idx < line.size() && (line[d_idx] == ' ' || line[d_idx] == '\t')) d_idx++;
-            if (d_idx < line.size() && std::isdigit(static_cast<unsigned char>(line[d_idx]))) {
-                n_lines_count++;
-            }
+        size_t end_digit = 0;
+        const size_t d_idx = fileLineNumberDigits(line, end_digit);
+        if (d_idx != std::string::npos) {
+            has_file_line_numbers_ = true;
+            max_num_chars = std::max(max_num_chars, 1 + end_digit - d_idx); // "N" + digits
         }
     }
-
-    const bool has_file_line_numbers = (n_lines_count > 0);
-    size_t max_num_chars = 4;
-
-    for (size_t i = 0; i < gcode_lines.size(); ++i) {
-        const auto& raw = gcode_lines[i];
-        auto& pld = parsed_display_lines_[i];
-
-        if (has_file_line_numbers) {
-            size_t idx = raw.find_first_not_of(" \t");
-            if (idx != std::string::npos && (raw[idx] == 'N' || raw[idx] == 'n')) {
-                size_t d_idx = idx + 1;
-                while (d_idx < raw.size() && (raw[d_idx] == ' ' || raw[d_idx] == '\t')) d_idx++;
-                if (d_idx < raw.size() && std::isdigit(static_cast<unsigned char>(raw[d_idx]))) {
-                    size_t end_digit = d_idx;
-                    while (end_digit < raw.size() && std::isdigit(static_cast<unsigned char>(raw[end_digit]))) {
-                        end_digit++;
-                    }
-                    std::string num_digits = raw.substr(d_idx, end_digit - d_idx);
-                    pld.line_num_str = "N" + num_digits;
-                    if (pld.line_num_str.size() > max_num_chars) {
-                        max_num_chars = pld.line_num_str.size();
-                    }
-                    size_t rest_idx = raw.find_first_not_of(" \t", end_digit);
-                    pld.command_str = (rest_idx != std::string::npos) ? raw.substr(rest_idx) : "";
-                } else {
-                    pld.line_num_str.clear();
-                    pld.command_str = raw;
-                }
-            } else {
-                pld.line_num_str.clear();
-                pld.command_str = raw;
-            }
-        } else {
-            char buf[24]; // fits any size_t
-            std::snprintf(buf, sizeof(buf), "%04zu", i + 1);
-            pld.line_num_str = buf;
-            pld.command_str  = raw;
-        }
-
-        size_t semi  = pld.command_str.find(';');
-        size_t paren = pld.command_str.find('(');
-        pld.comment_pos = std::min(semi, paren);
+    if (!has_file_line_numbers_) {
+        max_num_chars = std::max<size_t>(max_num_chars, std::to_string(gcode_lines.size()).size());
     }
 
     line_num_col_w_ = std::max(62.0f, static_cast<float>(max_num_chars + 2) * 9.5f + 16.0f);

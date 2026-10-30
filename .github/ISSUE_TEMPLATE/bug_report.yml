@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work as expected in BreakoutMill or BreakoutCut
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! If a machine moved unexpectedly, please say so in the title: those reports are looked
+        at first. **Never post passwords, network addresses or other private data.**
+
+        Tip: tick **Diagnostics** (bottom right of the window) and press **Copy to clipboard**. It copies the
+        version, OS, graphics and board details; paste them into the field below.
+  - type: dropdown
+    id: app
+    attributes:
+      label: Application
+      options:
+        - BreakoutMill
+        - BreakoutCut (plasma)
+        - BreakoutCut (laser)
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Tick Diagnostics (bottom right) and paste the copied report, or write the version and operating system.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - Simulator only (no board)
+        - RNR Eco Motion 2.0 board connected, drivers off
+        - RNR Eco Motion 2.0 board connected, machine running
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: If it depends on a G-code file, attach it (zipped if large) or paste the relevant lines.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots, logs, settings
+      description: |
+        Screenshots help a lot. For performance problems, run with BREAKOUTCNC_PERF_LOG=<file> or open the
+        F12 overlay and attach a screenshot. Settings (breakout_mill_settings.ini / breakout_cut_settings.ini)
+        can be attached too.

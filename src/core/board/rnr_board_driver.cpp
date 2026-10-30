@@ -86,7 +86,8 @@ void RnrBoardDriver::configure(const core::MachineConfig& cfg, bool homing) {
 }
 
 void RnrBoardDriver::emergencyStop() {
-    usb_.sendShortCommand(protocol::Opcode::EStopAbort);
+    // Ahead of any queued slices / commands: the controller drops all pending motion on an E-stop anyway
+    usb_.sendUrgentShortCommand(protocol::Opcode::EStopAbort);
 }
 
 void RnrBoardDriver::clearEmergencyStop() {

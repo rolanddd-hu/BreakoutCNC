@@ -904,6 +904,29 @@ int main() {
             assert(prog->warnings.empty());
             assert(std::abs(prog->bbox_max_mm[0] - prog->bbox_min_mm[0] - 90.0) < 0.01);
             assert(std::abs(prog->bbox_max_mm[1] - prog->bbox_min_mm[1] - 90.0) < 0.01);
+
+            // BreakoutCut: S is laser power, never an RPM-based PWM duty while the laser is off
+            assert(laser_ctrl.getTelemetry().spindle_pwm_duty == 0);
+            assert(laser_ctrl.resetFromEStop());
+            assert(laser_ctrl.executeMdiCommand("S500"));
+            assert(laser_ctrl.getTelemetry().spindle_pwm_duty == 0);
+            // A spindle ramp (e.g. from a Mach3 import) would keep the torch / laser on after M5
+            auto cut_cfg = laser_ctrl.getConfig();
+            cut_cfg.spindle_ramp_up_s   = 2.5;
+            cut_cfg.spindle_ramp_down_s = 2.0;
+            laser_ctrl.applyConfig(cut_cfg);
+            assert(laser_ctrl.getConfig().spindle_ramp_up_s == 0.0 && laser_ctrl.getConfig().spindle_ramp_down_s == 0.0);
+        }
+        {
+            rnr::core::RnRController mill_ctrl;
+            auto mill_cfg = mill_ctrl.getConfig();
+            mill_cfg.is_mill = true;
+            mill_cfg.spindle_ramp_down_s = 2.0;
+            mill_ctrl.applyConfig(mill_cfg);
+            assert(mill_ctrl.getConfig().spindle_ramp_down_s == 2.0);
+            assert(mill_ctrl.resetFromEStop());
+            assert(mill_ctrl.executeMdiCommand("S12000"));
+            assert(mill_ctrl.getTelemetry().spindle_pwm_duty == 500); // 12000 of 24000 RPM
         }
 
         // 3. Laser program detection

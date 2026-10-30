@@ -1,5 +1,6 @@
 #include "ui_common/io_status_bar.h"
 #include "ui_common/gcode_panel.h"
+#include "ui_common/diagnostics_report.h"
 #include "imgui.h"
 #include <cstdio>
 #include <algorithm>
@@ -563,6 +564,45 @@ void IoStatusBar::renderBottomIoStrip(
     ImGui::Checkbox("Diagnostics", &show_diagnostics);
 
     ImGui::EndChild();
+
+    // Diagnostics report for bug reports: shown in full before it is copied, so users see what they share
+    if (show_diagnostics) {
+        static std::string report;
+        static double report_time = -1.0;
+        static double copied_time = -10.0;
+        const double now = ImGui::GetTime();
+        if (now - report_time > 1.0) { // Refreshed once a second: getProgram() / glGetString() are not free
+            const auto program = controller.getProgram();
+            report = buildDiagnosticsReport(controller.getConfig(), telemetry,
+                                            program->lines.size(), program->segments.size());
+            report_time = now;
+        }
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 16.0f, vp->WorkPos.y + vp->WorkSize.y - 56.0f),
+                                ImGuiCond_Appearing, ImVec2(1.0f, 1.0f));
+        ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f), ImGuiCond_Appearing);
+        if (ImGui::Begin("Diagnostics report", &show_diagnostics, ImGuiWindowFlags_NoCollapse)) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("Paste this into a bug report on GitHub. It contains no file paths or serial numbers.");
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(report.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+            const char* copy_label = "Copy to clipboard";
+            if (ImGui::Button(copy_label, ImVec2(ImGui::CalcTextSize(copy_label).x + 32.0f, 32.0f))) {
+                ImGui::SetClipboardText(report.c_str());
+                copied_time = now;
+            }
+            if (now - copied_time < 2.0) {
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.45f, 1.0f), "Copied");
+            }
+        }
+        ImGui::End();
+    }
 }
 
 } // namespace rnr::ui

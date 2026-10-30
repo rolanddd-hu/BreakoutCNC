@@ -61,8 +61,25 @@ laser can fire.
 | BreakoutCut: plasma and laser | Simulator only, **not tested on a real cutting machine** |
 | Huanyang VFD | Protocol tested in unit tests; parameter read-back not yet checked on a real VFD |
 | Windows 10 / 11 (x64) | Main platform |
-| Linux / macOS | Build instructions below, but **not yet built or tested**. The camera works on Windows and Linux |
+| Linux / macOS | Built and unit-tested in CI, release downloads available, but **not yet tried on a real PC / Mac**. The camera works on Windows and Linux |
 | Other motion boards | Not supported yet; the driver layer is prepared ([BOARD_DRIVERS.md](docs/architecture/BOARD_DRIVERS.md)) |
+
+## Download
+
+Ready-to-run builds are on the [Releases](https://github.com/rolanddd-hu/BreakoutCNC/releases) page:
+
+- **Windows 10 / 11 (x64):** `BreakoutCNC-<version>-win64.zip`. Unzip and run `BreakoutMill.exe` or `BreakoutCut.exe`.
+- **Linux (x86_64), untested:** `BreakoutCNC-<version>-linux-x86_64.tar.gz`, for distributions from 2022 on (glibc 2.35+).
+  Unpack and run `./BreakoutMill` or `./BreakoutCut`. For the board and the VFD, set up the udev rule and the
+  serial port group described under [Linux](#linux-untested).
+- **macOS 11 or newer, untested:** `BreakoutCNC-<version>-macos-universal.tar.gz` (Apple Silicon and Intel). The apps
+  are not signed, so macOS blocks them at first: run `xattr -dr com.apple.quarantine <unpacked folder>` once, or
+  right-click an app and choose Open.
+
+The [User Guide](docs/USER_GUIDE.md) walks through the first start, setting up a machine (or importing it from
+Mach3) and running jobs. Settings are saved next to the applications, so keep each unpacked folder in a place you can
+write to. The Linux and
+macOS builds only pass the automated tests so far; feedback in an issue is very welcome.
 
 ## Building
 
@@ -154,7 +171,7 @@ some (CH340) need the vendor's driver on older macOS versions. The camera view i
 
 The version number is set in one place: `project(VERSION ...)` in [CMakeLists.txt](CMakeLists.txt).
 
-### Release package (Windows)
+### Release package
 
 ```powershell
 cmake --build build --config Release --target package
@@ -164,6 +181,13 @@ This creates `build/BreakoutCNC-<version>-win64.zip` with the two applications, 
 README, license, changelog, third-party notices and the hardware validation checklist. Test and diagnostic
 executables, settings files and build libraries are not included. The C++ runtime is linked statically, so the zip
 runs on a clean Windows 10 / 11 PC without the Visual C++ Redistributable.
+
+On Linux and macOS the same target creates a `.tar.gz` (`-linux-x86_64` / `-macos-arm64`). The release builds add
+these configure options (see [ci.yml](.github/workflows/ci.yml)):
+
+- Linux, built on Ubuntu 22.04: `"-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"`
+- macOS universal binary: `"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0`
+  (package name `-macos-universal`)
 
 ### Publishing a release
 
@@ -179,9 +203,11 @@ git tag v0.1
 git push origin v0.1
 ```
 
-The [release workflow](.github/workflows/release.yml) then builds and tests on Windows and publishes a GitHub Release
-named "BreakoutCNC <version>" with the zip attached and the changelog section as release notes. It stops without
-publishing if the tag does not match the CMake version or the changelog has no section for it.
+The [release workflow](.github/workflows/release.yml) then builds and tests on Windows, Linux and macOS and publishes
+a GitHub Release named "BreakoutCNC <version>" with the three packages attached and the changelog section as release
+notes. It stops without publishing if any platform fails, the tag does not match the CMake version or the changelog
+has no section for it. CI builds the same packages on every push (as run artifacts), so a release should not hold
+surprises.
 
 ## Tests
 
@@ -193,10 +219,12 @@ build\Release\huanyang_vfd_test.exe
 On Linux / macOS: `build/script_engine_test` and `build/huanyang_vfd_test`.
 
 GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) builds and runs both tests on Windows, Linux and
-macOS for every push and pull request. The Windows run also builds the release zip and attaches it to the run as
-`BreakoutCNC-win64`.
+macOS for every push and pull request, and attaches each platform's release package to the run
+(`BreakoutCNC-Windows`, `BreakoutCNC-Linux`, `BreakoutCNC-macOS`).
 
-Both run without hardware. `rnr_hid_test.exe` is a hardware diagnostic tool, **not** a unit test: it talks to a
+Both run without hardware. CI also starts both applications with `--smoke-test` (Linux under a virtual display,
+macOS on the runner): the app never opens USB devices, runs the built-in demo job in the simulator for about 4 s,
+exits with code 0 (2 if the job did not progress) and does not write any settings. `rnr_hid_test.exe` is a hardware diagnostic tool, **not** a unit test: it talks to a
 connected board and sends it the reset / arm sequence. Only run it with the stepper drivers powered off and the
 applications closed.
 
@@ -212,6 +240,8 @@ CNC machines, plasma torches and lasers can injure or kill. This software is pro
 
 ## Documentation
 
+- [docs/USER_GUIDE.md](docs/USER_GUIDE.md): user guide with screenshots: install, simulator, machine setup, Mach3
+  migration, running jobs, probing, plasma / laser, troubleshooting.
 - [docs/architecture/BOARD_DRIVERS.md](docs/architecture/BOARD_DRIVERS.md): machine core vs. board drivers, how to add
   a board.
 - [docs/architecture/SCRIPTING_ENGINE_SPEC.md](docs/architecture/SCRIPTING_ENGINE_SPEC.md): Lua scripting API.

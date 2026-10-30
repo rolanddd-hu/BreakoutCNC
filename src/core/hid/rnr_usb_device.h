@@ -51,6 +51,10 @@ public:
     // closed, the queue is full, or an earlier queued write failed.
     bool sendPacket(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq = nullptr);
 
+    // E-stop path: discards the motion slices not yet written, so the report only waits for the write in
+    // progress and any queued short commands. Never refused for a full queue or an earlier failed write.
+    bool sendPacketUrgent(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq = nullptr);
+
     // Waits until every queued report has been written (or the timeout expires)
     bool flush(uint32_t timeout_ms);
 
@@ -63,6 +67,9 @@ public:
         uint16_t arg7_8 = 0,
         uint32_t arg9_12 = 0,
         uint16_t* out_seq = nullptr);
+
+    // sendShortCommand() through sendPacketUrgent()
+    bool sendUrgentShortCommand(protocol::Opcode opcode, bool limit_override = false);
 
     bool sendMotionSlice(
         protocol::Opcode opcode,

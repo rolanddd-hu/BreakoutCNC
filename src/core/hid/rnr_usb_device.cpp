@@ -393,6 +393,32 @@ bool RnrUsbDevice::sendPacket(protocol::OutputReportBuffer& packet, uint16_t* ou
     return true;
 }
 
+bool RnrUsbDevice::sendPacketUrgent(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq) {
+    if (!open_.load()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        // Drop the queued motion slices (an E-stop cancels them anyway) but keep short commands such as the
+        // board configuration sent right before the E-stop on connect. The packet goes behind those few, so
+        // the board still sees ascending sequence numbers; the dropped numbers are simply never used.
+        tx_queue_.erase(std::remove_if(tx_queue_.begin(), tx_queue_.end(),
+                                       [](const protocol::OutputReportBuffer& p) {
+                                           const auto op = static_cast<protocol::Opcode>(p[1]);
+                                           return op == protocol::Opcode::StreamGcodeSlice ||
+                                                  op == protocol::Opcode::StreamJogSlice;
+                                       }),
+                        tx_queue_.end());
+        const uint16_t seq = static_cast<uint16_t>(tx_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
+        protocol::writeLE16(&packet[3], seq);
+        if (out_assigned_seq) {
+            *out_assigned_seq = seq;
+        }
+        tx_queue_.push_back(packet);
+    }
+    queue_cv_.notify_all();
+    return true;
+}
+
 void RnrUsbDevice::writerLoop() {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     while (true) {
@@ -482,6 +508,11 @@ bool RnrUsbDevice::sendShortCommand(
 {
     auto pkt = protocol::buildShortControlPacket(opcode, 0, limit_override, arg5, arg6, arg7_8, arg9_12);
     return sendPacket(pkt, out_seq);
+}
+
+bool RnrUsbDevice::sendUrgentShortCommand(protocol::Opcode opcode, bool limit_override) {
+    auto pkt = protocol::buildShortControlPacket(opcode, 0, limit_override, 0, 0, 0, 0);
+    return sendPacketUrgent(pkt);
 }
 
 bool RnrUsbDevice::sendMotionSlice(

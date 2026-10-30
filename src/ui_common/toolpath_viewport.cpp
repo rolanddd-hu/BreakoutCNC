@@ -103,15 +103,18 @@ public:
     ToolpathLineBatch(Sink sink, float tolerance_px) : sink_(std::move(sink)), tol_(tolerance_px) {}
     ~ToolpathLineBatch() { flush(); }
 
-    void add(ImVec2 p0, ImVec2 p1, uint32_t seg) {
+    void add(ImVec2 p0, ImVec2 p1, uint32_t seg) { add(p0, p1, seg, seg); }
+
+    // A line standing for the segments first..last (a chord over several segments while the view moves)
+    void add(ImVec2 p0, ImVec2 p1, uint32_t first, uint32_t last) {
         if (!pending_ || distSq(p0, end_) > kJoinPx * kJoinPx) {
             flush();
-            startChain(p0, seg);
+            startChain(p0, first);
         }
-        if (!extend(p1, seg)) {
+        if (!extend(p1, last)) {
             emit();
-            startChain(end_, seg);
-            extend(p1, seg); // always fits a fresh chain
+            startChain(end_, first);
+            extend(p1, last); // always fits a fresh chain
         }
     }
 
@@ -251,16 +254,35 @@ void ToolpathViewport::updatePathCache(const std::vector<core::ToolpathSegment>&
                            static_cast<double>(s.gcode_line) + static_cast<double>(s.type) * 0.1;
         }
     }
+    // Rotating / zooming a very large program rebuilds the cache every frame: build it from chords over a few
+    // segments until the view has been still for kInteractHoldS, then once more at full detail
+    const bool coarse = segments.size() >= kCoarseMinSegments && ImGui::GetTime() < interact_until_s_;
     auto& c = path_cache_;
-    if (c.valid && c.seg_data == segments.data() && c.seg_count == segments.size() && c.fingerprint == fingerprint &&
-        c.iso == isometric_3d_ && c.yaw == view_yaw_deg_ && c.pitch == view_pitch_deg_ && c.zoom == zoom_px_per_mm_ &&
-        c.tol == simplify_px_ && c.tool_filter == selected_tool_filter_) {
+    const bool same_program = c.geo_valid && c.seg_data == segments.data() && c.seg_count == segments.size() &&
+                              c.fingerprint == fingerprint;
+    if (same_program && c.valid && c.iso == isometric_3d_ && c.yaw == view_yaw_deg_ && c.pitch == view_pitch_deg_ &&
+        c.zoom == zoom_px_per_mm_ && c.tol == simplify_px_ && c.tool_filter == selected_tool_filter_ && c.coarse == coarse) {
         return;
     }
+    if (!same_program) {
+        c.geo.resize(segments.size());
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto& s = segments[i];
+            auto& g = c.geo[i];
+            for (int a = 0; a < 3; ++a) {
+                g.start[a] = static_cast<float>(s.start_xyza_mm[a]);
+                g.end[a]   = static_cast<float>(s.end_xyza_mm[a]);
+            }
+            g.tool = s.tool_number;
+            g.type = static_cast<uint8_t>(s.type);
+        }
+        c.geo_valid   = true;
+        c.seg_data    = segments.data();
+        c.seg_count   = segments.size();
+        c.fingerprint = fingerprint;
+    }
     c.valid       = true;
-    c.seg_data    = segments.data();
-    c.seg_count   = segments.size();
-    c.fingerprint = fingerprint;
+    c.coarse      = coarse;
     c.iso         = isometric_3d_;
     c.yaw         = view_yaw_deg_;
     c.pitch       = view_pitch_deg_;
@@ -279,11 +301,18 @@ void ToolpathViewport::updatePathCache(const std::vector<core::ToolpathSegment>&
     const double sy   = std::sin(static_cast<double>(view_yaw_deg_) * kDegToRad);
     const double cp   = std::cos(static_cast<double>(view_pitch_deg_) * kDegToRad);
     const double sp   = std::sin(static_cast<double>(view_pitch_deg_) * kDegToRad);
-    auto project = [&](const std::array<double, 4>& p) -> ImVec2 {
-        if (!iso) return ImVec2(static_cast<float>(p[0]) * zoom, -static_cast<float>(p[1]) * zoom);
+    auto project = [&](const float* p) -> ImVec2 {
+        if (!iso) return ImVec2(p[0] * zoom, -p[1] * zoom);
         const double rx = p[0] * cy - p[1] * sy;
         const double ry = p[0] * sy + p[1] * cy;
         return ImVec2(static_cast<float>(rx * zoom), -static_cast<float>((ry * cp + p[2] * sp) * zoom));
+    };
+    constexpr auto kRapid = static_cast<uint8_t>(core::SegmentType::RapidMove);
+    constexpr auto kDwell = static_cast<uint8_t>(core::SegmentType::Dwell);
+    auto isCut = [](uint8_t t) {
+        return t == static_cast<uint8_t>(core::SegmentType::CutLinear) ||
+               t == static_cast<uint8_t>(core::SegmentType::CutArcCW) ||
+               t == static_cast<uint8_t>(core::SegmentType::CutArcCCW);
     };
 
     uint16_t batch_tool = 0;
@@ -291,27 +320,45 @@ void ToolpathViewport::updatePathCache(const std::vector<core::ToolpathSegment>&
         c.cuts.push_back(CachedCutLine{a, b, first, last, batch_tool});
     };
     ToolpathLineBatch<decltype(sink)> batch(sink, simplify_px_);
+    const size_t stride = coarse ? std::max<size_t>(2, segments.size() / kCoarseTargetSegments) : 1;
+    size_t chord_first = 0, chord_len = 0;
+    ImVec2 chord_p0{};
     uint16_t last_tool_seen = 0;
-    for (size_t i = 0; i < segments.size(); ++i) {
-        const auto& seg = segments[i];
-        if (seg.tool_number > 0 && seg.tool_number != last_tool_seen) {
-            last_tool_seen = seg.tool_number;
-            if (std::find(c.tools_in_file.begin(), c.tools_in_file.end(), seg.tool_number) == c.tools_in_file.end()) {
-                c.tools_in_file.push_back(seg.tool_number);
+    const auto& geo = c.geo;
+    for (size_t i = 0; i < geo.size(); ++i) {
+        const auto& seg = geo[i];
+        if (seg.tool > 0 && seg.tool != last_tool_seen) {
+            last_tool_seen = seg.tool;
+            if (std::find(c.tools_in_file.begin(), c.tools_in_file.end(), seg.tool) == c.tools_in_file.end()) {
+                c.tools_in_file.push_back(seg.tool);
             }
         }
-        if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
-        if (seg.type == core::SegmentType::RapidMove) {
-            c.rapids.push_back(project(seg.start_xyza_mm));
-            c.rapids.push_back(project(seg.end_xyza_mm));
-        } else if (seg.type == core::SegmentType::Dwell) {
-            c.pierces.push_back(CachedPoint{project(seg.start_xyza_mm), static_cast<uint32_t>(i)});
-        } else if (isCutSegment(seg)) {
-            if (seg.tool_number != batch_tool) {
+        if (selected_tool_filter_ != 0 && seg.tool != selected_tool_filter_) continue;
+        if (seg.type == kRapid) {
+            c.rapids.push_back(project(seg.start));
+            c.rapids.push_back(project(seg.end));
+        } else if (seg.type == kDwell) {
+            c.pierces.push_back(CachedPoint{project(seg.start), static_cast<uint32_t>(i)});
+        } else if (isCut(seg.type)) {
+            if (seg.tool != batch_tool) {
                 batch.flush(); // one tool (one color) per merged line
-                batch_tool = seg.tool_number;
+                batch_tool = seg.tool;
             }
-            batch.add(project(seg.start_xyza_mm), project(seg.end_xyza_mm), static_cast<uint32_t>(i));
+            if (stride == 1) {
+                batch.add(project(seg.start), project(seg.end), static_cast<uint32_t>(i));
+                continue;
+            }
+            // Chord over up to `stride` consecutive cut segments of one tool; interior points are not projected
+            if (chord_len == 0) {
+                chord_first = i;
+                chord_p0    = project(seg.start);
+            }
+            ++chord_len;
+            const bool run_continues = (i + 1 < geo.size()) && isCut(geo[i + 1].type) && geo[i + 1].tool == seg.tool;
+            if (chord_len >= stride || !run_continues) {
+                batch.add(chord_p0, project(seg.end), static_cast<uint32_t>(chord_first), static_cast<uint32_t>(i));
+                chord_len = 0;
+            }
         }
     }
     batch.flush();
@@ -433,6 +480,7 @@ void ToolpathViewport::render(
     if (!in_cam_overlay && !in_cam_calibration && allow_canvas_input && std::abs(io.MouseWheel) > 0.001f) {
         float factor = (io.MouseWheel > 0.0f) ? 1.15f : (1.0f / 1.15f);
         zoom_px_per_mm_ = std::clamp(zoom_px_per_mm_ * factor, 0.2f, 80.0f);
+        interact_until_s_ = ImGui::GetTime() + kInteractHoldS;
     }
 
     // Precompute 3D camera trig for projection and screen-aligned panning
@@ -452,6 +500,9 @@ void ToolpathViewport::render(
             view_pitch_deg_ += io.MouseDelta.y * 0.45f;
             while (view_pitch_deg_ > 90.0f)  view_pitch_deg_ -= 180.0f;
             while (view_pitch_deg_ < -90.0f) view_pitch_deg_ += 180.0f;
+            if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) {
+                interact_until_s_ = ImGui::GetTime() + kInteractHoldS;
+            }
         } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) ||
                    ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
                    (!isometric_3d_ && ImGui::IsMouseDragging(ImGuiMouseButton_Right)))

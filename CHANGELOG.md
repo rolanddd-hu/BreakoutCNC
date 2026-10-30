@@ -3,13 +3,58 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
-## Unreleased
+## 0.3 - Linux / macOS downloads, user guide, safety fixes
 
+First release with Linux and macOS downloads, a user guide, and several safety fixes around the E-stop and the
+laser output.
+
+### Safety
+- A software E-stop no longer waits behind queued motion packets to the board: the queued slices are dropped
+  and the E-stop goes out right after the USB write in progress. Before, it could wait up to about 150 ms.
+- BreakoutCut: an S word (MDI, program start) or a spindle speed change no longer sets the board's PWM output
+  from an RPM value. In laser mode, `S500` used to set a 2 % PWM duty while the laser was off; the PWM output is
+  now set only by the laser power logic.
+- BreakoutCut ignores spindle spin-up / spin-down delays (for example imported from a Mach3 profile): they would
+  have kept the torch / laser output on for the spin-down time after M5.
+- The apps always use the settings file, `scripts/` and `resources/` next to the executable, also when started
+  from another folder (a Linux / macOS file manager, or "Open with" on Windows). Before, they could start with
+  default settings (steps/mm, limits, pins) in that case.
+
+### New
+- Linux (x86_64) and macOS (universal, macOS 11+) downloads next to the Windows zip. They are built and tested
+  automatically but not yet tried on a real machine: feedback is very welcome.
+- User guide with screenshots ([docs/USER_GUIDE.md](docs/USER_GUIDE.md)), also in the download: install and first
+  start, the simulator, setting up a new machine, migrating from Mach3, running jobs, probing, plasma / laser and
+  troubleshooting.
+- Open a G-code file by passing it on the command line ("Open with", double-click on an associated file) or by
+  dropping it onto the window. It goes through the same machine-type check as Load File.
+- Diagnostics: ticking "Diagnostics" (bottom right) opens a report with the version, OS, graphics, board state
+  and key settings, with a "Copy to clipboard" button for bug reports. It contains no file paths or serial
+  numbers.
 - BreakoutCut has a laser demo program (a 90x90 mm coaster: raster-filled center, rose, rings and compass
   ticks, outline cut). The built-in demo follows the Plasma / Laser mode; a program you loaded stays loaded when
   you switch modes.
+
+### Performance
+- Large programs load in the background: the window stays responsive while a file is read and parsed ("Loading
+  ..." next to the cycle buttons), including the last file at startup, so the window appears right away. A
+  650k-line file froze the window for about 1.3 s on a desktop PC (several seconds on a laptop); the longest
+  frame is now about 60 ms. The G-code list no longer copies every line, which saves ~150 ms and tens of MB on
+  such files.
+- Rotating or zooming the 3D view of very large programs (150k+ segments) is about 3x faster: the view keeps a
+  compact copy of the geometry and draws a slightly simplified path while it moves, then full detail 0.2 s
+  after the last move.
+
+### Changed
 - BreakoutCut no longer shows the spindle speed bar under the position readout (it only applies to the mill).
-- Screenshots in the README.
+- The G-code list's line-number column widens for programs with more than 9999 lines.
+- GLFW / OpenGL errors are printed to the terminal, which helps diagnose startup problems on Linux and macOS.
+
+### Project
+- README screenshots, a Download section, and GitHub issue forms for bug reports and Linux / macOS feedback.
+- CI builds the release packages for all three platforms on every push and starts both applications
+  (`--smoke-test`) on Linux and macOS to catch startup problems.
+- Fixed a timing-dependent unit test that failed occasionally on slow CI machines.
 
 ## 0.2 - performance on older PCs, optional homing
 

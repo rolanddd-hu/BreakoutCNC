@@ -19,14 +19,24 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
+            configure: cmake -B build -A x64
             # Multi-config generator: binaries land in build/Release
             bin_dir: build/Release
+            package: build/BreakoutCNC-*-win64.zip
+          # Linux / macOS build exactly like the release workflow, so every push checks the release packages:
+          # - Linux on the oldest supported Ubuntu with libstdc++ linked in, so the binaries run on most distros
+          #   from 2022 on (glibc 2.35+)
+          # - macOS as a universal binary (Apple Silicon + Intel), macOS 11+
           - name: Linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
+            configure: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
             bin_dir: build
+            package: build/BreakoutCNC-*-linux-*.tar.gz
           - name: macOS
             os: macos-latest
+            configure: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
             bin_dir: build
+            package: build/BreakoutCNC-*-macos-*.tar.gz
 
     steps:
       - uses: actions/checkout@v7
@@ -36,15 +46,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev wayland-protocols libgl-dev libudev-dev libusb-1.0-0-dev
+            libwayland-dev libxkbcommon-dev wayland-protocols libgl-dev libudev-dev libusb-1.0-0-dev \
+            xvfb libgl1-mesa-dri
 
-      - name: Configure (Windows)
-        if: runner.os == 'Windows'
-        run: cmake -B build -A x64
-
-      - name: Configure (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure
+        run: ${{ matrix.configure }}
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -59,14 +65,32 @@ jobs:
         working-directory: ${{ matrix.bin_dir }}
         run: ./huanyang_vfd_test
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+      # Start both GUI apps (simulator, no USB access), run the demo job for ~4 s and exit: catches startup
+      # crashes and OpenGL / window problems the unit tests cannot see. Windows runners have no OpenGL 3.3.
+      - name: Startup smoke test (Linux, virtual display)
+        if: runner.os == 'Linux'
+        working-directory: build
+        env:
+          LIBGL_ALWAYS_SOFTWARE: 1
+        run: |
+          timeout 120 xvfb-run -a -s "-screen 0 1920x1080x24" ./BreakoutMill --smoke-test
+          timeout 120 xvfb-run -a -s "-screen 0 1920x1080x24" ./BreakoutCut --smoke-test
+
+      - name: Startup smoke test (macOS)
+        if: runner.os == 'macOS'
+        # Not yet known whether the hosted macOS runners provide an OpenGL 3.3 context: report, do not block
+        continue-on-error: true
+        working-directory: build
+        run: |
+          ./BreakoutMill --smoke-test
+          ./BreakoutCut --smoke-test
+
+      - name: Package
         run: cmake --build build --config Release --target package
 
-      - name: Upload release zip
-        if: runner.os == 'Windows'
+      - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: BreakoutCNC-win64
-          path: build/BreakoutCNC-*-win64.zip
+          name: BreakoutCNC-${{ matrix.name }}
+          path: ${{ matrix.package }}
           if-no-files-found: error

@@ -1,6 +1,6 @@
 name: Release
 
-# Push a version tag to publish a GitHub Release with the Windows zip:
+# Push a version tag to publish a GitHub Release with the Windows zip and the Linux / macOS archives:
 #   git tag v0.1 && git push origin v0.1
 # The tag must match project(VERSION ...) in CMakeLists.txt; the release notes come from CHANGELOG.md.
 on:
@@ -12,15 +12,44 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build and publish
-    runs-on: windows-latest
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One failing platform stops the release: nothing is published unless all three packages build and pass
+      fail-fast: true
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            configure: cmake -B build -A x64
+            bin_dir: build/Release
+            package: build/BreakoutCNC-*-win64.zip
+          # Same settings as the CI Linux / macOS jobs (see ci.yml for why)
+          - name: Linux
+            os: ubuntu-22.04
+            configure: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+            bin_dir: build
+            package: build/BreakoutCNC-*-linux-*.tar.gz
+          - name: macOS
+            os: macos-latest
+            configure: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+            bin_dir: build
+            package: build/BreakoutCNC-*-macos-*.tar.gz
 
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols libgl-dev libudev-dev libusb-1.0-0-dev \
+            xvfb libgl1-mesa-dri
+
       - name: Configure
-        run: cmake -B build -A x64
+        run: ${{ matrix.configure }}
 
       - name: Check tag matches the CMake version
         shell: bash
@@ -30,41 +59,85 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match project version $version in CMakeLists.txt"
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
       - name: Script engine tests
-        working-directory: build/Release
+        working-directory: ${{ matrix.bin_dir }}
         run: ./script_engine_test
 
       - name: Huanyang VFD tests
-        working-directory: build/Release
+        working-directory: ${{ matrix.bin_dir }}
         run: ./huanyang_vfd_test
+
+      - name: Startup smoke test (Linux, virtual display)
+        if: runner.os == 'Linux'
+        working-directory: build
+        env:
+          LIBGL_ALWAYS_SOFTWARE: 1
+        run: |
+          timeout 120 xvfb-run -a -s "-screen 0 1920x1080x24" ./BreakoutMill --smoke-test
+          timeout 120 xvfb-run -a -s "-screen 0 1920x1080x24" ./BreakoutCut --smoke-test
 
       - name: Package
         run: cmake --build build --config Release --target package
 
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: ${{ matrix.package }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
       - name: Release notes from CHANGELOG.md
-        shell: bash
         run: |
+          version="${GITHUB_REF_NAME#v}"
           # The "## <version> ..." section, up to the next "## " heading
-          awk -v v="$VERSION" '
+          awk -v v="$version" '
             /^## / { if (found) exit; if ($2 == v) { found = 1; next } }
             found { print }
           ' CHANGELOG.md > release_notes.md
           if [ ! -s release_notes.md ]; then
-            echo "::error::CHANGELOG.md has no '## $VERSION' section"
+            echo "::error::CHANGELOG.md has no '## $version' section"
             exit 1
           fi
+          cat >> release_notes.md <<'EOF'
+
+          ### Downloads
+          - **Windows 10 / 11 (x64):** the `-win64.zip`. Unzip and run `BreakoutMill.exe` or `BreakoutCut.exe`.
+          - **Linux (x86_64), untested:** the `-linux-x86_64.tar.gz`, built on Ubuntu 22.04. Unpack it and run
+            `./BreakoutMill` or `./BreakoutCut`. The README describes the udev rule for the board and the serial port
+            group for the VFD.
+          - **macOS 11 or newer (Apple Silicon and Intel), untested:** the `-macos-universal.tar.gz`. The apps are not
+            signed: after unpacking, run `xattr -dr com.apple.quarantine <folder>` once, or right-click an app and
+            choose Open.
+
+          The Linux and macOS builds are tested only by the automated unit tests. If you try one, please report what
+          works and what does not in an issue.
+          EOF
+          ls -l dist
 
       - name: Publish GitHub Release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "build/BreakoutCNC-$VERSION-win64.zip" \
-            --title "BreakoutCNC $VERSION" \
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "BreakoutCNC ${GITHUB_REF_NAME#v}" \
             --notes-file release_notes.md \
             --verify-tag

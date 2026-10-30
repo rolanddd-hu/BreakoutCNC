@@ -146,6 +146,17 @@ private:
         bool        iso         = false;
         float       yaw = 0.0f, pitch = 0.0f, zoom = 0.0f, tol = 0.0f;
         uint16_t    tool_filter = 0;
+        bool        coarse      = false; // built from chords while the view was rotating / zooming
+        // Compact copy of the program geometry, built once per program: a view change re-projects ~28 bytes
+        // per segment instead of reading the ~200-byte segments (the rebuild is memory-bound)
+        struct Geo {
+            float    start[3];
+            float    end[3];
+            uint16_t tool;
+            uint8_t  type;
+        };
+        std::vector<Geo> geo;
+        bool             geo_valid = false;
         std::vector<CachedCutLine> cuts;
         std::vector<ImVec2>        rapids;  // start / end pairs
         std::vector<CachedPoint>   pierces;
@@ -154,6 +165,10 @@ private:
     void updatePathCache(const std::vector<core::ToolpathSegment>& segments);
     ImVec2 projectNoPan(double x_mm, double y_mm, double z_mm) const;
     PathCache path_cache_;
+    static constexpr size_t kCoarseMinSegments    = 150000; // smaller programs always rebuild at full detail
+    static constexpr size_t kCoarseTargetSegments = 100000; // chords per rebuild while the view moves
+    static constexpr double kInteractHoldS        = 0.2;    // full detail returns this long after the last move
+    double interact_until_s_ = -1.0;
 
     float zoom_px_per_mm_   = 4.2f;
     float pan_x_mm_         = 65.0f;
