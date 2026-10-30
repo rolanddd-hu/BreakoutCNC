@@ -120,6 +120,7 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "isometric_3d")            s.ui.isometric_3d            = toBool(val);
             if (key == "show_rapids")             s.ui.show_rapids             = toBool(val);
             if (key == "show_pierces")            s.ui.show_pierces            = toBool(val);
+            if (key == "toolpath_simplify_px")    s.ui.toolpath_simplify_px    = static_cast<float>(std::atof(val.c_str()));
             if (key == "follow_torch")            s.ui.follow_torch            = toBool(val);
             if (key == "minimal_layout")          s.ui.minimal_layout          = toBool(val);
             if (key == "step_jog_mode")           s.ui.step_jog_mode           = toBool(val);
@@ -177,6 +178,7 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "dwell_p_milliseconds") s.machine.dwell_p_milliseconds = toBool(val);
             if (key == "estop_pin")           s.machine.estop_pin           = static_cast<uint8_t>(std::atoi(val.c_str()));
             if (key == "estop_invert")        s.machine.estop_invert        = toBool(val);
+            if (key == "require_homing")      s.machine.require_homing      = toBool(val);
             if (key == "spindle_pwm_ratio")   s.machine.spindle_pwm_ratio   = static_cast<float>(std::atof(val.c_str()));
             if (key == "spindle_ramp_up_s")   s.machine.spindle_ramp_up_s   = std::max(0.0, std::atof(val.c_str()));
             if (key == "spindle_ramp_down_s") s.machine.spindle_ramp_down_s = std::max(0.0, std::atof(val.c_str()));
@@ -412,6 +414,7 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "dry_run_mode = " << (s.ui.dry_run_mode ? 1 : 0) << "\n";
     ofs << "isometric_3d = " << (s.ui.isometric_3d ? 1 : 0) << "\n";
     ofs << "show_rapids = " << (s.ui.show_rapids ? 1 : 0) << "\n";
+    ofs << "toolpath_simplify_px = " << s.ui.toolpath_simplify_px << "\n";
     ofs << "show_pierces = " << (s.ui.show_pierces ? 1 : 0) << "\n";
     ofs << "follow_torch = " << (s.ui.follow_torch ? 1 : 0) << "\n";
     ofs << "minimal_layout = " << (s.ui.minimal_layout ? 1 : 0) << "\n";
@@ -465,6 +468,7 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "dwell_p_milliseconds = " << (s.machine.dwell_p_milliseconds ? 1 : 0) << "\n";
     ofs << "estop_pin = " << static_cast<int>(s.machine.estop_pin) << "\n";
     ofs << "estop_invert = " << (s.machine.estop_invert ? 1 : 0) << "\n";
+    ofs << "require_homing = " << (s.machine.require_homing ? 1 : 0) << "\n";
     ofs << "spindle_pwm_ratio = " << s.machine.spindle_pwm_ratio << "\n";
     ofs << "spindle_ramp_up_s = " << s.machine.spindle_ramp_up_s << "\n";
     ofs << "spindle_ramp_down_s = " << s.machine.spindle_ramp_down_s << "\n\n";

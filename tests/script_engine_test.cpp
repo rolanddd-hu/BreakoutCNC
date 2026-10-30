@@ -1107,6 +1107,9 @@ int main() {
         ps.machine = controller.getConfig();
         ps.machine.linear_units = rnr::core::LinearUnits::Imperial;
         ps.ui.speed_unit_idx = 1; // in/s
+        assert(ps.machine.require_homing); // Default: G53 / G28 / G30 need homed axes
+        ps.machine.require_homing = false;
+        ps.ui.toolpath_simplify_px = 2.5f;
 
         std::string test_units_ini = "test_units_settings.ini";
         bool saved = rnr::config::SettingsManager::saveToFile(test_units_ini, ps);
@@ -1116,6 +1119,8 @@ int main() {
         bool loaded = rnr::config::SettingsManager::loadFromFile(test_units_ini, loaded_ps);
         assert(loaded);
         assert(loaded_ps.machine.linear_units == rnr::core::LinearUnits::Imperial);
+        assert(!loaded_ps.machine.require_homing);
+        assert(std::abs(loaded_ps.ui.toolpath_simplify_px - 2.5f) < 1e-5f);
         assert(loaded_ps.ui.speed_unit_idx == 1);
         std::remove(test_units_ini.c_str());
 

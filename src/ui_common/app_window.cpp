@@ -1,4 +1,5 @@
 #include "ui_common/app_window.h"
+#include "ui_common/frame_stats.h"
 #include "core/controller/motion_controller.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -6,6 +7,10 @@
 #include <GLFW/glfw3.h>
 #include <filesystem>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -18,6 +23,8 @@
 #include <GLFW/glfw3native.h>
 #include <dwmapi.h>
 #include <windowsx.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "dwmapi.lib")
 
 namespace {
@@ -212,6 +219,8 @@ ImFont* AppWindow::s_dro_font_       = nullptr;
 ImFont* AppWindow::s_badge_font_top_ = nullptr;
 ImFont* AppWindow::s_badge_font_sub_ = nullptr;
 
+static void fitWindowToWorkArea(GLFWwindow* window);
+
 AppWindow::AppWindow(const std::string& title, int width, int height)
     : title_(title), saved_window_w_(width), saved_window_h_(height)
 {
@@ -229,6 +238,8 @@ AppWindow::AppWindow(const std::string& title, int width, int height)
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     // Custom borderless window: replace default white OS title bar with sleek industrial header
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    // Created hidden: runLoop() shows it after the saved geometry is applied and the first frame is drawn
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     window_ = glfwCreateWindow(width, height, title_.c_str(), nullptr, nullptr);
     if (!window_) {
@@ -309,7 +320,13 @@ AppWindow::AppWindow(const std::string& title, int width, int height)
 #endif
 
     glfwMakeContextCurrent(window_);
-    glfwSwapInterval(1); // Enable VSync (60 Hz)
+    // No driver vsync wait: many OpenGL drivers busy-wait for the display refresh inside SwapBuffers, which keeps
+    // a whole CPU core at 100% and starves the UI on 2-core laptops. runLoop() paces frames by sleeping instead
+    // (the Windows compositor still presents without tearing in windowed and borderless mode).
+    glfwSwapInterval(0);
+#ifdef _WIN32
+    timeBeginPeriod(1); // 1 ms sleep granularity for the frame limiter
+#endif
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -375,6 +392,7 @@ AppWindow::AppWindow(const std::string& title, int width, int height)
 AppWindow::~AppWindow() {
     if (window_) {
 #ifdef _WIN32
+        timeEndPeriod(1);
         if (s_overlay_hwnd && IsWindow(s_overlay_hwnd)) {
             DestroyWindow(s_overlay_hwnd);
             s_overlay_hwnd = nullptr;
@@ -394,10 +412,100 @@ AppWindow::~AppWindow() {
     }
 }
 
+void AppWindow::renderPerfOverlay() {
+    const auto& reg = perf::registry();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - 12.0f, vp->Pos.y + 44.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(400.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##PerfOverlay", nullptr, flags)) {
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::TextColored(ImVec4(0.40f, 0.75f, 1.0f, 1.0f), "PERFORMANCE (F12 to close)");
+        ImGui::Text("%d frames in the last second", perf_fps_);
+        ImGui::Text("Vertices: %d   Indices: %d   Windows: %d", io.MetricsRenderVertices, io.MetricsRenderIndices,
+                    io.MetricsRenderWindows);
+        ImGui::Spacing();
+        if (ImGui::BeginTable("##PerfTable", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Section", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("avg ms", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableSetupColumn("worst ms", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < reg.count; ++i) {
+                const auto& s = reg.sections[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(s.name);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.2f", s.avg_ms);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.2f", s.max_ms);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        if (ImGui::BeginTable("##PerfCoreTable", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Controller / USB", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("per s", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+            ImGui::TableSetupColumn("avg ms", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+            ImGui::TableSetupColumn("worst ms", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableHeadersRow();
+            const struct { const char* name; const core::diag::Counter::Snapshot* s; } rows[] = {
+                {"Waiting for controller (reads)", &perf_read_wait_},
+                {"Controller tick holds lock", &perf_tick_hold_},
+                {"USB writes to board", &perf_usb_write_},
+            };
+            for (const auto& r : rows) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(r.name);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%llu", static_cast<unsigned long long>(r.s->count));
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.2f", r.s->avg_ms);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.2f", r.s->max_ms);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Averages and the worst frame over the last second. \"Whole frame (busy)\" is the work per "
+                            "frame; at 60 FPS it must stay below 16.7 ms. \"Idle\" is the time the app sleeps until "
+                            "the next frame. \"GPU draw\" waits for the GPU while this overlay is open.");
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+}
+
 int AppWindow::runLoop(const std::function<void()>& render_callback) {
     if (!window_) return 1;
 
+    using PerfClock = std::chrono::steady_clock;
+    auto msSince = [](PerfClock::time_point t) {
+        return std::chrono::duration<double, std::milli>(PerfClock::now() - t).count();
+    };
+    auto& perf_reg = perf::registry();
+    // BREAKOUTCNC_PERF_LOG=<file>: also write the overlay's numbers once per second (for remote diagnosis)
+    std::FILE* perf_log = nullptr;
+    if (const char* log_path = std::getenv("BREAKOUTCNC_PERF_LOG"); log_path && *log_path) {
+        perf_log = std::fopen(log_path, "w");
+    }
+
+    // Frame limiter: 60 FPS, 10 FPS while minimized
+    constexpr auto kFramePeriod     = std::chrono::microseconds(16667);
+    constexpr auto kIconifiedPeriod = std::chrono::milliseconds(100);
+    auto next_frame = PerfClock::now();
+
+    // The default or saved size may not fit this screen (e.g. settings copied from a larger monitor)
+    if (!is_fullscreen_ && glfwGetWindowAttrib(window_, GLFW_MAXIMIZED) != GLFW_TRUE) {
+        fitWindowToWorkArea(window_);
+    }
+    bool window_shown = false;
+
     while (!glfwWindowShouldClose(window_)) {
+        const auto t_frame = PerfClock::now();
         glfwPollEvents();
 
         // Track normal window geometry when not fullscreen and not maximized or minimized
@@ -423,6 +531,13 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
             toggleFullscreen();
         }
+        // F12: performance overlay
+        if (ImGui::IsKeyPressed(ImGuiKey_F12, false)) {
+            perf_overlay_visible_ = !perf_overlay_visible_;
+        }
+        perf_reg.enabled = perf_overlay_visible_ || perf_log != nullptr;
+        perf::add("Events + new frame", msSince(t_frame));
+        const auto t_ui = PerfClock::now();
 
         // 1. Sleek Modern Custom Title Bar Header (edge-to-edge, height = 32px)
         renderCustomTitleBar();
@@ -453,15 +568,70 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
 
         ImGui::End();
 
+        if (perf_overlay_visible_) {
+            renderPerfOverlay();
+        }
+        perf::add("UI build (all panels)", msSince(t_ui));
+
+        auto t_phase = PerfClock::now();
         ImGui::Render();
+        perf::add("ImGui render (CPU)", msSince(t_phase));
+
+        t_phase = PerfClock::now();
         int display_w = 0, display_h = 0;
         glfwGetFramebufferSize(window_, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
         glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (perf_reg.enabled) {
+            glFinish(); // Only while measuring: separates the GPU's work from the vsync wait below
+        }
+        perf::add("GPU draw", msSince(t_phase));
 
+        t_phase = PerfClock::now();
         glfwSwapBuffers(window_);
+        perf::add("Swap", msSince(t_phase));
+        if (!window_shown) {
+            window_shown = true;
+            glfwShowWindow(window_);
+            glfwFocusWindow(window_);
+        }
+
+        perf::add("Whole frame (busy)", msSince(t_frame));
+
+        // Sleep until the next frame slot; never try to catch up after a slow frame
+        t_phase = PerfClock::now();
+        next_frame += (glfwGetWindowAttrib(window_, GLFW_ICONIFIED) == GLFW_TRUE) ? kIconifiedPeriod : kFramePeriod;
+        if (t_phase > next_frame + kFramePeriod) {
+            next_frame = t_phase;
+        }
+        std::this_thread::sleep_until(next_frame);
+        perf::add("Idle (frame limiter)", msSince(t_phase));
+        if (perf_reg.enabled &&
+            perf::endFrame(perf_frames_in_second_, perf_second_start_s_, glfwGetTime(), perf_fps_)) {
+            perf_read_wait_ = core::diag::controllerReadWait().takeAndReset();
+            perf_tick_hold_ = core::diag::workerTickLockHold().takeAndReset();
+            perf_usb_write_ = core::diag::usbWrite().takeAndReset();
+            if (perf_log) {
+                std::fprintf(perf_log, "fps=%d vertices=%d", perf_fps_, ImGui::GetIO().MetricsRenderVertices);
+                for (size_t i = 0; i < perf_reg.count; ++i) {
+                    const auto& s = perf_reg.sections[i];
+                    std::fprintf(perf_log, " | %s avg=%.2f max=%.2f", s.name, s.avg_ms, s.max_ms);
+                }
+                const struct { const char* name; const core::diag::Counter::Snapshot* s; } rows[] = {
+                    {"read wait", &perf_read_wait_}, {"tick lock hold", &perf_tick_hold_}, {"usb write", &perf_usb_write_}};
+                for (const auto& r : rows) {
+                    std::fprintf(perf_log, " | %s n=%llu avg=%.2f max=%.2f", r.name,
+                                 static_cast<unsigned long long>(r.s->count), r.s->avg_ms, r.s->max_ms);
+                }
+                std::fprintf(perf_log, "\n");
+                std::fflush(perf_log);
+            }
+        }
+    }
+    if (perf_log) {
+        std::fclose(perf_log);
     }
 
     if (on_close_callback_) {
@@ -936,6 +1106,30 @@ static GLFWmonitor* getCurrentMonitor(GLFWwindow* window) {
     return best_monitor ? best_monitor : glfwGetPrimaryMonitor();
 }
 
+// Shrinks and moves a normal (not maximized) window so it lies inside the work area of the monitor it
+// overlaps most; a window that overlaps no monitor goes to the first one
+static void fitWindowToWorkArea(GLFWwindow* window) {
+    GLFWmonitor* monitor = getCurrentMonitor(window);
+    if (!monitor) return;
+    int wx = 0, wy = 0, ww = 0, wh = 0;
+    glfwGetMonitorWorkarea(monitor, &wx, &wy, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+
+    int x = 0, y = 0, w = 0, h = 0;
+    glfwGetWindowPos(window, &x, &y);
+    glfwGetWindowSize(window, &w, &h);
+    const int new_w = std::min(w, ww);
+    const int new_h = std::min(h, wh);
+    const int new_x = std::clamp(x, wx, wx + ww - new_w);
+    const int new_y = std::clamp(y, wy, wy + wh - new_h);
+    if (new_w != w || new_h != h) {
+        glfwSetWindowSize(window, new_w, new_h);
+    }
+    if (new_x != x || new_y != y) {
+        glfwSetWindowPos(window, new_x, new_y);
+    }
+}
+
 void AppWindow::setWindowGeometry(int x, int y, int width, int height, bool maximized) {
     if (!window_) return;
     if (width >= 640 && height >= 480) {
@@ -943,11 +1137,14 @@ void AppWindow::setWindowGeometry(int x, int y, int width, int height, bool maxi
         saved_window_h_ = height;
         glfwSetWindowSize(window_, width, height);
     }
-    if (x >= 0 && y >= 0) {
+    // Monitors left of or above the primary one have negative coordinates; -32000 marks a minimized window
+    if (x > -10000 && y > -10000) {
         saved_window_x_ = x;
         saved_window_y_ = y;
         glfwSetWindowPos(window_, x, y);
     }
+    // The settings may come from another PC or a monitor that is no longer connected
+    fitWindowToWorkArea(window_);
     if (maximized) {
         saved_was_maximized_ = true;
         glfwMaximizeWindow(window_);

@@ -1,5 +1,6 @@
 #include "ui_common/dro_panel.h"
 #include "ui_common/app_window.h"
+#include "ui_common/frame_stats.h"
 #include "ui_common/gcode_panel.h"
 #include "core/scripting/script_path_helper.h"
 #include "imgui.h"
@@ -237,6 +238,7 @@ void DroAndJogPanel::render(
     float allocated_h,
     GCodeProgramPanel* gcode_panel)
 {
+    perf::ScopedTimer perf_timer("DRO + jog panel");
     float start_cursor_y = ImGui::GetCursorPosY();
     handleKeyboardJog(controller, telemetry);
 

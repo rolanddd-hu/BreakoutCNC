@@ -1,5 +1,6 @@
 #include "ui_common/gcode_panel.h"
 #include "ui_common/app_window.h"
+#include "ui_common/frame_stats.h"
 #include "ui_common/file_dialog.h"
 #include "imgui.h"
 #include <cmath>
@@ -19,6 +20,7 @@ void GCodeProgramPanel::render(
     double total_cut_length_mm,
     const std::function<void()>& on_load_file_clicked)
 {
+    perf::ScopedTimer perf_timer("G-code list + cycle buttons");
     const auto program = controller.getProgram(); // Snapshot stays valid even if a new file is loaded meanwhile
     const auto& gcode_lines = program->lines;
     updateLineNumberCache(gcode_lines, loaded_filename);

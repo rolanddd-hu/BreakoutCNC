@@ -1,4 +1,5 @@
 #include "core/controller/machine_controller.h"
+#include "core/diagnostics.h"
 #include "core/scripting/script_runner.h"
 #include "core/scripting/script_path_helper.h"
 #include <chrono>
@@ -419,7 +420,9 @@ void MachineController::applyConfigLocked(const MachineConfig& cfg_in) {
 }
 
 MachineConfig MachineController::getConfig() const {
+    const auto wait_start = Clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
+    diag::controllerReadWait().add(Clock::now() - wait_start);
     return config_;
 }
 
@@ -456,7 +459,9 @@ void MachineController::requestVfdParameterRead() {
 TelemetrySnapshot MachineController::getTelemetry() const {
     TelemetrySnapshot telem;
     {
+        const auto wait_start = Clock::now();
         std::lock_guard<std::mutex> lock(mutex_);
+        diag::controllerReadWait().add(Clock::now() - wait_start);
         telem = telemetry_;
     }
     // Script state is queried without holding the controller lock (the script thread calls back into us)
@@ -2141,7 +2146,9 @@ void MachineController::setProgramLocked(std::shared_ptr<const gcode::ParseResul
 }
 
 std::shared_ptr<const gcode::ParseResult> MachineController::getProgram() const {
+    const auto wait_start = Clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
+    diag::controllerReadWait().add(Clock::now() - wait_start);
     return program_;
 }
 
@@ -2360,7 +2367,7 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
     if (wordValue('F', f_val) && f_val > 0.0) {
         mdi_feed_mm_min_ = f_val * unit_scale; // Feed rate is modal across MDI commands
     }
-    if (!telemetry_.simulator_mode) {
+    if (!telemetry_.simulator_mode && config_.require_homing) {
         for (size_t a = 0; a < 4; ++a) {
             if (((mdi_res.machine_axes_used >> a) & 1U) && !telemetry_.axis_homed[a]) {
                 telemetry_.active_fault_message = std::string("MDI rejected: machine-coordinate move on unhomed axis ") + kAxisNames[a];
@@ -2526,11 +2533,12 @@ bool MachineController::validateProgramForRunLocked(size_t start_seg) {
         telemetry_.active_fault_message = "Cannot start: program has errors. " + prog.firstErrorText();
         return false;
     }
-    if (!telemetry_.simulator_mode) {
+    if (!telemetry_.simulator_mode && config_.require_homing) {
         for (size_t a = 0; a < 4; ++a) {
             if (((prog.machine_axes_used >> a) & 1U) && !telemetry_.axis_homed[a]) {
                 telemetry_.active_fault_message = std::string("Cannot start: the program uses machine coordinates (G53/G28) on ") +
-                                                  kAxisNames[a] + ", which is not homed. Home the machine first.";
+                                                  kAxisNames[a] + ", which is not homed. Home the machine first, or turn off "
+                                                  "\"Require homing\" for a machine without home switches.";
                 return false;
             }
         }
@@ -3910,6 +3918,11 @@ void MachineController::workerLoop() {
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            const auto lock_start = Clock::now();
+            struct HoldTimer {
+                Clock::time_point start;
+                ~HoldTimer() { diag::workerTickLockHold().add(Clock::now() - start); }
+            } hold_timer{lock_start};
 
             processBoardReportLocked(got_any, rep, usb_open_now);
             evaluateInputsAndEndStopsLocked();

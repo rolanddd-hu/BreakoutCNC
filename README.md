@@ -12,7 +12,7 @@ BreakoutCNC drives the **RNR Eco Motion 2.0** USB motion board (VID `A720`, PID 
 as a Mach3 USB controller). The PC plans the motion and streams it to the board, so the board's original
 Mach3 plugin is not needed. A built-in simulator lets you try everything without hardware.
 
-> **Version 0.1: experimental.** This is the first public release. Read the [safety notice](#safety) before
+> **Experimental.** This is an early release (see the [changelog](CHANGELOG.md)). Read the [safety notice](#safety) before
 > connecting it to a machine.
 
 ## Features

@@ -129,6 +129,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
         viewport.setIsometric3D(saved_settings.ui.isometric_3d);
         viewport.setShowRapids(saved_settings.ui.show_rapids);
+        viewport.setSimplifyPx(saved_settings.ui.toolpath_simplify_px);
         viewport.setShowPierces(saved_settings.ui.show_pierces);
         viewport.setFollowTorch(saved_settings.ui.follow_torch);
 
@@ -201,6 +202,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
         saved_settings.ui.isometric_3d            = viewport.isIsometric3D();
         saved_settings.ui.show_rapids             = viewport.getShowRapids();
+        saved_settings.ui.toolpath_simplify_px = viewport.getSimplifyPx();
         saved_settings.ui.show_pierces            = viewport.getShowPierces();
         saved_settings.ui.follow_torch            = viewport.getFollowTorch();
         saved_settings.ui.minimal_layout          = saved_settings.ui.minimal_layout;
@@ -272,6 +274,7 @@ int main(int /*argc*/, char** /*argv*/) {
     viewport.setOnViewChanged([&]() {
         saved_settings.ui.isometric_3d = viewport.isIsometric3D();
         saved_settings.ui.show_rapids  = viewport.getShowRapids();
+        saved_settings.ui.toolpath_simplify_px = viewport.getSimplifyPx();
         saved_settings.ui.show_pierces = viewport.getShowPierces();
         saved_settings.ui.follow_torch = viewport.getFollowTorch();
         markSettingsDirty();
@@ -1519,6 +1522,28 @@ int main(int /*argc*/, char** /*argv*/) {
                             if (ImGui::IsItemHovered()) {
                                 ImGui::SetTooltip("Active Low: Checked = Normally-Closed (NC) switch connected to COM/GND.\nTriggers E-Stop when opened or pulled low. Unchecked = Active High (NO switch).");
                             }
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::Spacing();
+
+                        // 2. Homing requirement
+                        ImGui::BeginChild("##PlasmaHomingRequiredCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                        {
+                            ImGui::TextColored(ImVec4(0.40f, 0.75f, 1.0f, 1.0f), "HOMING");
+                            ImGui::Spacing();
+                            if (ImGui::Checkbox("Require homing for G53 / G28 / G30##ReqHome", &cfg.require_homing)) changed = true;
+                            ImGui::PushTextWrapPos(0.0f);
+                            if (cfg.require_homing) {
+                                ImGui::TextDisabled("Programs and MDI commands that move in machine coordinates (G53, G28, G30) "
+                                                    "are refused until those axes are homed.");
+                            } else {
+                                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                                   "Machine coordinates are then not tied to switches: they continue from the position saved when the app last closed. "
+                                                   "If the axes were moved by hand or lost steps, G53 / G28 / G30 moves go to the wrong place. "
+                                                   "Use this only on a machine without home switches.");
+                            }
+                            ImGui::PopTextWrapPos();
                         }
                         ImGui::EndChild();
 

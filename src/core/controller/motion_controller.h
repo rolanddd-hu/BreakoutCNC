@@ -398,7 +398,10 @@ struct MachineConfig {
     bool             limit_override    = false; // Allow jogging off an active end-stop switch (buf[2]=0x40)
     uint8_t          estop_pin           = 0;     // 0 = disabled by default, 1..12 = IN1..IN12
     bool             estop_invert        = false;
-    float            spindle_pwm_ratio   = 1.0f;  // Mill 0-10V AVI scaling
+    // Programs and MDI commands that move in machine coordinates (G53 / G28 / G30) need the axis homed first.
+    // Off for machines without home switches: machine coordinates then continue from the position saved at the last exit.
+    bool             require_homing      = true;
+    float            spindle_pwm_ratio  = 1.0f;  // Mill 0-10V AVI scaling
     double           spindle_ramp_up_s   = 0.0;   // Mill spindle spin-up ramp time (0..30s) before cutting starts
     double           spindle_ramp_down_s = 0.0;   // Mill spindle spin-down ramp time (0..30s)
     ThcConfig        thc{};

@@ -1,6 +1,7 @@
 #include "ui_common/toolpath_viewport.h"
 #include "ui_common/app_window.h"
 #include "ui_common/io_status_bar.h"
+#include "ui_common/frame_stats.h"
 #include "imgui.h"
 #include <GLFW/glfw3.h>
 #include <cmath>
@@ -24,21 +25,174 @@ ToolpathViewport::~ToolpathViewport() {
 namespace {
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 
-void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thickness = 1.2f, float dash_len = 6.0f) {
+// Background opacity of every overlay on the toolpath view (toolbar, readouts, legend, banners): 85 %, so the
+// toolpath stays faintly visible behind them
+constexpr float kOverlayBgAlpha    = 0.85f;
+constexpr int   kOverlayBgAlpha255 = static_cast<int>(kOverlayBgAlpha * 255.0f + 0.5f);
+
+// Clips the line a->b to rectangle r (x0, y0, x1, y1) in parametric form (Liang-Barsky).
+// Returns false if no part of the line is inside.
+bool clipLineParams(ImVec2 a, ImVec2 b, const ImVec4& r, float& t0, float& t1) {
+    t0 = 0.0f;
+    t1 = 1.0f;
+    const float dx = b.x - a.x;
+    const float dy = b.y - a.y;
+    const float p[4] = {-dx, dx, -dy, dy};
+    const float q[4] = {a.x - r.x, r.z - a.x, a.y - r.y, r.w - a.y};
+    for (int i = 0; i < 4; ++i) {
+        if (std::abs(p[i]) < 1e-9f) {
+            if (q[i] < 0.0f) return false;
+            continue;
+        }
+        const float t = q[i] / p[i];
+        if (p[i] < 0.0f) {
+            t0 = std::max(t0, t);
+        } else {
+            t1 = std::min(t1, t);
+        }
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
+// Only the visible part is dashed (a long rapid seen up close would otherwise produce thousands of dashes);
+// the dash pattern stays anchored to point a so dashes do not crawl while panning
+void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thickness, float dash_len, const ImVec4& clip) {
+    float t0 = 0.0f, t1 = 1.0f;
+    if (!clipLineParams(a, b, clip, t0, t1)) return;
     float dx = b.x - a.x;
     float dy = b.y - a.y;
     float dist = std::hypot(dx, dy);
     if (dist < 1.0f) return;
     float ux = dx / dist;
     float uy = dy / dist;
-    float pos = 0.0f;
+    const float period = dash_len * 2.0f;
+    float pos = std::floor(t0 * dist / period) * period;
+    dist *= t1;
     while (pos < dist) {
         float end_p = std::min(pos + dash_len, dist);
         ImVec2 p0(a.x + ux * pos, a.y + uy * pos);
         ImVec2 p1(a.x + ux * end_p, a.y + uy * end_p);
         dl->AddLine(p0, p1, col, thickness);
-        pos += dash_len * 2.0f;
+        pos += period;
     }
+}
+
+// Grows a clip rectangle (x0, y0, x1, y1) by the line thickness
+ImVec4 cullRect(const ImVec4& clip) {
+    constexpr float kMargin = 4.0f;
+    return ImVec4(clip.x - kMargin, clip.y - kMargin, clip.z + kMargin, clip.w + kMargin);
+}
+
+bool lineOutside(ImVec2 a, ImVec2 b, const ImVec4& r) {
+    return (a.x < r.x && b.x < r.x) || (a.x > r.z && b.x > r.z) || (a.y < r.y && b.y < r.y) || (a.y > r.w && b.y > r.w);
+}
+
+// Merges toolpath segments into lines. Dense CAM programs have 100k+ segments, most of them tiny steps
+// along nearly straight or gently curved paths: a chain of connected segments becomes one line for as long
+// as every point of the chain stays within tolerance_px of that line. Each finished line goes to
+// sink(a, b, first_segment, last_segment).
+//
+// The check is constant work per point (sleeve / angular-wedge simplification): each point P at distance d
+// from the chain start allows the final line direction to deviate from P's direction by asin(tol / d). The
+// wedge of directions allowed by all points so far is kept as two unit vectors; a new point fits if its
+// direction lies inside the wedge and it is not closer to the start than the farthest point (no reversal).
+template <class Sink>
+class ToolpathLineBatch {
+public:
+    ToolpathLineBatch(Sink sink, float tolerance_px) : sink_(std::move(sink)), tol_(tolerance_px) {}
+    ~ToolpathLineBatch() { flush(); }
+
+    void add(ImVec2 p0, ImVec2 p1, uint32_t seg) {
+        if (!pending_ || distSq(p0, end_) > kJoinPx * kJoinPx) {
+            flush();
+            startChain(p0, seg);
+        }
+        if (!extend(p1, seg)) {
+            emit();
+            startChain(end_, seg);
+            extend(p1, seg); // always fits a fresh chain
+        }
+    }
+
+    void flush() {
+        if (pending_ && distSq(start_, end_) > 0.01f) emit();
+        pending_ = false;
+    }
+
+private:
+    static constexpr float kJoinPx = 0.25f; // segment starts where the previous one ended
+
+    static float distSq(ImVec2 a, ImVec2 b) {
+        const float dx = b.x - a.x;
+        const float dy = b.y - a.y;
+        return dx * dx + dy * dy;
+    }
+    static float cross(ImVec2 a, ImVec2 b) { return a.x * b.y - a.y * b.x; }
+
+    void startChain(ImVec2 p, uint32_t seg) {
+        start_      = p;
+        end_        = p;
+        max_dist_   = 0.0f;
+        has_wedge_  = false;
+        pending_    = true;
+        first_seg_  = seg;
+        last_seg_   = seg;
+    }
+
+    // Moves the chain end to p if the whole chain still fits one line; false (unchanged) otherwise
+    bool extend(ImVec2 p, uint32_t seg) {
+        const ImVec2 v(p.x - start_.x, p.y - start_.y);
+        const float d = std::sqrt(v.x * v.x + v.y * v.y);
+        if (d + 0.25f * tol_ < max_dist_) return false; // path turned back towards the start
+        if (d > tol_) {
+            const ImVec2 u(v.x / d, v.y / d);
+            const float s = tol_ / d;                // sin of the allowed deviation
+            const float c = std::sqrt(1.0f - s * s); // cos of the allowed deviation
+            const ImVec2 lo(u.x * c + u.y * s, u.y * c - u.x * s); // u rotated clockwise
+            const ImVec2 hi(u.x * c - u.y * s, u.y * c + u.x * s); // u rotated counter-clockwise
+            if (!has_wedge_) {
+                wedge_lo_  = lo;
+                wedge_hi_  = hi;
+                has_wedge_ = true;
+            } else {
+                if (cross(wedge_lo_, u) < 0.0f || cross(u, wedge_hi_) < 0.0f) return false;
+                if (cross(wedge_lo_, lo) > 0.0f) wedge_lo_ = lo; // keep the tighter bound on each side
+                if (cross(hi, wedge_hi_) > 0.0f) wedge_hi_ = hi;
+            }
+        }
+        // Points within tol of the start constrain nothing
+        end_      = p;
+        max_dist_ = std::max(max_dist_, d);
+        last_seg_ = seg;
+        return true;
+    }
+
+    void emit() { sink_(start_, end_, first_seg_, last_seg_); }
+
+    Sink sink_;
+    float tol_;
+    bool pending_   = false;
+    bool has_wedge_ = false;
+    float max_dist_ = 0.0f;
+    ImVec2 start_{}, end_{};
+    ImVec2 wedge_lo_{}, wedge_hi_{}; // allowed directions of the merged line (unit vectors)
+    uint32_t first_seg_ = 0, last_seg_ = 0;
+};
+
+// Draws merged lines of one color into a draw list, skipping lines outside the clip rectangle
+struct DrawLineSink {
+    ImDrawList* dl;
+    ImVec4 cull;
+    ImU32 col;
+    void operator()(ImVec2 a, ImVec2 b, uint32_t, uint32_t) const {
+        if (!lineOutside(a, b, cull)) dl->AddLine(a, b, col, 1.0f);
+    }
+};
+
+bool isCutSegment(const core::ToolpathSegment& seg) {
+    return seg.type == core::SegmentType::CutLinear || seg.type == core::SegmentType::CutArcCW ||
+           seg.type == core::SegmentType::CutArcCCW;
 }
 
 void drawHudTextbox(
@@ -53,7 +207,7 @@ void drawHudTextbox(
     ImU32 val_color = IM_COL32(225, 238, 252, 255))
 {
     ImVec2 box_p1(box_p0.x + box_w, box_p0.y + box_h);
-    dl->AddRectFilled(box_p0, box_p1, IM_COL32(10, 13, 18, 238), 4.0f);
+    dl->AddRectFilled(box_p0, box_p1, IM_COL32(10, 13, 18, kOverlayBgAlpha255), 4.0f);
     dl->AddRect(box_p0, box_p1, IM_COL32(46, 62, 82, 215), 4.0f, 0, 1.0f);
 
     float text_y = box_p0.y + (box_h - font_size) * 0.5f - 1.0f;
@@ -74,6 +228,95 @@ void ToolpathViewport::fitToBounds(const std::array<double, 3>& bbox_min_mm, con
     initial_fit_done_ = false; // Will compute exact pixel scale on next frame
 }
 
+// The view projection without pan and canvas center: projectXYZ(p) == center + projectNoPan(p) - projectNoPan(pan)
+ImVec2 ToolpathViewport::projectNoPan(double x_mm, double y_mm, double z_mm) const {
+    if (!isometric_3d_) {
+        return ImVec2(static_cast<float>(x_mm) * zoom_px_per_mm_, -static_cast<float>(y_mm) * zoom_px_per_mm_);
+    }
+    const double yaw_rad   = static_cast<double>(view_yaw_deg_) * kDegToRad;
+    const double pitch_rad = static_cast<double>(view_pitch_deg_) * kDegToRad;
+    const double rx = x_mm * std::cos(yaw_rad) - y_mm * std::sin(yaw_rad);
+    const double ry = x_mm * std::sin(yaw_rad) + y_mm * std::cos(yaw_rad);
+    const double sy = ry * std::cos(pitch_rad) + z_mm * std::sin(pitch_rad);
+    return ImVec2(static_cast<float>(rx * zoom_px_per_mm_), -static_cast<float>(sy * zoom_px_per_mm_));
+}
+
+void ToolpathViewport::updatePathCache(const std::vector<core::ToolpathSegment>& segments) {
+    // A cheap fingerprint guards against a new program allocated at the same address with the same size
+    double fingerprint = 0.0;
+    if (!segments.empty()) {
+        for (size_t i : {size_t{0}, segments.size() / 2, segments.size() - 1}) {
+            const auto& s = segments[i];
+            fingerprint += s.end_xyza_mm[0] * 1.3 + s.end_xyza_mm[1] * 1.7 + s.end_xyza_mm[2] * 1.9 +
+                           static_cast<double>(s.gcode_line) + static_cast<double>(s.type) * 0.1;
+        }
+    }
+    auto& c = path_cache_;
+    if (c.valid && c.seg_data == segments.data() && c.seg_count == segments.size() && c.fingerprint == fingerprint &&
+        c.iso == isometric_3d_ && c.yaw == view_yaw_deg_ && c.pitch == view_pitch_deg_ && c.zoom == zoom_px_per_mm_ &&
+        c.tol == simplify_px_ && c.tool_filter == selected_tool_filter_) {
+        return;
+    }
+    c.valid       = true;
+    c.seg_data    = segments.data();
+    c.seg_count   = segments.size();
+    c.fingerprint = fingerprint;
+    c.iso         = isometric_3d_;
+    c.yaw         = view_yaw_deg_;
+    c.pitch       = view_pitch_deg_;
+    c.zoom        = zoom_px_per_mm_;
+    c.tol         = simplify_px_;
+    c.tool_filter = selected_tool_filter_;
+    c.cuts.clear();
+    c.rapids.clear();
+    c.pierces.clear();
+    c.tools_in_file.clear();
+
+    // Same math as projectNoPan() with the trigonometry hoisted out of the loop
+    const bool   iso  = isometric_3d_;
+    const float  zoom = zoom_px_per_mm_;
+    const double cy   = std::cos(static_cast<double>(view_yaw_deg_) * kDegToRad);
+    const double sy   = std::sin(static_cast<double>(view_yaw_deg_) * kDegToRad);
+    const double cp   = std::cos(static_cast<double>(view_pitch_deg_) * kDegToRad);
+    const double sp   = std::sin(static_cast<double>(view_pitch_deg_) * kDegToRad);
+    auto project = [&](const std::array<double, 4>& p) -> ImVec2 {
+        if (!iso) return ImVec2(static_cast<float>(p[0]) * zoom, -static_cast<float>(p[1]) * zoom);
+        const double rx = p[0] * cy - p[1] * sy;
+        const double ry = p[0] * sy + p[1] * cy;
+        return ImVec2(static_cast<float>(rx * zoom), -static_cast<float>((ry * cp + p[2] * sp) * zoom));
+    };
+
+    uint16_t batch_tool = 0;
+    auto sink = [&c, &batch_tool](ImVec2 a, ImVec2 b, uint32_t first, uint32_t last) {
+        c.cuts.push_back(CachedCutLine{a, b, first, last, batch_tool});
+    };
+    ToolpathLineBatch<decltype(sink)> batch(sink, simplify_px_);
+    uint16_t last_tool_seen = 0;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto& seg = segments[i];
+        if (seg.tool_number > 0 && seg.tool_number != last_tool_seen) {
+            last_tool_seen = seg.tool_number;
+            if (std::find(c.tools_in_file.begin(), c.tools_in_file.end(), seg.tool_number) == c.tools_in_file.end()) {
+                c.tools_in_file.push_back(seg.tool_number);
+            }
+        }
+        if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
+        if (seg.type == core::SegmentType::RapidMove) {
+            c.rapids.push_back(project(seg.start_xyza_mm));
+            c.rapids.push_back(project(seg.end_xyza_mm));
+        } else if (seg.type == core::SegmentType::Dwell) {
+            c.pierces.push_back(CachedPoint{project(seg.start_xyza_mm), static_cast<uint32_t>(i)});
+        } else if (isCutSegment(seg)) {
+            if (seg.tool_number != batch_tool) {
+                batch.flush(); // one tool (one color) per merged line
+                batch_tool = seg.tool_number;
+            }
+            batch.add(project(seg.start_xyza_mm), project(seg.end_xyza_mm), static_cast<uint32_t>(i));
+        }
+    }
+    batch.flush();
+}
+
 void ToolpathViewport::render(
     const std::vector<core::ToolpathSegment>& segments,
     const core::TelemetrySnapshot& telemetry,
@@ -81,6 +324,7 @@ void ToolpathViewport::render(
     const std::array<double, 3>& bbox_max_mm,
     core::IMotionController* controller)
 {
+    perf::ScopedTimer perf_timer("Toolpath view");
     ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
     ImVec2 canvas_sz = ImGui::GetContentRegionAvail();
     if (canvas_sz.x < 60.0f) canvas_sz.x = 60.0f;
@@ -322,7 +566,7 @@ void ToolpathViewport::render(
         // Calibration status banner at top
         ImVec2 banner_p0(canvas_p0.x + 8.0f, tb_p1.y + 34.0f);
         ImVec2 banner_p1(canvas_p1.x - 8.0f, banner_p0.y + 32.0f);
-        dl->AddRectFilled(banner_p0, banner_p1, IM_COL32(10, 18, 28, 240), 4.0f);
+        dl->AddRectFilled(banner_p0, banner_p1, IM_COL32(10, 18, 28, kOverlayBgAlpha255), 4.0f);
         dl->AddRect(banner_p0, banner_p1, IM_COL32(0, 215, 255, 230), 4.0f, 0, 1.5f);
         if (waiting_for_dent_click_) {
             dl->AddText(ImVec2(banner_p0.x + 12.0f, banner_p0.y + 7.0f),
@@ -523,29 +767,33 @@ void ToolpathViewport::render(
         current_active_tool = segments[0].tool_number;
     }
 
+    // Whole-pixel line widths: ImGui draws them from its line texture with half the vertices of fractional widths
+    const ImVec4 canvas_clip(canvas_p0.x, canvas_p0.y, canvas_p1.x, canvas_p1.y);
+    const ImVec4 cull = cullRect(canvas_clip);
+
+    // Cached geometry + this frame's pan offset
+    updatePathCache(segments);
+    const ImVec2 pan_px = projectNoPan(pan_x_mm_, pan_y_mm_, 0.0);
+    const ImVec2 off(center_px.x - pan_px.x, center_px.y - pan_px.y);
+    auto shifted = [&off](ImVec2 p) { return ImVec2(p.x + off.x, p.y + off.y); };
+
     // Layer 1: Rapids (G0 travel moves)
     if (show_rapids_) {
-        for (const auto& seg : segments) {
-            if (seg.type == core::SegmentType::RapidMove) {
-                if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
-                ImVec2 p0 = projectXYZ(seg.start_xyza_mm[0], seg.start_xyza_mm[1], seg.start_xyza_mm[2]);
-                ImVec2 p1 = projectXYZ(seg.end_xyza_mm[0], seg.end_xyza_mm[1], seg.end_xyza_mm[2]);
-                drawDashedLine(dl, p0, p1, col_rapid, 1.2f, 5.0f);
-            }
+        const auto& r = path_cache_.rapids;
+        for (size_t i = 0; i + 1 < r.size(); i += 2) {
+            drawDashedLine(dl, shifted(r[i]), shifted(r[i + 1]), col_rapid, 1.0f, 5.0f, canvas_clip);
         }
     }
 
     // Layer 2: Pierce / Dwell markers (G4)
     if (show_pierces_) {
-        for (const auto& seg : segments) {
-            if (seg.type == core::SegmentType::Dwell) {
-                if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
-                ImVec2 pt = projectXYZ(seg.start_xyza_mm[0], seg.start_xyza_mm[1], seg.start_xyza_mm[2]);
-                bool done = (seg.segment_index < active_idx);
-                ImU32 pcol = done ? col_cut_done : IM_COL32(255, 190, 40, 220);
-                dl->AddCircleFilled(pt, 4.0f, pcol, 12);
-                dl->AddCircle(pt, 7.0f, pcol, 12, 1.2f);
-            }
+        for (const auto& pc : path_cache_.pierces) {
+            const ImVec2 pt = shifted(pc.p);
+            if (pt.x < cull.x - 8.0f || pt.x > cull.z + 8.0f || pt.y < cull.y - 8.0f || pt.y > cull.w + 8.0f) continue;
+            bool done = (pc.seg < active_idx);
+            ImU32 pcol = done ? col_cut_done : IM_COL32(255, 190, 40, 220);
+            dl->AddCircleFilled(pt, 4.0f, pcol, 12);
+            dl->AddCircle(pt, 7.0f, pcol, 12, 1.2f);
         }
     }
 
@@ -584,39 +832,41 @@ void ToolpathViewport::render(
         }
     }
 
+    // A cached line that covers segments on both sides of the active span is redrawn from its own segments,
+    // so progress is shown segment-exact instead of whole merged lines changing color at once
+    auto drawSegmentRange = [&](uint32_t first, uint32_t last, ImU32 col) {
+        ToolpathLineBatch<DrawLineSink> batch(DrawLineSink{dl, cull, col}, simplify_px_);
+        for (uint32_t i = first; i <= last && i < segments.size(); ++i) {
+            const auto& seg = segments[i];
+            if (!isCutSegment(seg)) continue;
+            if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
+            batch.add(projectXYZ(seg.start_xyza_mm[0], seg.start_xyza_mm[1], seg.start_xyza_mm[2]),
+                      projectXYZ(seg.end_xyza_mm[0], seg.end_xyza_mm[1], seg.end_xyza_mm[2]), i);
+        }
+    };
+
     // Layer 3: Uncut Cut Segments (seg.segment_index > active_end_idx)
     // Drawn FIRST so future operations never paint over completed cuts
-    for (const auto& seg : segments) {
-        if (seg.type != core::SegmentType::CutLinear &&
-            seg.type != core::SegmentType::CutArcCW &&
-            seg.type != core::SegmentType::CutArcCCW)
-        {
-            continue;
-        }
-        if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
-        if (seg.segment_index > active_end_idx) {
-            ImVec2 p0 = projectXYZ(seg.start_xyza_mm[0], seg.start_xyza_mm[1], seg.start_xyza_mm[2]);
-            ImVec2 p1 = projectXYZ(seg.end_xyza_mm[0], seg.end_xyza_mm[1], seg.end_xyza_mm[2]);
-            const bool is_active_tool = (seg.tool_number == current_active_tool);
-            ImU32 c = is_active_tool ? col_uncut : col_uncut_other_tool;
-            dl->AddLine(p0, p1, c, 1.0f);
+    for (const auto& ln : path_cache_.cuts) {
+        if (ln.last_seg <= active_end_idx) continue;
+        const ImU32 col = (ln.tool == current_active_tool) ? col_uncut : col_uncut_other_tool;
+        if (ln.first_seg > active_end_idx) {
+            const ImVec2 a = shifted(ln.a), b = shifted(ln.b);
+            if (!lineOutside(a, b, cull)) dl->AddLine(a, b, col, 1.0f);
+        } else {
+            drawSegmentRange(static_cast<uint32_t>(active_end_idx + 1), ln.last_seg, col);
         }
     }
 
     // Layer 4: Completed Cut Segments (seg.segment_index < active_idx)
     // Drawn ON TOP of uncut lines with vivid neon green
-    for (const auto& seg : segments) {
-        if (seg.type != core::SegmentType::CutLinear &&
-            seg.type != core::SegmentType::CutArcCW &&
-            seg.type != core::SegmentType::CutArcCCW)
-        {
-            continue;
-        }
-        if (selected_tool_filter_ != 0 && seg.tool_number != selected_tool_filter_) continue;
-        if (seg.segment_index < active_idx) {
-            ImVec2 p0 = projectXYZ(seg.start_xyza_mm[0], seg.start_xyza_mm[1], seg.start_xyza_mm[2]);
-            ImVec2 p1 = projectXYZ(seg.end_xyza_mm[0], seg.end_xyza_mm[1], seg.end_xyza_mm[2]);
-            dl->AddLine(p0, p1, col_cut_done, 1.2f);
+    for (const auto& ln : path_cache_.cuts) {
+        if (ln.first_seg >= active_idx) continue;
+        if (ln.last_seg < active_idx) {
+            const ImVec2 a = shifted(ln.a), b = shifted(ln.b);
+            if (!lineOutside(a, b, cull)) dl->AddLine(a, b, col_cut_done, 1.0f);
+        } else {
+            drawSegmentRange(ln.first_seg, static_cast<uint32_t>(active_idx - 1), col_cut_done);
         }
     }
 
@@ -676,7 +926,7 @@ void ToolpathViewport::render(
     }
     } // end if (!in_cam_calibration)
 
-    // 5. Bottom-Left Viewport HUD Overlay: Individual Fixed-Width Digital Textboxes (never jump/resize)
+    // 5. Bottom-Left Viewport HUD Overlay: individual digital textboxes, each as wide as its label and value
     size_t cut_done_count = std::min(active_idx, segments.size());
     float pct_done = segments.empty() ? 0.0f : (100.0f * static_cast<float>(cut_done_count) / static_cast<float>(segments.size()));
     int elapsed_min = static_cast<int>(telemetry.job_elapsed_seconds) / 60;
@@ -688,6 +938,14 @@ void ToolpathViewport::render(
     const float box_gap     = 6.0f;
     const float hud_y       = canvas_p1.y - box_h - 8.0f;
     float cur_x             = canvas_p0.x + 10.0f;
+
+    // Label + value + 8 px padding each side + 12 px between them (matches drawHudTextbox)
+    auto hudBoxWidth = [hud_font](float font_sz, const char* label, const char* value) {
+        auto text_w = [&](const char* s) {
+            return hud_font ? hud_font->CalcTextSizeA(font_sz, 1000.0f, 0.0f, s).x : ImGui::CalcTextSize(s).x;
+        };
+        return std::ceil(text_w(label) + text_w(value) + 28.0f);
+    };
 
     const bool is_imp = (controller && controller->getConfig().linear_units == core::LinearUnits::Imperial);
     const double b_scale = is_imp ? (1.0 / 25.4) : 1.0;
@@ -701,23 +959,26 @@ void ToolpathViewport::render(
                       bbox_max_mm[0] - bbox_min_mm[0],
                       bbox_max_mm[1] - bbox_min_mm[1]);
     }
-    drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), 285.0f, box_h,
+    const float bounds_w = hudBoxWidth(hud_font_sz, "Part Bounds:", bounds_val);
+    drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), bounds_w, box_h,
                    "Part Bounds:", bounds_val, IM_COL32(215, 228, 245, 255));
-    cur_x += 285.0f + box_gap;
+    cur_x += bounds_w + box_gap;
 
     char prog_val[64];
     std::snprintf(prog_val, sizeof(prog_val), "%zu / %zu (%3.0f%%)",
                   cut_done_count, segments.size(), pct_done);
-    drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), 255.0f, box_h,
+    const float prog_w = hudBoxWidth(hud_font_sz, "Progress:", prog_val);
+    drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), prog_w, box_h,
                    "Progress:", prog_val, IM_COL32(0, 230, 140, 255));
-    cur_x += 255.0f + box_gap;
+    cur_x += prog_w + box_gap;
 
     char elapsed_val[64];
     std::snprintf(elapsed_val, sizeof(elapsed_val), "%02d:%04.1f s",
                   elapsed_min, elapsed_sec);
-    drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), 220.0f, box_h,
+    const float elapsed_w = hudBoxWidth(hud_font_sz, "Elapsed:", elapsed_val);
+    drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), elapsed_w, box_h,
                    "Elapsed:", elapsed_val, IM_COL32(255, 210, 75, 255));
-    cur_x += 220.0f + box_gap;
+    cur_x += elapsed_w + box_gap;
 
     // 6. Top-Left Viewport HUD Overlay: Zoom & 3D RMB readouts right below the top-left view buttons
     const float top_hud_y   = tb_p1.y + 4.0f;
@@ -727,28 +988,69 @@ void ToolpathViewport::render(
 
     char zoom_val[64];
     std::snprintf(zoom_val, sizeof(zoom_val), "%.1f px/mm", zoom_px_per_mm_);
-    drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), 150.0f, top_box_h,
+    const float zoom_w = hudBoxWidth(top_font_sz, "Zoom:", zoom_val);
+    drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), zoom_w, top_box_h,
                    "Zoom:", zoom_val, IM_COL32(120, 215, 255, 255));
-    top_cur_x += 150.0f + box_gap;
+    top_cur_x += zoom_w + box_gap;
 
     if (isometric_3d_) {
         char rot_val[64];
         std::snprintf(rot_val, sizeof(rot_val), "Y:%+.0f P:%+.0f", view_yaw_deg_, view_pitch_deg_);
-        drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), 160.0f, top_box_h,
+        const float rot_w = hudBoxWidth(top_font_sz, "3D RMB:", rot_val);
+        drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), rot_w, top_box_h,
                        "3D RMB:", rot_val, IM_COL32(190, 175, 255, 255));
+        top_cur_x += rot_w + box_gap;
     } else if (in_cam_overlay) {
-        drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), 175.0f, top_box_h,
+        const float sync_w = hudBoxWidth(top_font_sz, "Cam Sync:", "PAN/ZOOM LOCKED");
+        drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), sync_w, top_box_h,
                        "Cam Sync:", "PAN/ZOOM LOCKED", IM_COL32(255, 215, 70, 255));
+        top_cur_x += sync_w + box_gap;
     } else if (in_cam_calibration) {
-        drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), 175.0f, top_box_h,
+        const float calib_w = hudBoxWidth(top_font_sz, "Cam Mode:", "CALIBRATING");
+        drawHudTextbox(dl, hud_font, top_font_sz, ImVec2(top_cur_x, top_hud_y), calib_w, top_box_h,
                        "Cam Mode:", "CALIBRATING", IM_COL32(0, 235, 255, 255));
+        top_cur_x += calib_w + box_gap;
+    }
+
+    // Color legend on the same row, aligned to the right edge (skipped if the view is too narrow for it)
+    {
+        struct LegendItem { const char* label; ImU32 col; };
+        const LegendItem items[] = {
+            {"Cut",       IM_COL32(0, 230, 117, 255)},
+            {"Active",    IM_COL32(255, 145, 0, 255)},
+            {"To Be Cut", IM_COL32(0, 230, 255, 255)},
+            {"Rapid",     IM_COL32(140, 153, 173, 255)},
+        };
+        const float pad = 8.0f, swatch_w = 12.0f, swatch_gap = 5.0f, item_gap = 12.0f;
+        auto textWidth = [&](const char* s) {
+            return hud_font ? hud_font->CalcTextSizeA(top_font_sz, 1000.0f, 0.0f, s).x : ImGui::CalcTextSize(s).x;
+        };
+        float legend_w = pad * 2.0f - item_gap;
+        for (const auto& it : items) legend_w += swatch_w + swatch_gap + textWidth(it.label) + item_gap;
+
+        const float legend_x = canvas_p1.x - 8.0f - legend_w;
+        if (legend_x >= top_cur_x) {
+            const ImVec2 box_p0(legend_x, top_hud_y);
+            const ImVec2 box_p1(legend_x + legend_w, top_hud_y + top_box_h);
+            dl->AddRectFilled(box_p0, box_p1, IM_COL32(10, 13, 18, kOverlayBgAlpha255), 4.0f);
+            dl->AddRect(box_p0, box_p1, IM_COL32(46, 62, 82, 215), 4.0f, 0, 1.0f);
+            const float text_y = top_hud_y + (top_box_h - top_font_sz) * 0.5f - 1.0f;
+            const float mid_y  = top_hud_y + top_box_h * 0.5f;
+            float x = legend_x + pad;
+            for (const auto& it : items) {
+                dl->AddLine(ImVec2(x, mid_y), ImVec2(x + swatch_w, mid_y), it.col, 3.0f);
+                x += swatch_w + swatch_gap;
+                dl->AddText(hud_font, top_font_sz, ImVec2(x, text_y), it.col, it.label);
+                x += textWidth(it.label) + item_gap;
+            }
+        }
     }
 
     // 5.5 Interactive Surface Rectangle Selection Overlay
     if (selecting_surface_rect_) {
         ImVec2 banner_p0(canvas_p0.x + 8.0f, canvas_p0.y + tb_h + 10.0f);
         ImVec2 banner_p1(canvas_p1.x - 8.0f, banner_p0.y + 32.0f);
-        dl->AddRectFilled(banner_p0, banner_p1, IM_COL32(12, 20, 32, 235), 4.0f);
+        dl->AddRectFilled(banner_p0, banner_p1, IM_COL32(12, 20, 32, kOverlayBgAlpha255), 4.0f);
         dl->AddRect(banner_p0, banner_p1, IM_COL32(0, 200, 255, 220), 4.0f, 0, 1.5f);
         dl->AddText(ImVec2(banner_p0.x + 12.0f, banner_p0.y + 7.0f),
                     IM_COL32(0, 235, 255, 255),
@@ -797,7 +1099,7 @@ void ToolpathViewport::render(
                 tip_y0 = canvas_p0.y + tb_h + 8.0f;
             }
 
-            dl->AddRectFilled(ImVec2(tip_x0, tip_y0), ImVec2(tip_x0 + tip_w, tip_y0 + tip_h), IM_COL32(10, 15, 24, 235), 4.0f);
+            dl->AddRectFilled(ImVec2(tip_x0, tip_y0), ImVec2(tip_x0 + tip_w, tip_y0 + tip_h), IM_COL32(10, 15, 24, kOverlayBgAlpha255), 4.0f);
             dl->AddRect(ImVec2(tip_x0, tip_y0), ImVec2(tip_x0 + tip_w, tip_y0 + tip_h), IM_COL32(0, 200, 255, 210), 4.0f, 0, 1.2f);
             dl->AddText(ImVec2(tip_x0 + pad_x, tip_y0 + pad_y), IM_COL32(230, 245, 255, 255), dim_buf);
         }
@@ -826,7 +1128,7 @@ void ToolpathViewport::render(
 
     // 6. Floating Top Toolbar HUD hovering directly over the top of the canvas
     ImGui::SetCursorScreenPos(tb_p0);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.07f, 0.10f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.07f, 0.10f, kOverlayBgAlpha));
     ImGui::PushStyleColor(ImGuiCol_Border,  ImVec4(0.16f, 0.20f, 0.27f, 0.95f));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
@@ -911,19 +1213,61 @@ void ToolpathViewport::render(
             if (on_view_changed_) on_view_changed_();
         }
 
-        // Multi-tool filter selector (if program contains more than 1 tool)
-        std::vector<uint16_t> tools_in_file;
-        for (const auto& s : segments) {
-            if (s.tool_number > 0) {
-                if (std::find(tools_in_file.begin(), tools_in_file.end(), s.tool_number) == tools_in_file.end()) {
-                    tools_in_file.push_back(s.tool_number);
-                }
-            }
+        // Detail + tool selector are aligned to the right edge; the surface status goes between, when it fits
+        const auto& tools_in_file = path_cache_.tools_in_file;
+        const bool  show_tool_combo = tools_in_file.size() > 1;
+        const float combo_w   = 125.0f;
+        const float group_gap = 16.0f;
+        const float detail_w  = ImGui::CalcTextSize("Detail").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float group_w   = detail_w + (show_tool_combo ? group_gap + combo_w : 0.0f);
+        const float after_checkboxes_x = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + group_gap;
+        const float right_group_x = std::max(after_checkboxes_x, ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - group_w);
+
+        char surface_txt[64] = "";
+        ImVec4 surface_col(0.0f, 0.90f, 0.46f, 1.0f);
+        if (has_pending_surface_change_) {
+            std::snprintf(surface_txt, sizeof(surface_txt), "[SURFACE PREVIEW: %.0f%% (UNAPPLIED)]", proposed_surface_smoothness_ * 100.0f);
+            surface_col = ImVec4(1.0f, 0.75f, 0.20f, 1.0f);
+        } else if (telemetry.surface_compensation_active) {
+            std::snprintf(surface_txt, sizeof(surface_txt), "[SURFACE COMPENSATED: %.0f%%]", telemetry.surface_height_map->smoothness * 100.0f);
         }
-        if (tools_in_file.size() > 1) {
-            // Distinct spacing between the last checkbox and the tool selector dropdown
-            ImGui::SameLine(0.0f, 16.0f);
-            ImGui::SetNextItemWidth(125.0f);
+        if (surface_txt[0] != '\0' && after_checkboxes_x + ImGui::CalcTextSize(surface_txt).x + group_gap <= right_group_x) {
+            ImGui::SameLine(0.0f, group_gap);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(surface_col, "%s", surface_txt);
+        }
+
+        ImGui::SameLine(right_group_x);
+        if (ImGui::Button("Detail")) {
+            ImGui::OpenPopup("##ToolpathDetailPopup");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Toolpath drawing accuracy (lower it if the view is slow on large programs)");
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+        if (ImGui::BeginPopup("##ToolpathDetailPopup")) {
+            const float popup_w = 280.0f;
+            ImGui::TextUnformatted("Toolpath drawing tolerance");
+            ImGui::SetNextItemWidth(popup_w);
+            float px = simplify_px_;
+            if (ImGui::SliderFloat("##SimplifyPx", &px, kMinSimplifyPx, kMaxSimplifyPx, "%.1f px")) {
+                setSimplifyPx(px);
+                if (on_view_changed_) on_view_changed_();
+            }
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + popup_w);
+            ImGui::TextDisabled("Short connected moves are drawn as one line while they stay within this many pixels "
+                                "of it. Higher values draw large programs faster on slow PCs; curves look slightly "
+                                "more angular. Only the display changes, never the machine motion.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar(2);
+
+        // Multi-tool filter selector (if program contains more than 1 tool)
+        if (show_tool_combo) {
+            ImGui::SameLine(0.0f, group_gap);
+            ImGui::SetNextItemWidth(combo_w);
             char combo_preview[64];
             if (selected_tool_filter_ == 0) {
                 std::snprintf(combo_preview, sizeof(combo_preview), "Tool: All (%zu)", tools_in_file.size());
@@ -943,37 +1287,6 @@ void ToolpathViewport::render(
                 }
                 ImGui::EndCombo();
             }
-        }
-
-        // Legend aligned to the right edge of the floating toolbar
-        const float spacing_item   = ImGui::GetStyle().ItemSpacing.x;
-        const float cut_w          = ImGui::CalcTextSize("[Cut]").x;
-        const float active_w       = ImGui::CalcTextSize("[Active]").x;
-        const float to_be_cut_w    = ImGui::CalcTextSize("[To Be Cut]").x;
-        const float rapid_w        = ImGui::CalcTextSize("[Rapid]").x;
-        const float exact_legend_w = cut_w + active_w + to_be_cut_w + rapid_w + spacing_item * 3.0f;
-        const float pad_right      = ImGui::GetStyle().WindowPadding.x > 0.0f ? ImGui::GetStyle().WindowPadding.x : 8.0f;
-        const float target_x       = ImGui::GetWindowWidth() - exact_legend_w - pad_right;
-
-        if (target_x > ImGui::GetCursorPosX() + 16.0f) {
-            if (has_pending_surface_change_) {
-                ImGui::SameLine(0.0f, 16.0f);
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.20f, 1.0f), "[SURFACE PREVIEW: %.0f%% (UNAPPLIED)]", proposed_surface_smoothness_ * 100.0f);
-            } else if (telemetry.surface_compensation_active) {
-                ImGui::SameLine(0.0f, 16.0f);
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextColored(ImVec4(0.0f, 0.90f, 0.46f, 1.0f), "[SURFACE COMPENSATED: %.0f%%]", telemetry.surface_height_map->smoothness * 100.0f);
-            }
-            ImGui::SameLine(target_x);
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(ImVec4(0.0f, 0.90f, 0.46f, 1.0f), "[Cut]");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.57f, 0.0f, 1.0f), "[Active]");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.0f, 0.90f, 1.0f, 1.0f), "[To Be Cut]");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.68f, 1.0f), "[Rapid]");
         }
     }
     ImGui::EndChild();

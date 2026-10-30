@@ -3,7 +3,10 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 
 namespace rnr::hid {
 
@@ -18,9 +21,10 @@ struct UsbDeviceInfo {
     uint16_t output_report_len = 0;
 };
 
-// Thread-safety: all public methods may be called from any thread. A single I/O mutex serializes
-// reads, writes, open and close so the device handle can never be closed underneath a pending
-// overlapped operation.
+// Thread-safety: all public methods may be called from any thread. The I/O mutex serializes reads,
+// open and close; writes go through a queue served by a writer thread (the board can take ~25 ms to
+// accept a report, which must not stall the caller). close() waits for queued writes and holds both
+// mutexes, so the handle can never be closed underneath a pending overlapped operation.
 class RnrUsbDevice {
 public:
     RnrUsbDevice();
@@ -42,8 +46,13 @@ public:
     // Timeout-based 49-byte status report read (returns true if a report was read)
     bool readStatusReport(protocol::BoardStatusReport& out_report, uint32_t timeout_ms = 10);
 
-    // Raw 27-byte output report write (automatically assigns & increments 16-bit sequence number at buf[3..4])
-    bool sendPacket(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq = nullptr, uint32_t timeout_ms = 50);
+    // Queues a raw 27-byte output report (automatically assigns & increments 16-bit sequence number at buf[3..4])
+    // and returns without waiting for the board. Reports are written in order. Returns false if the device is
+    // closed, the queue is full, or an earlier queued write failed.
+    bool sendPacket(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq = nullptr);
+
+    // Waits until every queued report has been written (or the timeout expires)
+    bool flush(uint32_t timeout_ms);
 
     // High-level convenience wrappers around protocol packet builders
     bool sendShortCommand(
@@ -80,10 +89,25 @@ public:
     uint16_t lastSentSequence() const noexcept { return tx_seq_.load(std::memory_order_relaxed); }
 
 private:
+    enum class WriteResult { Ok, Failed, Disconnected };
+
     void closeLocked();
     bool readStatusReportLocked(protocol::BoardStatusReport& out_report, uint32_t timeout_ms);
+    void writerLoop();
+    WriteResult writePacket(const protocol::OutputReportBuffer& packet);
 
-    mutable std::mutex io_mutex_;               // Guards handle_, info_, read state and all I/O
+    static constexpr size_t   kMaxQueuedWrites = 64;
+    static constexpr uint32_t kWriteTimeoutMs  = 50;
+
+    mutable std::mutex io_mutex_;               // Guards handle_, info_ and read state; held by open/close/read
+    std::mutex write_mutex_;                    // Guards tx_buf_ / write_event_; handle_ changes hold both mutexes
+    std::mutex queue_mutex_;                    // Guards tx_queue_, writer_busy_, writer_stop_
+    std::condition_variable queue_cv_;
+    std::deque<protocol::OutputReportBuffer> tx_queue_;
+    bool writer_busy_ = false;
+    bool writer_stop_ = false;
+    std::atomic<bool> write_failed_{false};     // A queued write failed; reported by the next sendPacket()
+    std::thread writer_thread_;                 // Started by the first successful open()
     void* handle_ = nullptr;                    // Windows HANDLE / hid_device*
     std::atomic<bool> open_{false};             // Lock-free mirror of "handle_ is valid" for isOpen()
     void* read_event_ = nullptr;                // Overlapped Read Event HANDLE

@@ -2,6 +2,7 @@
 #include "imgui.h"
 #include "core/controller/motion_controller.h"
 #include "core/camera/camera_manager.h"
+#include <algorithm>
 #include <vector>
 #include <array>
 #include <functional>
@@ -81,6 +82,13 @@ public:
 
     void setFollowToolLabel(const std::string& label) { follow_tool_label_ = label; }
 
+    // Toolpath drawing tolerance in screen pixels: chains of short segments are drawn as one line while they
+    // stay within this distance of it. Larger = fewer lines, faster drawing, less exact curves.
+    static constexpr float kMinSimplifyPx = 0.5f;
+    static constexpr float kMaxSimplifyPx = 4.0f;
+    void setSimplifyPx(float px) noexcept { simplify_px_ = std::clamp(px, kMinSimplifyPx, kMaxSimplifyPx); }
+    float getSimplifyPx() const noexcept { return simplify_px_; }
+
     void setOnViewChanged(std::function<void()> cb) { on_view_changed_ = std::move(cb); }
 
     void setSelectedToolFilter(uint16_t tool) noexcept { selected_tool_filter_ = tool; }
@@ -118,6 +126,35 @@ public:
     }
 
 private:
+    // Toolpath geometry projected and simplified for the current view, without the pan offset (screen position =
+    // cached position + offset). Rebuilt only when the program, zoom, 3D angle, tolerance or tool filter changes,
+    // so panning, following the tool and job progress do not re-process every segment each frame.
+    struct CachedCutLine {
+        ImVec2   a, b;
+        uint32_t first_seg = 0, last_seg = 0; // segment index range the merged line covers
+        uint16_t tool      = 0;
+    };
+    struct CachedPoint {
+        ImVec2   p;
+        uint32_t seg = 0;
+    };
+    struct PathCache {
+        bool        valid       = false;
+        const void* seg_data    = nullptr;
+        size_t      seg_count   = 0;
+        double      fingerprint = 0.0;
+        bool        iso         = false;
+        float       yaw = 0.0f, pitch = 0.0f, zoom = 0.0f, tol = 0.0f;
+        uint16_t    tool_filter = 0;
+        std::vector<CachedCutLine> cuts;
+        std::vector<ImVec2>        rapids;  // start / end pairs
+        std::vector<CachedPoint>   pierces;
+        std::vector<uint16_t>      tools_in_file; // in order of first use, regardless of the filter
+    };
+    void updatePathCache(const std::vector<core::ToolpathSegment>& segments);
+    ImVec2 projectNoPan(double x_mm, double y_mm, double z_mm) const;
+    PathCache path_cache_;
+
     float zoom_px_per_mm_   = 4.2f;
     float pan_x_mm_         = 65.0f;
     float pan_y_mm_         = 45.0f;
@@ -127,6 +164,7 @@ private:
     bool  show_rapids_      = true;
     bool  show_pierces_     = true;
     bool  follow_torch_     = false;
+    float simplify_px_      = 1.0f;
     bool  initial_fit_done_ = false;
     std::string follow_tool_label_ = "Follow Torch";
     float proposed_surface_smoothness_ = 0.5f;

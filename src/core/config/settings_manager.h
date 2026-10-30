@@ -18,6 +18,7 @@ struct AppUiSettings {
     bool        show_rapids             = true;
     bool        show_pierces            = true;
     bool        follow_torch            = false;
+    float       toolpath_simplify_px    = 1.0f;  // Toolpath view drawing tolerance (ToolpathViewport::setSimplifyPx)
     bool        minimal_layout          = false; // false = Full layout, true = Minimal (big viewport) layout
 
     bool        step_jog_mode           = false;

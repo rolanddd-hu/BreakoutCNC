@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <functional>
+#include "core/diagnostics.h"
 
 struct GLFWwindow;
 struct ImFont;
@@ -63,6 +64,14 @@ public:
 
 private:
     void renderCustomTitleBar();
+    void renderPerfOverlay(); // F12: frame time breakdown
+
+    // F12 performance overlay statistics
+    int    perf_frames_in_second_ = 0;
+    double perf_second_start_s_   = 0.0;
+    int    perf_fps_              = 0;
+    bool   perf_overlay_visible_  = false;
+    core::diag::Counter::Snapshot perf_read_wait_{}, perf_tick_hold_{}, perf_usb_write_{}; // last completed second
 
     GLFWwindow* window_ = nullptr;
     std::string title_;

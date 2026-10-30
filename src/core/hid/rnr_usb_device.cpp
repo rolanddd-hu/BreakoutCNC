@@ -1,4 +1,5 @@
 #include "core/hid/rnr_usb_device.h"
+#include "core/diagnostics.h"
 #include <algorithm>
 #include <cstring>
 
@@ -54,6 +55,14 @@ RnrUsbDevice::RnrUsbDevice() {
 
 RnrUsbDevice::~RnrUsbDevice() {
     close();
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        writer_stop_ = true;
+    }
+    queue_cv_.notify_all();
+    if (writer_thread_.joinable()) {
+        writer_thread_.join();
+    }
 #ifdef _WIN32
     if (read_event_) {
         CloseHandle(static_cast<HANDLE>(read_event_));
@@ -199,6 +208,7 @@ bool RnrUsbDevice::open(const std::string& device_path) {
     // Size transfer buffers to the device's reported HID report lengths: Windows requires the read
     // buffer to be at least InputReportByteLength and writes to be exactly OutputReportByteLength.
     rx_buf_.assign(std::max<size_t>(protocol::kInputReportBytes, info_.input_report_len), 0);
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
     tx_buf_.assign(std::max<size_t>(protocol::kOutputReportBytes, info_.output_report_len), 0);
 
 #ifdef _WIN32
@@ -228,22 +238,41 @@ bool RnrUsbDevice::open(const std::string& device_path) {
     handle_ = dev;
     read_pending_ = false;
 #endif
+    write_failed_.store(false);
     open_.store(true);
+    if (!writer_thread_.joinable()) {
+        writer_thread_ = std::thread(&RnrUsbDevice::writerLoop, this);
+    }
     return true;
 }
 
 void RnrUsbDevice::close() {
+    // Let the final commands (e.g. E-stop, outputs off on disconnect) reach the board first
+    flush(250);
     std::lock_guard<std::mutex> lock(io_mutex_);
     closeLocked();
 }
 
+bool RnrUsbDevice::flush(uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    return queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                              [this] { return tx_queue_.empty() && !writer_busy_; });
+}
+
 void RnrUsbDevice::closeLocked() {
     open_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        tx_queue_.clear();
+    }
+    queue_cv_.notify_all();
 #ifdef _WIN32
     if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
         HANDLE h = static_cast<HANDLE>(handle_);
-        // CancelIoEx cancels I/O issued by ANY thread on this handle (CancelIo only cancels the caller's).
+        // CancelIoEx cancels I/O issued by ANY thread on this handle (CancelIo only cancels the caller's),
+        // so a write in progress on the writer thread finishes at once and releases write_mutex_.
         CancelIoEx(h, nullptr);
+        std::lock_guard<std::mutex> write_lock(write_mutex_);
         if (read_pending_) {
             // Wait for the cancelled read so the kernel no longer references the OVERLAPPED / buffer.
             DWORD ignored = 0;
@@ -253,6 +282,8 @@ void RnrUsbDevice::closeLocked() {
     }
     handle_ = INVALID_HANDLE_VALUE;
 #else
+    // The writer takes io_mutex_ before writing on this platform, so no write is in progress here
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
     if (handle_) {
         hid_close(static_cast<hid_device*>(handle_));
     }
@@ -341,19 +372,66 @@ bool RnrUsbDevice::readStatusReportLocked(protocol::BoardStatusReport& out_repor
 #endif
 }
 
-bool RnrUsbDevice::sendPacket(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq, uint32_t timeout_ms) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
+bool RnrUsbDevice::sendPacket(protocol::OutputReportBuffer& packet, uint16_t* out_assigned_seq) {
     if (!open_.load()) return false;
+    if (write_failed_.exchange(false)) return false;
 
-    // Assign and increment 16-bit sequence number at buf[3..4] (acknowledged by the board in its status report)
-    const uint16_t seq = static_cast<uint16_t>(tx_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
-    protocol::writeLE16(&packet[3], seq);
-    if (out_assigned_seq) {
-        *out_assigned_seq = seq;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (tx_queue_.size() >= kMaxQueuedWrites) return false;
+
+        // Assign and increment 16-bit sequence number at buf[3..4] (acknowledged by the board in its status
+        // report). Assigned under the queue lock so sequence numbers reach the board in ascending order.
+        const uint16_t seq = static_cast<uint16_t>(tx_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
+        protocol::writeLE16(&packet[3], seq);
+        if (out_assigned_seq) {
+            *out_assigned_seq = seq;
+        }
+        tx_queue_.push_back(packet);
     }
+    queue_cv_.notify_all();
+    return true;
+}
+
+void RnrUsbDevice::writerLoop() {
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    while (true) {
+        queue_cv_.wait(lock, [this] { return writer_stop_ || !tx_queue_.empty(); });
+        if (writer_stop_) return;
+        const protocol::OutputReportBuffer packet = tx_queue_.front();
+        tx_queue_.pop_front();
+        writer_busy_ = true;
+        lock.unlock();
+
+        const WriteResult result = writePacket(packet);
+        if (result == WriteResult::Disconnected) {
+            std::lock_guard<std::mutex> io_lock(io_mutex_);
+            closeLocked();
+        } else if (result == WriteResult::Failed && open_.load()) {
+            write_failed_.store(true);
+        }
+
+        lock.lock();
+        writer_busy_ = false;
+        queue_cv_.notify_all();
+    }
+}
+
+RnrUsbDevice::WriteResult RnrUsbDevice::writePacket(const protocol::OutputReportBuffer& packet) {
+#ifndef _WIN32
+    // hidapi does not promise that reads and writes on one device may overlap
+    std::lock_guard<std::mutex> io_lock(io_mutex_);
+#endif
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (!open_.load()) return WriteResult::Failed;
 
     std::fill(tx_buf_.begin(), tx_buf_.end(), 0);
     std::memcpy(tx_buf_.data(), packet.data(), packet.size());
+
+    struct WriteTimer {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~WriteTimer() { core::diag::usbWrite().add(std::chrono::steady_clock::now() - start); }
+    } write_timer;
 
 #ifdef _WIN32
     HANDLE h = static_cast<HANDLE>(handle_);
@@ -366,38 +444,30 @@ bool RnrUsbDevice::sendPacket(protocol::OutputReportBuffer& packet, uint16_t* ou
     if (!ok) {
         const DWORD err = GetLastError();
         if (err != ERROR_IO_PENDING) {
-            if (isDisconnectError(err)) {
-                closeLocked();
-            }
-            return false;
+            return isDisconnectError(err) ? WriteResult::Disconnected : WriteResult::Failed;
         }
-        DWORD wait_res = WaitForSingleObject(ol.hEvent, timeout_ms);
+        DWORD wait_res = WaitForSingleObject(ol.hEvent, kWriteTimeoutMs);
         if (wait_res != WAIT_OBJECT_0) {
             // Cancel the write and WAIT for the cancellation to complete: the OVERLAPPED lives on this
             // stack frame, so the kernel must be finished with it before we return.
             CancelIoEx(h, &ol);
             GetOverlappedResult(h, &ol, &bytes_written, TRUE);
-            return false;
+            return WriteResult::Failed;
         }
         if (!GetOverlappedResult(h, &ol, &bytes_written, FALSE)) {
-            if (isDisconnectError(GetLastError())) {
-                closeLocked();
-            }
-            return false;
+            return isDisconnectError(GetLastError()) ? WriteResult::Disconnected : WriteResult::Failed;
         }
     }
-    return bytes_written == tx_buf_.size();
+    return bytes_written == tx_buf_.size() ? WriteResult::Ok : WriteResult::Failed;
 #else
-    (void)timeout_ms;
     int bytes_written = hid_write(
         static_cast<hid_device*>(handle_),
         tx_buf_.data(),
         tx_buf_.size());
     if (bytes_written < 0) {
-        closeLocked();
-        return false;
+        return WriteResult::Disconnected;
     }
-    return bytes_written == static_cast<int>(tx_buf_.size());
+    return bytes_written == static_cast<int>(tx_buf_.size()) ? WriteResult::Ok : WriteResult::Failed;
 #endif
 }
 

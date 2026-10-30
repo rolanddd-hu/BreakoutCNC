@@ -2,6 +2,7 @@
 #include "core/controller/rnr_controller.h"
 #include "core/config/settings_manager.h"
 #include "ui_common/app_window.h"
+#include "ui_common/frame_stats.h"
 #include "ui_common/toolpath_viewport.h"
 #include "ui_common/dro_panel.h"
 #include "ui_common/io_status_bar.h"
@@ -141,6 +142,7 @@ int main(int /*argc*/, char** /*argv*/) {
         controller.setFeedOverride(saved_settings.ui.feed_override_pct);
 
         viewport.setShowRapids(saved_settings.ui.show_rapids);
+        viewport.setSimplifyPx(saved_settings.ui.toolpath_simplify_px);
         viewport.setShowPierces(saved_settings.ui.show_pierces);
         viewport.setFollowTorch(saved_settings.ui.follow_torch);
 
@@ -233,6 +235,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
         saved_settings.ui.isometric_3d         = viewport.isIsometric3D();
         saved_settings.ui.show_rapids          = viewport.getShowRapids();
+        saved_settings.ui.toolpath_simplify_px = viewport.getSimplifyPx();
         saved_settings.ui.show_pierces         = viewport.getShowPierces();
         saved_settings.ui.follow_torch         = viewport.getFollowTorch();
         saved_settings.ui.minimal_layout       = minimal_layout;
@@ -266,6 +269,7 @@ int main(int /*argc*/, char** /*argv*/) {
     viewport.setOnViewChanged([&]() {
         saved_settings.ui.isometric_3d = viewport.isIsometric3D();
         saved_settings.ui.show_rapids  = viewport.getShowRapids();
+        saved_settings.ui.toolpath_simplify_px = viewport.getSimplifyPx();
         saved_settings.ui.show_pierces = viewport.getShowPierces();
         saved_settings.ui.follow_torch = viewport.getFollowTorch();
         markSettingsDirty();
@@ -452,6 +456,7 @@ int main(int /*argc*/, char** /*argv*/) {
         if (!minimal_layout) {
             ImGui::SameLine();
 
+            const auto perf_right_col = std::chrono::steady_clock::now();
             ImGui::BeginChild("##MillRightCol", ImVec2(right_col_w, workspace_h), false, ImGuiWindowFlags_NoScrollbar);
             {
                 ImGui::BeginChild("##MillSettingsScroll", ImVec2(0.0f, 0.0f), true);
@@ -1637,6 +1642,28 @@ int main(int /*argc*/, char** /*argv*/) {
 
                 ImGui::Spacing();
 
+                // 2. HOMING REQUIREMENT
+                ImGui::BeginChild("##HomingRequiredCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                {
+                    ImGui::TextColored(ImVec4(0.40f, 0.75f, 1.0f, 1.0f), "HOMING");
+                    ImGui::Spacing();
+                    if (ImGui::Checkbox("Require homing for G53 / G28 / G30##ReqHome", &cfg.require_homing)) changed = true;
+                    ImGui::PushTextWrapPos(0.0f);
+                    if (cfg.require_homing) {
+                        ImGui::TextDisabled("Programs and MDI commands that move in machine coordinates (G53, G28, G30) "
+                                            "are refused until those axes are homed.");
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.30f, 1.0f),
+                                           "Machine coordinates are then not tied to switches: they continue from the position saved when the app last closed. "
+                                           "If the axes were moved by hand or lost steps, G53 / G28 / G30 moves go to the wrong place. "
+                                           "Use this only on a machine without home switches.");
+                    }
+                    ImGui::PopTextWrapPos();
+                }
+                ImGui::EndChild();
+
+                ImGui::Spacing();
+
                 const char* ax_names[4] = {"X AXIS LIMITS & HOMING", "Y AXIS LIMITS & HOMING", "Z AXIS LIMITS & HOMING", "A AXIS LIMITS & HOMING"};
                 const char* card_ids[4] = {"##LimitsXCard", "##LimitsYCard", "##LimitsZCard", "##LimitsACard"};
                 for (int a = 0; a < 4; ++a) {
@@ -1998,6 +2025,7 @@ int main(int /*argc*/, char** /*argv*/) {
                 ImGui::EndChild(); // ##MillSettingsScroll
             }
             ImGui::EndChild(); // ##MillRightCol
+            ui::perf::add("Settings column", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_right_col).count());
         } // if (!minimal_layout)
 
         // Exit Confirmation Modal when cycle is active

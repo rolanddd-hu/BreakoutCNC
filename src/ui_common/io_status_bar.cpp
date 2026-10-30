@@ -469,7 +469,8 @@ void IoStatusBar::renderFloatingAlarmBanner(
         ImGui::SetNextWindowPos(screen_pos);
         ImGui::SetNextWindowSize(ImVec2(width, 38.0f));
 
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.42f, 0.08f, 0.08f, 0.95f));
+        // 85 % like the other toolpath view overlays, so the toolpath stays faintly visible behind the banner
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.42f, 0.08f, 0.08f, 0.85f));
         ImGui::PushStyleColor(ImGuiCol_Border,   ImVec4(0.85f, 0.25f, 0.20f, 1.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
