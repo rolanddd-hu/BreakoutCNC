@@ -33,6 +33,17 @@
 #include <fstream>
 #include <sstream>
 
+// Polls until the controller's worker thread has caught up. Fixed sleeps were flaky on slow CI runners.
+template <typename Pred>
+static bool waitUntil(Pred pred, int timeout_ms = 5000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
 // Mock motion controller for scripting tests
 class MockController : public rnr::core::IMotionController {
 public:
@@ -818,11 +829,15 @@ int main() {
         assert(!controller.getTelemetry().torch_or_spindle_on);
         controller.setSimulatedInputPin(cfg.laser.chiller_flow_pin, true);   // Chiller flowing
         controller.setSimulatedInputPin(cfg.laser.door_interlock_pin, true); // Lid closed
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));          // Worker re-evaluates inputs
-        controller.testFireLaserPulse(100.0f, 25.0f);
-        assert(controller.getTelemetry().torch_or_spindle_on);
-        assert(controller.getTelemetry().live_laser_power_pct == 25.0f);
-        assert(controller.getTelemetry().spindle_pwm_duty > 0);
+        assert(waitUntil([&] {                                                // Worker re-evaluates inputs
+            const auto t = controller.getTelemetry();
+            return t.laser_chiller_flow_ok && t.laser_door_closed;
+        }));
+        controller.testFireLaserPulse(2000.0f, 25.0f); // Long pulse so it is still on when read back
+        const auto fired = controller.getTelemetry();
+        assert(fired.torch_or_spindle_on);
+        assert(fired.live_laser_power_pct == 25.0f);
+        assert(fired.spindle_pwm_duty > 0);
 
         // 5. Settings Persistence Verification
         rnr::config::PersistentSettings ps{};
@@ -2126,17 +2141,14 @@ int main() {
         assert(controller.resetFromEStop());
         controller.setLimitOverride(true);
         controller.setSimulatedInputPin(6, true); // E-Stop pressed
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        assert(controller.getTelemetry().state == rnr::core::ControllerState::EStop);
+        assert(waitUntil([&] { return controller.getTelemetry().state == rnr::core::ControllerState::EStop; }));
         assert(!controller.resetFromEStop()); // Still pressed
         controller.setSimulatedInputPin(6, false);
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        assert(controller.resetFromEStop());
+        assert(waitUntil([&] { return controller.resetFromEStop(); }));
 
         // A limit switch blocks reset unless Limit Override is on
         controller.setSimulatedInputPin(7, true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        assert(controller.getTelemetry().state == rnr::core::ControllerState::EStop);
+        assert(waitUntil([&] { return controller.getTelemetry().state == rnr::core::ControllerState::EStop; }));
         assert(!controller.resetFromEStop());
         controller.setLimitOverride(true);
         assert(controller.resetFromEStop());
@@ -2567,8 +2579,7 @@ int main() {
             assert(fb->count("positions") == 1);
             assert(mc.boardCapabilities().display_name == "Fake Board");
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // First board report
-            assert(mc.resetFromEStop());
+            assert(waitUntil([&] { return mc.resetFromEStop(); })); // After the first board report
             assert(fb->count("clear_estop") == 1);
 
             // Jog: internal slices only, the board ends exactly at the commanded position
