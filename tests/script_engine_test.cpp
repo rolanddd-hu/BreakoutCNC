@@ -893,6 +893,19 @@ int main() {
         assert(plasma_score >= 50);
         assert(!plasma_ind.empty());
 
+        // 2b. Built-in laser demo: detected as laser and parses without warnings
+        std::string laser_demo = rnr::gcode::GCodeParser::sampleLaserCoasterGCode();
+        assert(rnr::gcode::GCodeParser::detectTargetMachine(laser_demo, nullptr, nullptr) == rnr::gcode::MachineType::Laser);
+        {
+            rnr::core::RnRController laser_ctrl;
+            assert(laser_ctrl.loadGCodeString(laser_demo));
+            const auto prog = laser_ctrl.getProgram();
+            assert(prog->segments.size() > 1000);
+            assert(prog->warnings.empty());
+            assert(std::abs(prog->bbox_max_mm[0] - prog->bbox_min_mm[0] - 90.0) < 0.01);
+            assert(std::abs(prog->bbox_max_mm[1] - prog->bbox_min_mm[1] - 90.0) < 0.01);
+        }
+
         // 3. Laser program detection
         std::string laser_gcode =
             "; LightBurn 1.4.03\n"

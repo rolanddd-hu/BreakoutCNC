@@ -399,8 +399,8 @@ void DroAndJogPanel::render(
         ImGui::SetTooltip("Open Z Probe Touch-Off Dialog (Z Plate or Direct Workpiece Surface)");
     }
 
-    // 1b. Live Spindle Speed / Progress Bar Indicator (always visible below DRO buttons)
-    {
+    // 1b. Live Spindle Speed / Progress Bar Indicator (mill only: the cutter's torch / laser has its own panel)
+    if (active_cfg.is_mill) {
         ImGui::Spacing();
         char ramp_overlay[96];
         uint32_t cmd_rpm = telemetry.commanded_spindle_rpm > 0 ? telemetry.commanded_spindle_rpm : 12000;

@@ -158,9 +158,21 @@ int main(int /*argc*/, char** /*argv*/) {
     // Always engage E-Stop by default on program start so machine is disarmed until operator clicks RESET E-STOP
     controller.triggerEStop();
 
-    // Load the built-in plasma demo program (or the user's last loaded file below)
-    controller.loadGCodeString(gcode::GCodeParser::samplePlasmaBracketGCode());
-    std::string loaded_filename = "Built-in Demo: Gusset Bracket (140x90mm)";
+    // Load the built-in demo program for the current mode (or the user's last loaded file below)
+    static const std::string kPlasmaDemoName = "Built-in Demo: Gusset Bracket (140x90mm)";
+    static const std::string kLaserDemoName  = "Built-in Demo: Compass Rose Coaster (90x90mm)";
+    auto loadDemoProgram = [&](core::OperationMode mode, std::string& name) {
+        const bool laser = (mode == core::OperationMode::Laser);
+        if (controller.loadGCodeString(laser ? gcode::GCodeParser::sampleLaserCoasterGCode()
+                                             : gcode::GCodeParser::samplePlasmaBracketGCode()))
+        {
+            name = laser ? kLaserDemoName : kPlasmaDemoName;
+            return true;
+        }
+        return false;
+    };
+    std::string loaded_filename;
+    loadDemoProgram(saved_settings.machine.operation_mode, loaded_filename);
     std::string persisted_file_path;
     if (!saved_settings.ui.last_gcode_file_path.empty() &&
         std::filesystem::exists(saved_settings.ui.last_gcode_file_path))
@@ -261,6 +273,13 @@ int main(int /*argc*/, char** /*argv*/) {
         saved_settings.machine.operation_mode = new_mode;
         controller.setOperationMode(new_mode);
         updateWindowCaptionForMode(new_mode);
+        // Swap the built-in demo to the one for the new mode; a user's own program stays loaded
+        if ((loaded_filename == kPlasmaDemoName || loaded_filename == kLaserDemoName) &&
+            loadDemoProgram(new_mode, loaded_filename))
+        {
+            const auto prog = controller.getProgram();
+            viewport.fitToBounds(prog->bbox_min_mm, prog->bbox_max_mm);
+        }
         markSettingsDirty();
     });
 

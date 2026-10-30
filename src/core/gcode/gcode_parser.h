@@ -100,6 +100,9 @@ public:
     // Built-in sample Plasma G-code program (Gusset Bracket with 2 bolt holes + outer contour)
     static std::string samplePlasmaBracketGCode();
 
+    // Built-in sample Laser G-code program (90x90mm coaster: raster fill, rose curve and ring engraving + outline cut)
+    static std::string sampleLaserCoasterGCode();
+
     // Built-in sample Mach3 ATC Mill G-code program (Multi-tool T1 Endmill Pocket/Contour + M6 T2 G83 Peck Drilling)
     static std::string sampleMillAtcGCode();
 };

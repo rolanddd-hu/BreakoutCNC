@@ -15,6 +15,8 @@ Mach3 plugin is not needed. A built-in simulator lets you try everything without
 > **Experimental.** This is an early release (see the [changelog](CHANGELOG.md)). Read the [safety notice](#safety) before
 > connecting it to a machine.
 
+![BreakoutMill running a job in the simulator: 3D toolpath view with completed, active and remaining cuts](docs/images/breakoutmill_job.png)
+
 ## Features
 
 - G-code parser and look-ahead trajectory planner, feed hold / resume, feed and spindle overrides, MDI.
@@ -29,6 +31,27 @@ Mach3 plugin is not needed. A built-in simulator lets you try everything without
 - Mach3 profile import: motor tuning, homing, limits, slaving, spindle, RNR and Huanyang VFD plugin settings.
 - Camera view with a toolpath overlay and an optional MJPEG stream for remote monitoring.
 - 2D / 3D toolpath view.
+
+## Screenshots
+
+All screenshots were taken in the built-in simulator, with the demo programs that come with the apps.
+
+**M6 tool change.** The tool change is a Lua script ([scripts/mill/m6.lua](scripts/mill/m6.lua)) that pauses the job and asks the operator
+to insert the tool, then probes its length or skips probing.
+
+![BreakoutMill tool change prompt from the M6 Lua script](docs/images/breakoutmill_tool_change.png)
+
+**BreakoutCut, plasma mode.** The torch is firing on an inside circle cut. The right panel shows the torch
+height control (THC) status and tracking settings.
+
+![BreakoutCut in plasma mode with the torch height control panel](docs/images/breakoutcut_plasma.png)
+
+**BreakoutCut, laser mode.** The laser demo: a coaster with a raster-filled center, an engraved rose, rings and
+compass ticks, then the outline cut. Laser power follows the speed (M4 dynamic power). The right panel has the
+power limits, job framing and a test pulse; the chiller and door interlocks (IN2 / IN3) must be closed before the
+laser can fire.
+
+![BreakoutCut in laser mode engraving the built-in coaster demo](docs/images/breakoutcut_laser.png)
 
 ## Status
 

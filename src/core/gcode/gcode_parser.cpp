@@ -914,6 +914,92 @@ M30                   ; End of Program
 )";
 }
 
+std::string GCodeParser::sampleLaserCoasterGCode() {
+    // Generated rather than written out: the rose curve, raster fill and tick marks are ~1200 moves
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double cx = 45.0, cy = 45.0;
+    std::ostringstream g;
+    g.setf(std::ios::fixed);
+    g.precision(3);
+    auto polar = [&](double r, double a, double& x, double& y) {
+        x = cx + r * std::cos(a);
+        y = cy + r * std::sin(a);
+    };
+
+    g << "; =========================================================\n"
+         "; BreakoutCut Laser Demo: Compass Rose Coaster (90x90mm, 3mm plywood)\n"
+         "; Engrave: raster-filled center, 8-petal rose, rings, 72 compass ticks\n"
+         "; Cut: rounded outline at full laser power\n"
+         "; M4 = dynamic laser power (scaled by speed), S0-1000 = 0-100% power\n"
+         "; =========================================================\n"
+         "G21 G90 G17\n";
+
+    // 1. Raster fill of the center disc (bidirectional scan lines, 0.25 mm line spacing)
+    g << "\n; --- Raster engrave: center disc R7 (laser power 45%) ---\n";
+    constexpr double kDiscR = 7.0, kLineStep = 0.25;
+    bool first_line = true, left_to_right = true;
+    for (double dy = -kDiscR + kLineStep * 0.5; dy < kDiscR; dy += kLineStep) {
+        const double hw = std::sqrt(kDiscR * kDiscR - dy * dy);
+        const double x0 = left_to_right ? cx - hw : cx + hw;
+        const double x1 = left_to_right ? cx + hw : cx - hw;
+        g << "G0 X" << x0 << " Y" << cy + dy << "\n";
+        if (first_line) { g << "M4 S450\n"; first_line = false; }
+        g << "G1 X" << x1 << " F4000\n";
+        left_to_right = !left_to_right;
+    }
+    g << "M5\n";
+
+    // 2. Rose curve r = R * cos(4t): 8 petals, one continuous line
+    g << "\n; --- Vector engrave: 8-petal rose R28 (laser power 35%) ---\n";
+    constexpr double kRoseR = 28.0;
+    constexpr int kRoseSteps = 960;
+    for (int i = 0; i <= kRoseSteps; ++i) {
+        const double t = 2.0 * kPi * i / kRoseSteps;
+        double x, y;
+        polar(kRoseR * std::cos(4.0 * t), t, x, y);
+        if (i == 0) g << "G0 X" << x << " Y" << y << "\nM4 S350\n";
+        else        g << "G1 X" << x << " Y" << y << (i == 1 ? " F2400" : "") << "\n";
+    }
+    g << "M5\n";
+
+    // 3. Two rings (full arcs)
+    g << "\n; --- Vector engrave: rings R32 and R34 (laser power 35%) ---\n";
+    for (double r : {32.0, 34.0}) {
+        g << "G0 X" << cx + r << " Y" << cy << "\nM4 S350\n"
+          << "G3 X" << cx + r << " Y" << cy << " I" << -r << " J0.000 F2400\nM5\n";
+    }
+
+    // 4. Compass ticks every 5 degrees, longer at 45 / 90 degrees
+    g << "\n; --- Vector engrave: 72 compass ticks (laser power 40%) ---\n";
+    for (int i = 0; i < 72; ++i) {
+        const double a = 2.0 * kPi * i / 72.0;
+        const double r_out = (i % 18 == 0) ? 41.0 : (i % 9 == 0) ? 39.5 : (i % 2 == 0) ? 38.0 : 37.0;
+        double x0, y0, x1, y1;
+        polar(35.5, a, x0, y0);
+        polar(r_out, a, x1, y1);
+        g << "G0 X" << x0 << " Y" << y0 << "\nM4 S400\nG1 X" << x1 << " Y" << y1 << " F2000\nM5\n";
+    }
+
+    // 5. Outline cut: 90x90 square with R8 corners, constant power (M3), 2 passes
+    g << "\n; --- Cut: 90x90 outline, R8 corners, 2 passes (laser power 100%, air assist) ---\n"
+         "G0 X0.000 Y8.000\n"
+         "M3 S1000\n";
+    for (int pass = 0; pass < 2; ++pass) {
+        g << "G1 X0.000 Y82.000 F600\n"
+             "G2 X8.000 Y90.000 I8.000 J0.000\n"
+             "G1 X82.000 Y90.000\n"
+             "G2 X90.000 Y82.000 I0.000 J-8.000\n"
+             "G1 X90.000 Y8.000\n"
+             "G2 X82.000 Y0.000 I-8.000 J0.000\n"
+             "G1 X8.000 Y0.000\n"
+             "G2 X0.000 Y8.000 I0.000 J8.000\n";
+    }
+    g << "M5\n"
+         "G0 X0.000 Y0.000\n"
+         "M30\n";
+    return g.str();
+}
+
 std::string GCodeParser::sampleMillAtcGCode() {
     return R"((=========================================================)
 (BreakoutMill Mach3 ATC Demo: Bearing Housing Block 120x80mm   )

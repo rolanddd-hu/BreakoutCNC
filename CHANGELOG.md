@@ -3,6 +3,14 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## Unreleased
+
+- BreakoutCut has a laser demo program (a 90x90 mm coaster: raster-filled center, rose, rings and compass
+  ticks, outline cut). The built-in demo follows the Plasma / Laser mode; a program you loaded stays loaded when
+  you switch modes.
+- BreakoutCut no longer shows the spindle speed bar under the position readout (it only applies to the mill).
+- Screenshots in the README.
+
 ## 0.2 - performance on older PCs, optional homing
 
 Mainly makes both apps run smoothly on older laptops, with a real board connected and with large programs.
