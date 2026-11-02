@@ -1,0 +1,5 @@
+# Normalize line endings in the repository; Windows-only files keep CRLF on checkout
+* text=auto
+*.rc   text eol=crlf
+*.ico  binary
+*.png  binary

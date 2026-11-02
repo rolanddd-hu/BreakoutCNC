@@ -1,0 +1,28 @@
+#include <winres.h>
+#include "breakout_version.h"
+
+1 ICON "icons/breakout_mill.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     BREAKOUTCNC_VERSION_MAJOR, BREAKOUTCNC_VERSION_MINOR, BREAKOUTCNC_VERSION_PATCH, 0
+ PRODUCTVERSION  BREAKOUTCNC_VERSION_MAJOR, BREAKOUTCNC_VERSION_MINOR, BREAKOUTCNC_VERSION_PATCH, 0
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "BreakoutMill - 4-Axis CNC Mill Controller"
+            VALUE "FileVersion",      BREAKOUTCNC_VERSION_STRING
+            VALUE "InternalName",     "BreakoutMill"
+            VALUE "OriginalFilename", "BreakoutMill.exe"
+            VALUE "ProductName",      "BreakoutCNC"
+            VALUE "ProductVersion",   BREAKOUTCNC_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

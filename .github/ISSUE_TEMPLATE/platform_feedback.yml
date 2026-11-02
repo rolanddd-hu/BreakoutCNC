@@ -1,0 +1,43 @@
+name: Linux / macOS feedback
+description: Tried a Linux or macOS build? Tell us what worked and what did not, even if everything worked.
+labels: [platform-feedback]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The Linux and macOS builds are only checked by automated tests, so any report is useful, including
+        "it started and the simulator works".
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        Tick Diagnostics (bottom right of the window) and paste the copied report. If the app does not start,
+        write the distribution / macOS version and the error shown in the terminal.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: What did you try?
+      options:
+        - label: The app starts and the window looks right
+        - label: Simulator: load a program, cycle start, jog
+        - label: The RNR board connects
+        - label: The Huanyang VFD connects
+        - label: Machine moves as expected
+  - type: textarea
+    id: notes
+    attributes:
+      label: What did not work, or anything else
