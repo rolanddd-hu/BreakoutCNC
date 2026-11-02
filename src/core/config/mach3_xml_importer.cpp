@@ -373,22 +373,21 @@ Mach3MigrationReport Mach3XmlImporter::importFromString(
             std::string raw = fmt("X:%d Y:%d Z:%d", s[0], s[1], s[2]);
             if (s[0] == 0) slave_master = 0;
             else if (s[1] == 0) slave_master = 1;
+            else if (s[2] == 0) slave_master = 2;
             cfg.gantry_slave = (slave_master == 0) ? core::GantrySlave::AFollowsX
                              : (slave_master == 1) ? core::GantrySlave::AFollowsY
+                             : (slave_master == 2) ? core::GantrySlave::AFollowsZ
                                                    : core::GantrySlave::None;
             std::string note;
             MigrationSeverity sev = MigrationSeverity::Ok;
-            if (s[2] == 0) {
-                sev = MigrationSeverity::Warning;
-                note = "Mach3 slaved A to Z, which BreakoutCNC does not support: A is left independent.";
-                warn(note);
-            } else if ((s[0] == 1 || s[0] == 2) || (s[1] == 1 || s[1] == 2) || (s[2] == 1 || s[2] == 2)) {
+            if ((s[0] == 1 || s[0] == 2) || (s[1] == 1 || s[1] == 2) || (s[2] == 1 || s[2] == 2)) {
                 sev = MigrationSeverity::Warning;
                 note = "Mach3 slaved a B or C motor; BreakoutCNC only has the A motor output for a second gantry motor.";
                 warn(note);
             }
             add("Units & Core", "Dual-Motor Gantry", raw,
-                slave_master == 0 ? "A follows X" : (slave_master == 1 ? "A follows Y" : "None"), sev, note);
+                slave_master == 0 ? "A follows X" : slave_master == 1 ? "A follows Y"
+                                                  : slave_master == 2 ? "A follows Z" : "None", sev, note);
         }
     }
 
@@ -894,6 +893,7 @@ Mach3MigrationReport Mach3XmlImporter::importFromString(
     double safe_z = 0.0;
     if (P.flag("UseSafeZ", use_safe_z) && use_safe_z && P.num("m_SafeZ", safe_z) && safe_z > 0.0) {
         cfg.tool_change.safe_z_mm = std::clamp(safe_z * unit_to_mm, 1.0, 200.0);
+        cfg.start_safe_z_mm       = cfg.tool_change.safe_z_mm;
         add("Tool Change", "Safe Z", fmt("%.4g %s", safe_z, unit_name), fmt("%.1f mm", cfg.tool_change.safe_z_mm),
             MigrationSeverity::Ok, "");
     }

@@ -3,11 +3,23 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
-## Unreleased
+## 0.2
+
+### Added
+- Jogging the A axis when it is a rotary / independent axis (BreakoutMill): an A pad next to Z, and Home / End as
+  A+ / A- like in Mach3 (Ctrl + Home / End for one step). A slaved to another axis has no jog controls and refuses
+  A jogs.
+- The A motor can now also follow Z (dual-motor Z axis), not only X or Y; a Mach3 profile with A slaved to Z is
+  imported as such instead of leaving A independent.
+- *Limits & Homing* > **Program start**: the automatic Z lift before a program's first rapid can be turned off, so the
+  first G0 runs as written with all axes moving together, and it has its own **Safe Z** height (before, the M6 safe Z
+  was used; existing settings keep that value). Run From Line lifts to the same height.
 
 ### Fixed
 - A script cancel or E-stop that arrived in the moment a Lua script was starting (a macro, M6 or homing script) could
   be lost, so the script kept running. The cancel now always reaches the script.
+- G-code written without spaces between words (`G0X1Y2`, `g1x10f500`) is read correctly. Before, `G0X1` was read as
+  `G1` with no X word, so the move did not run.
 
 ### Project
 - Unit tests no longer depend on fixed waits: the multi-axis jog, camera and script cancel tests wait for the actual

@@ -2093,6 +2093,31 @@ int main() {
         auto g43 = GCodeParser::parse("G43 H1 Z5\n");
         assert(!g43.hasErrors() && !g43.warnings.empty());                        // G43 ignored -> warning
 
+        // Words written without spaces: "0X1" must not be read as a hexadecimal number, nor "1E2" as 100
+        {
+            std::vector<rnr::gcode::GCodeWord> words;
+            assert(rnr::gcode::tokenizeBlock("g0x1y-2.5z+.5", words, nullptr, nullptr));
+            assert(words.size() == 4);
+            assert(words[0].letter == 'G' && words[0].value == 0.0);
+            assert(words[1].letter == 'X' && words[1].value == 1.0);
+            assert(words[2].letter == 'Y' && words[2].value == -2.5);
+            assert(words[3].letter == 'Z' && words[3].value == 0.5);
+            assert(rnr::gcode::tokenizeBlock("G1X1E2F500", words, nullptr, nullptr));
+            assert(words.size() == 4 && words[1].value == 1.0 && words[2].letter == 'E' && words[2].value == 2.0);
+            assert(!rnr::gcode::tokenizeBlock("G0X", words, nullptr, nullptr));   // Letter without a number
+            assert(!rnr::gcode::tokenizeBlock("G0X.", words, nullptr, nullptr));
+
+            auto packed = GCodeParser::parse("G0X10Y5\nG1X20F500\n");
+            auto spaced = GCodeParser::parse("G0 X10 Y5\nG1 X20 F500\n");
+            assert(!packed.hasErrors() && packed.segments.size() == spaced.segments.size());
+            for (size_t i = 0; i < packed.segments.size(); ++i) {
+                for (size_t a = 0; a < 4; ++a) {
+                    assert(packed.segments[i].end_xyza_mm[a] == spaced.segments[i].end_xyza_mm[a]);
+                }
+            }
+            assert(std::abs(packed.segments.back().end_xyza_mm[0] - 20.0) < 1e-9);
+        }
+
         // G92 inside a program shifts coordinates without creating a discontinuous jump
         auto g92 = GCodeParser::parse("G0 X10\nG92 X0\nG1 X5 F600\n");
         assert(!g92.hasErrors());
@@ -2762,8 +2787,129 @@ int main() {
         std::cout << "  -> PASSED: output mapping, custom outputs, sanitizing, input overview, settings and Lua.\n";
     }
 
+    // ========================================================================
+    // Test 41: Program start Z lift (on / off, own safe Z height, settings)
+    // ========================================================================
+    {
+        std::cout << "\n[Test 41] Testing the program start Z lift setting...\n";
+        auto firstSlices = [](bool lift, double safe_z, const std::string& gcode) {
+            rnr::core::RnRController controller;
+            controller.setSimulatorMode(true);
+            controller.connect();
+            controller.resetFromEStop();
+            auto cfg = controller.getConfig();
+            cfg.start_lift_to_safe_z = lift;
+            cfg.start_safe_z_mm      = safe_z;
+            cfg.tool_change.safe_z_mm = 40.0; // Must not be used
+            controller.applyConfig(cfg);
+            assert(controller.loadGCodeString(gcode));
+            controller.startJob();
+            auto slices = controller.getSliceQueue();
+            controller.stopJob();
+            controller.disconnect();
+            assert(!slices.empty());
+            return slices;
+        };
+
+        // Lift on: Z rises to the line's own Z10 before X / Y / A move
+        auto on = firstSlices(true, 7.0, "G0 X10 Y10 Z10 A10\n");
+        for (const auto& sl : on) {
+            if (sl.target_pos_mm[2] < 10.0 - 1e-6) assert(std::abs(sl.target_pos_mm[0]) < 1e-6);
+        }
+        // Lift off: all axes move together from the first slice
+        auto off = firstSlices(false, 7.0, "G0 X10 Y10 Z10 A10\n");
+        assert(off.front().target_pos_mm[0] > 1e-6 && off.front().target_pos_mm[2] > 1e-6);
+        // A pure XY rapid lifts to the configured height, not the M6 safe Z
+        auto xy = firstSlices(true, 7.0, "G0 X10 Y10\n");
+        double max_z = 0.0;
+        for (const auto& sl : xy) max_z = std::max(max_z, sl.target_pos_mm[2]);
+        assert(std::abs(max_z - 7.0) < 1e-6);
+        auto xy_off = firstSlices(false, 7.0, "G0 X10 Y10\n");
+        for (const auto& sl : xy_off) assert(std::abs(sl.target_pos_mm[2]) < 1e-6);
+
+        // Settings: saved and restored; older files take the height from the M6 safe Z
+        const std::string ini = (std::filesystem::temp_directory_path() / "breakout_start_lift_test.ini").string();
+        rnr::config::PersistentSettings ps;
+        ps.machine.start_lift_to_safe_z = false;
+        ps.machine.start_safe_z_mm      = 12.5;
+        assert(rnr::config::SettingsManager::saveToFile(ini, ps));
+        rnr::config::PersistentSettings back;
+        assert(rnr::config::SettingsManager::loadFromFile(ini, back));
+        assert(!back.machine.start_lift_to_safe_z && back.machine.start_safe_z_mm == 12.5);
+        std::filesystem::remove(ini + ".bak"); // An old file has no integrity marker: no backup may win
+        {
+            std::ofstream old_file(ini, std::ios::trunc);
+            old_file << "[ToolChange]\nsafe_z_mm = 18\n";
+        }
+        rnr::config::PersistentSettings old;
+        assert(rnr::config::SettingsManager::loadFromFile(ini, old));
+        std::filesystem::remove(ini);
+        std::filesystem::remove(ini + ".bak");
+        assert(old.machine.start_lift_to_safe_z && old.machine.start_safe_z_mm == 18.0);
+        std::cout << "  -> PASSED: lift on / off, own safe Z height and settings migration.\n";
+    }
+
+    // ========================================================================
+    // Test 42: A as an independent (rotary) axis vs. A slaved to Z
+    // ========================================================================
+    {
+        std::cout << "\n[Test 42] Testing A jogging and A slaved to Z...\n";
+        using rnr::core::GantrySlave;
+
+        // A follows Z: every Z step is copied to the A motor
+        rnr::core::MachineConfig zcfg;
+        zcfg.gantry_slave = GantrySlave::AFollowsZ;
+        assert(zcfg.gantryMasterAxis() == 2);
+        auto zs = rnr::planner::TrajectoryPlanner::sliceLinearMove({0, 0, 0, 0}, {0, 0, -5, 0}, 600.0, zcfg);
+        assert(!zs.empty());
+        int32_t z_total = 0;
+        for (const auto& sl : zs) {
+            assert(sl.slice.delta_steps[3] == sl.slice.delta_steps[2]);
+            z_total += sl.slice.delta_steps[2];
+        }
+        assert(z_total == static_cast<int32_t>(std::llround(-5.0 * zcfg.axes[2].steps_per_mm)));
+
+        rnr::core::RnRController controller;
+        controller.setSimulatorMode(true);
+        controller.connect();
+        controller.resetFromEStop();
+
+        // Slaved A refuses its own jogs
+        auto cfg = controller.getConfig();
+        cfg.gantry_slave = GantrySlave::AFollowsZ;
+        controller.applyConfig(cfg);
+        controller.jogStep(rnr::core::Axis::A, 10.0, 600.0);
+        controller.jogStartContinuous(rnr::core::Axis::A, true, 0.5);
+        assert(controller.getSliceQueue().empty());
+        assert(controller.getTelemetry().state == rnr::core::ControllerState::Idle);
+
+        // Independent A jogs in degrees
+        cfg = controller.getConfig();
+        cfg.gantry_slave = GantrySlave::None;
+        controller.applyConfig(cfg);
+        const double a0 = controller.getTelemetry().work_pos_mm[3];
+        controller.jogStep(rnr::core::Axis::A, 10.0, 1800.0);
+        assert(waitUntil([&] {
+            const auto t = controller.getTelemetry();
+            return t.state == rnr::core::ControllerState::Idle && std::abs(t.work_pos_mm[3] - (a0 + 10.0)) < 1e-3;
+        }));
+        controller.disconnect();
+
+        // Settings keep "A follows Z"
+        const std::string ini = (std::filesystem::temp_directory_path() / "breakout_a_follows_z_test.ini").string();
+        rnr::config::PersistentSettings ps;
+        ps.machine.gantry_slave = GantrySlave::AFollowsZ;
+        assert(rnr::config::SettingsManager::saveToFile(ini, ps));
+        rnr::config::PersistentSettings back;
+        assert(rnr::config::SettingsManager::loadFromFile(ini, back));
+        std::filesystem::remove(ini);
+        std::filesystem::remove(ini + ".bak");
+        assert(back.machine.gantry_slave == GantrySlave::AFollowsZ);
+        std::cout << "  -> PASSED: A follows Z copies Z steps, slaved A refuses jogs, independent A jogs.\n";
+    }
+
     std::cout << "\n====================================================\n";
-    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (40/40)\n";
+    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (42/42)\n";
     std::cout << "====================================================\n";
     return 0;
 }

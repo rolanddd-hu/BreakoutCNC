@@ -121,6 +121,7 @@ std::string buildDiagnosticsReport(const core::MachineConfig& cfg,
 
     r << "Settings: " << (cfg.linear_units == core::LinearUnits::Imperial ? "inch" : "mm")
       << ", require homing " << (cfg.require_homing ? "on" : "off")
+      << ", start lift " << (cfg.start_lift_to_safe_z ? "on" : "off") << " (Z " << cfg.start_safe_z_mm << ")"
       << ", tool length: " << tool_mode
       << ", VFD " << (cfg.vfd.enabled ? "on" : "off")
       << ", pulse rate " << static_cast<int>(cfg.pulse_rate_khz) << " kHz\n";

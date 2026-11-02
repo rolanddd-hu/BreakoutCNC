@@ -4,13 +4,14 @@
 
 namespace rnr::ui {
 
-// Dual-motor gantry selector shared by the machine settings of both applications.
+// Dual-motor axis selector shared by the machine settings of both applications.
 // Returns true when the selection changed.
 inline bool renderGantrySlaveCombo(core::MachineConfig& cfg) {
     static const char* kItems[] = {
         "None (A is an independent axis)",
         "A motor follows X (dual-motor X gantry)",
         "A motor follows Y (dual-motor Y gantry)",
+        "A motor follows Z (dual-motor Z axis)",
     };
     ImGui::TextUnformatted("Dual-Motor Gantry (A Motor Slaving)");
     int idx = static_cast<int>(cfg.gantry_slave);
@@ -24,7 +25,10 @@ inline bool renderGantrySlaveCombo(core::MachineConfig& cfg) {
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("The A motor copies every step of its master axis, so give it the same Steps/mm and "
                             "use its Invert Dir setting to match the motor's mounting. Homing does not square the "
-                            "gantry: both motors move together.");
+                            "gantry: both motors move together. A cannot be jogged or programmed on its own.");
+    } else {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("A is an independent (rotary) axis: it has its own jog pad and the Home / End keys.");
         ImGui::PopTextWrapPos();
     }
     return changed;

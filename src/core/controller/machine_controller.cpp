@@ -58,6 +58,7 @@ void sanitizeConfig(MachineConfig& c) {
     }
     if (c.pulse_rate_khz == 0 || c.pulse_rate_khz > 100) c.pulse_rate_khz = 100;
     if (c.estop_pin > 12) c.estop_pin = 0;
+    c.start_safe_z_mm = std::isfinite(c.start_safe_z_mm) ? std::clamp(c.start_safe_z_mm, 0.0, 1000.0) : 25.0;
     if (c.probe.probe_pin > 12) c.probe.probe_pin = 0;
     c.spindle_ramp_up_s   = std::clamp(std::isfinite(c.spindle_ramp_up_s) ? c.spindle_ramp_up_s : 0.0, 0.0, 30.0);
     c.spindle_ramp_down_s = std::clamp(std::isfinite(c.spindle_ramp_down_s) ? c.spindle_ramp_down_s : 0.0, 0.0, 30.0);
@@ -933,6 +934,7 @@ void MachineController::jogStartContinuous(core::Axis axis, bool positive_dir, d
     const size_t idx = static_cast<size_t>(axis);
     if (idx >= 4) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (idx == 3 && config_.gantryMasterAxis() >= 0) return; // A slaved motor only moves with its master
     const auto s = telemetry_.state;
     const bool state_ok = (s == ControllerState::Idle || s == ControllerState::ToolChangeHold ||
                            (s == ControllerState::Jogging && cont_jog_active_));
@@ -979,6 +981,7 @@ void MachineController::jogStep(core::Axis axis, double delta_mm, double feed_mm
     const size_t idx = static_cast<size_t>(axis);
     if (idx >= 4) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (idx == 3 && config_.gantryMasterAxis() >= 0) return; // A slaved motor only moves with its master
     if (!readyForCommandLocked(true, "Jog")) return;
 
     std::array<double, 4> start_work = telemetry_.work_pos_mm;
@@ -2700,7 +2703,7 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
     const std::array<double, 4> plan_start = cur;
 
     // Safe retract height (configured for the tool tip): never above the Z soft limit of a homed machine
-    double safe_z = std::max(cur[2], config_.tool_change.safe_z_mm + activeTloLocked());
+    double safe_z = std::max(cur[2], config_.start_safe_z_mm + activeTloLocked());
     {
         const auto& zax = config_.axes[2];
         if (zax.soft_limits_enabled && telemetry_.axis_homed[2]) {
@@ -2853,9 +2856,9 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
             } else {
                 // START FROM THE BEGINNING: a first RAPID that travels in XY never drags the tool sideways
                 // at a low height: go up, across at travel height, then the rapid itself only descends.
-                // A first FEED move is executed exactly as programmed.
+                // A first FEED move is executed exactly as programmed, and so is everything when the lift is off.
                 const bool moves_xy = std::hypot(fm_end[0] - cur[0], fm_end[1] - cur[1]) > 0.05;
-                if (fm.type == SegmentType::RapidMove && moves_xy) {
+                if (config_.start_lift_to_safe_z && fm.type == SegmentType::RapidMove && moves_xy) {
                     double travel_z = std::max(cur[2], fm_end[2]);
                     if (std::abs(fm_end[2] - cur[2]) <= 0.05) {
                         travel_z = std::max(travel_z, safe_z); // Pure XY rapid at the current (possibly low) Z

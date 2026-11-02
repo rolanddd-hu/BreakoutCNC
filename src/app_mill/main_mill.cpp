@@ -15,6 +15,7 @@
 #include "ui_common/workspace_panel.h"
 #include "ui_common/tool_table_panel.h"
 #include "ui_common/gantry_slave_combo.h"
+#include "ui_common/program_start_settings.h"
 #include "ui_common/file_dialog.h"
 #include "ui_common/mach3_migration_dialog.h"
 #include "ui_common/camera_panel.h"
@@ -1710,6 +1711,17 @@ int main(int argc, char** argv) {
                                            "Use this only on a machine without home switches.");
                     }
                     ImGui::PopTextWrapPos();
+                }
+                ImGui::EndChild();
+
+                ImGui::Spacing();
+
+                // Automatic Z lift at program start
+                ImGui::BeginChild("##ProgramStartCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                {
+                    ImGui::TextColored(ui::theme::pal().heading, "PROGRAM START");
+                    ImGui::Spacing();
+                    if (ui::renderProgramStartSettings(cfg)) changed = true;
                 }
                 ImGui::EndChild();
 

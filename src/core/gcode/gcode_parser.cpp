@@ -73,6 +73,23 @@ std::string formatGCode(char letter, double value) {
     std::snprintf(buf, sizeof(buf), "%c%g", letter, value);
     return buf;
 }
+// Reads a plain decimal number ([+-]digits[.digits]) at `pos` and advances past it. Not strtod: that would read
+// "G0X1" as the hexadecimal number 0X1 and "X1E2" as 100, so words written without spaces would merge.
+bool scanNumber(const std::string& s, size_t& pos, double& out) {
+    size_t i = pos;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+    bool any_digit = false;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) { any_digit = true; ++i; }
+    if (i < s.size() && s[i] == '.') {
+        ++i;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) { any_digit = true; ++i; }
+    }
+    if (!any_digit) return false;
+    // Convert only the scanned characters, so strtod cannot read further
+    out = std::strtod(s.substr(pos, i - pos).c_str(), nullptr);
+    pos = i;
+    return true;
+}
 } // namespace
 
 bool tokenizeBlock(const std::string& raw_line, std::vector<GCodeWord>& words, std::string* comment, std::string* error) {
@@ -130,13 +147,11 @@ bool tokenizeBlock(const std::string& raw_line, std::vector<GCodeWord>& words, s
             if (error) *error = "Parameters/expressions (#, [ ]) are not supported";
             return false;
         }
-        char* end_ptr = nullptr;
-        const double val = std::strtod(clean.c_str() + pos, &end_ptr);
-        if (end_ptr == clean.c_str() + pos) {
+        double val = 0.0;
+        if (!scanNumber(clean, pos, val)) {
             if (error) *error = std::string("Letter '") + c + "' has no numeric value";
             return false;
         }
-        pos = static_cast<size_t>(end_ptr - clean.c_str());
         words.push_back({c, val});
     }
     return true;

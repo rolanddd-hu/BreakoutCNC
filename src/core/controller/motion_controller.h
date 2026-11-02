@@ -405,11 +405,12 @@ struct IoConfig {
     std::array<bool, kInputCount> input_invert{};                // Custom inputs: active when the input is off
 };
 
-// Dual-motor gantry: the A motor output drives the second motor of X or Y
+// Dual-motor axis: the A motor output drives the second motor of X, Y or Z
 enum class GantrySlave : uint8_t {
     None      = 0,
     AFollowsX = 1,
     AFollowsY = 2,
+    AFollowsZ = 3,
 };
 
 struct MachineConfig {
@@ -417,13 +418,18 @@ struct MachineConfig {
     std::array<AxisConfig, 4> axes{};
     uint8_t          pulse_rate_khz    = 100;   // 10, 25, 50, or 100 kHz
     uint8_t          slice_interval_ms = 4;     // Default 4ms per motion slice
-    GantrySlave      gantry_slave      = GantrySlave::None; // Dual-motor gantry: A motor follows X or Y
+    GantrySlave      gantry_slave      = GantrySlave::None; // Dual-motor axis: A motor follows X, Y or Z
     bool             limit_override    = false; // Allow jogging off an active end-stop switch (buf[2]=0x40)
     uint8_t          estop_pin           = 0;     // 0 = disabled by default, 1..12 = IN1..IN12
     bool             estop_invert        = false;
     // Programs and MDI commands that move in machine coordinates (G53 / G28 / G30) need the axis homed first.
     // Off for machines without home switches: machine coordinates then continue from the position saved at the last exit.
     bool             require_homing      = true;
+    // Program start: a first G0 that moves in XY lifts Z first (to start_safe_z_mm when it does not change Z
+    // itself), so the tool is not dragged sideways at a low height. Off = the first rapid runs as written.
+    // start_safe_z_mm (work Z of the tool tip) is also the lift height of Run From Line.
+    bool             start_lift_to_safe_z = true;
+    double           start_safe_z_mm      = 25.0;
     float            spindle_pwm_ratio  = 1.0f;  // Mill 0-10V AVI scaling
     double           spindle_ramp_up_s   = 0.0;   // Mill spindle spin-up ramp time (0..30s) before cutting starts
     double           spindle_ramp_down_s = 0.0;   // Mill spindle spin-down ramp time (0..30s)
@@ -456,11 +462,12 @@ struct MachineConfig {
     // Runtime-only: same protection for the tool table (tool lengths measured by the controller)
     uint64_t                             tool_table_revision = 0;
 
-    // Axis index (0 = X, 1 = Y) the A motor copies step-for-step, or -1 when A is an independent axis
+    // Axis index (0 = X, 1 = Y, 2 = Z) the A motor copies step-for-step, or -1 when A is an independent axis
     int gantryMasterAxis() const noexcept {
         switch (gantry_slave) {
             case GantrySlave::AFollowsX: return 0;
             case GantrySlave::AFollowsY: return 1;
+            case GantrySlave::AFollowsZ: return 2;
             default:                     return -1;
         }
     }

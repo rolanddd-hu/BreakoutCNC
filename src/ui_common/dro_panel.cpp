@@ -225,6 +225,8 @@ void DroAndJogPanel::render(
 {
     perf::ScopedTimer perf_timer("DRO + jog panel");
     float start_cursor_y = ImGui::GetCursorPosY();
+    // A gets its own jog controls only when it is a rotary / independent axis, not a gantry slave
+    a_jog_enabled_ = show_fourth_axis_a && controller.getConfig().gantryMasterAxis() < 0;
     handleKeyboardJog(controller, telemetry);
 
     // Compact mode for narrow side panels (e.g. 325px Minimal layout): hide MPos/Vel column,
@@ -431,9 +433,11 @@ void DroAndJogPanel::render(
     const float base_tb       = is_wide ? 46.0f  : 36.0f;
     const float base_font_sz  = is_wide ? 24.0f  : 20.0f;
 
-    // Fixed base width so other controls (toggle, step buttons, slider, STOP JOG) stay the same size
-    const float base_total_w  = base_cross_sz + base_gap + base_arm_w; // 376.0f (wide) or 290.0f (compact)
-    const float target_w      = base_total_w;
+    // Fixed base width so other controls (toggle, step buttons, slider, STOP JOG) stay the same size:
+    // the X/Y cross plus the Z pill, and the A pill when A is jogged on its own
+    const int   pill_count    = a_jog_enabled_ ? 2 : 1;
+    const float base_total_w  = base_cross_sz + pill_count * (base_gap + base_arm_w); // 376 / 290 without A
+    const float target_w      = std::min(base_total_w, pad_avail_w);
     const float pad_offset_x  = std::max(0.0f, (pad_avail_w - target_w) * 0.5f);
 
     if (allocated_h > 0.0f) {
@@ -447,13 +451,17 @@ void DroAndJogPanel::render(
         float deficit = max_height_ - allocated_height_;
         cross_sz = std::max(70.0f, base_cross_sz - deficit);
     }
+    // Narrow panel: shrink the pad so the cross and every pill fit the width
+    if (base_total_w > pad_avail_w) {
+        cross_sz = std::min(cross_sz, std::max(70.0f, base_cross_sz * pad_avail_w / base_total_w));
+    }
 
     const float scale        = cross_sz / base_cross_sz;
     const float arm_w        = std::round(base_arm_w * scale);
     const float gap          = std::round(base_gap * scale);
     const float z_w          = arm_w;
     const float z_h          = cross_sz;
-    const float total_pad_w  = cross_sz + gap + z_w;
+    const float total_pad_w  = cross_sz + pill_count * (gap + z_w);
     const float hub_r        = std::round(base_hub_r * scale);
     const float arm_rounding = std::round(base_rounding * scale);
     const float fillet_r     = std::round(base_fillet * scale);
@@ -546,6 +554,8 @@ void DroAndJogPanel::render(
     const ImVec2 P_z  = ImVec2(P_xy.x + cross_sz + gap, P_xy.y);
     const ImVec2 C_xy = ImVec2(P_xy.x + cross_sz * 0.5f, P_xy.y + cross_sz * 0.5f);
     const ImVec2 C_z  = ImVec2(P_z.x + z_w * 0.5f, P_z.y + z_h * 0.5f);
+    const ImVec2 P_a  = ImVec2(P_z.x + z_w + gap, P_xy.y);
+    const ImVec2 C_a  = ImVec2(P_a.x + z_w * 0.5f, P_a.y + z_h * 0.5f);
 
     const float bevel_w = std::max(3.0f, std::round(4.5f * scale));
 
@@ -562,14 +572,25 @@ void DroAndJogPanel::render(
 
     renderMoldedPadWithShadow(dl, pts_cross_outer, pts_cross_inner, scale);
     renderMoldedPadWithShadow(dl, pts_pill_outer, pts_pill_inner, scale);
+    if (a_jog_enabled_) {
+        std::vector<ImVec2> pts_a_outer, pts_a_inner;
+        buildPillPolygon(pts_a_outer, C_a, z_w, z_h, 16);
+        buildPillPolygon(pts_a_inner, C_a, z_w - bevel_w * 2.0f, z_h - bevel_w * 2.0f, 16);
+        renderMoldedPadWithShadow(dl, pts_a_outer, pts_a_inner, scale);
+    }
 
     // Virtual Analog Joystick Interaction & State Updates (Continuous Mode Only)
     // Safety check: if EStop occurred, immediately cancel any active joystick drag
     if (telemetry.state == core::ControllerState::EStop) {
         js_xy_active_ = false;
         js_xy_drag_   = ImVec2(0.0f, 0.0f);
-        js_z_active_  = false;
-        js_z_drag_    = 0.0f;
+        js_pill_active_ = {false, false};
+        js_pill_drag_   = {0.0f, 0.0f};
+    }
+    if (!a_jog_enabled_ && js_pill_active_[1]) {
+        js_pill_active_[1] = false;
+        js_pill_drag_[1]   = 0.0f;
+        controller.jogStopAxis(core::Axis::A);
     }
 
     const float max_deflect = hub_r * 0.85f;
@@ -645,55 +666,76 @@ void DroAndJogPanel::render(
         }
     }
 
-    // --- Z Center Hub Joystick Interaction ---
-    ImGui::SetCursorScreenPos(ImVec2(C_z.x - hub_r, C_z.y - hub_r));
-    ImGui::InvisibleButton("##JogCenterZ", ImVec2(hub_r * 2.0f, hub_r * 2.0f));
-    const bool z_btn_hovered = ImGui::IsItemHovered();
+    // --- Z and A Pill Hub Joystick Interaction (vertical drag) ---
+    struct PillHub {
+        const char* id;
+        core::Axis  axis;
+        char        name;
+        ImVec2      center;
+    };
+    const PillHub pill_hubs[2] = {
+        {"##JogCenterZ", core::Axis::Z, 'Z', C_z},
+        {"##JogCenterA", core::Axis::A, 'A', C_a},
+    };
+    bool pill_hovered[2] = {false, false};
+    for (int p = 0; p < pill_count; ++p) {
+        const PillHub& hub = pill_hubs[p];
+        ImGui::SetCursorScreenPos(ImVec2(hub.center.x - hub_r, hub.center.y - hub_r));
+        ImGui::InvisibleButton(hub.id, ImVec2(hub_r * 2.0f, hub_r * 2.0f));
+        pill_hovered[p] = ImGui::IsItemHovered();
+        bool&  active = js_pill_active_[p];
+        float& drag   = js_pill_drag_[p];
 
-    if (!step_jog_mode_) {
-        if (ImGui::IsItemActive()) {
-            js_z_active_ = true;
-            const float mouse_y = ImGui::GetIO().MousePos.y;
-            const float raw_dy  = mouse_y - C_z.y;
-            js_z_drag_ = std::clamp(raw_dy, -max_deflect, max_deflect);
+        if (!step_jog_mode_) {
+            if (ImGui::IsItemActive()) {
+                active = true;
+                const float raw_dy = ImGui::GetIO().MousePos.y - hub.center.y;
+                drag = std::clamp(raw_dy, -max_deflect, max_deflect);
 
-            const float norm_z  = -js_z_drag_ / max_deflect; // Up is +Z
-            const float abs_z   = std::abs(norm_z);
-            const float max_spd = std::clamp(jog_speed_pct_ / 100.0f, 0.05f, 1.0f);
+                const float norm    = -drag / max_deflect; // Up is positive
+                const float abs_n   = std::abs(norm);
+                const float max_spd = std::clamp(jog_speed_pct_ / 100.0f, 0.05f, 1.0f);
 
-            if (abs_z > deadzone) {
-                const float ratio_z = (abs_z - deadzone) / (1.0f - deadzone);
-                const float speed_z = std::clamp(ratio_z * max_spd, 0.05f, 1.0f);
-                controller.jogStartContinuous(core::Axis::Z, norm_z > 0.0f, static_cast<double>(speed_z));
-            } else {
-                controller.jogStopAxis(core::Axis::Z);
+                if (abs_n > deadzone) {
+                    const float ratio = (abs_n - deadzone) / (1.0f - deadzone);
+                    const float speed = std::clamp(ratio * max_spd, 0.05f, 1.0f);
+                    controller.jogStartContinuous(hub.axis, norm > 0.0f, static_cast<double>(speed));
+                } else {
+                    controller.jogStopAxis(hub.axis);
+                }
+
+                ImGui::SetTooltip("%c: %+.0f%%", hub.name, norm * 100.0f);
             }
 
-            ImGui::SetTooltip("Z: %+.0f%%", norm_z * 100.0f);
-        }
+            if (active && (ImGui::IsItemDeactivated() || !ImGui::IsMouseDown(ImGuiMouseButton_Left))) {
+                active = false;
+                drag   = 0.0f;
+                controller.jogStopAxis(hub.axis);
+            }
 
-        if (js_z_active_ && (ImGui::IsItemDeactivated() || !ImGui::IsMouseDown(ImGuiMouseButton_Left))) {
-            js_z_active_ = false;
-            js_z_drag_   = 0.0f;
-            controller.jogStopAxis(core::Axis::Z);
-        }
-
-        if (z_btn_hovered && !js_z_active_) {
-            ImGui::SetTooltip("Analog Joystick: Drag Z (Deflection controls speed)");
-        }
-    } else {
-        if (js_z_active_) {
-            js_z_active_ = false;
-            js_z_drag_   = 0.0f;
-        }
-        if (z_btn_hovered) {
-            ImGui::SetTooltip("Virtual Joystick (Continuous Jog Mode Only)");
+            if (pill_hovered[p] && !active) {
+                ImGui::SetTooltip("Analog Joystick: Drag %c (Deflection controls speed)", hub.name);
+            }
+        } else {
+            if (active) {
+                active = false;
+                drag   = 0.0f;
+            }
+            if (pill_hovered[p]) {
+                ImGui::SetTooltip("Virtual Joystick (Continuous Jog Mode Only)");
+            }
         }
     }
 
     // Hit Testing & Embossed Molded Rubber Directional Arrows
     const float th = base_th * scale; // triangle height
     const float tb = base_tb * scale; // triangle base
+
+    // A rotates in degrees: it takes the step value as shown (10 mm -> 10 deg, 0.1 in -> 0.1 deg)
+    auto stepFor = [&](core::Axis axis) {
+        const double step = static_cast<double>(step_size_mm_);
+        return (axis == core::Axis::A && is_imperial) ? step / 25.4 : step;
+    };
 
     auto doArrowButton = [&](const char* id,
                              ImVec2 btn_pos,
@@ -720,15 +762,18 @@ void DroAndJogPanel::render(
                 js_active = pos_dir ? (-js_xy_drag_.y > dz_px) : (-js_xy_drag_.y < -dz_px);
             }
         }
-        if (js_z_active_ && axis == core::Axis::Z) {
-            js_active = pos_dir ? (-js_z_drag_ > dz_px) : (-js_z_drag_ < -dz_px);
+        const int pill = (axis == core::Axis::Z) ? 0 : (axis == core::Axis::A ? 1 : -1);
+        if (pill >= 0 && js_pill_active_[pill]) {
+            const float d = -js_pill_drag_[pill];
+            js_active = pos_dir ? (d > dz_px) : (d < -dz_px);
         }
 
         bool active = mouse_active || kb_active || js_active;
 
         if (step_jog_mode_) {
             if (ImGui::IsItemClicked()) {
-                double delta = pos_dir ? static_cast<double>(step_size_mm_) : -static_cast<double>(step_size_mm_);
+                const double step = stepFor(axis);
+                double delta = pos_dir ? step : -step;
                 double feed  = 3000.0 * (jog_speed_pct_ / 100.0f);
                 controller.jogStep(axis, delta, feed);
             }
@@ -742,7 +787,7 @@ void DroAndJogPanel::render(
             }
         }
 
-        if (hovered && !js_xy_active_ && !js_z_active_) {
+        if (hovered && !js_xy_active_ && !js_pill_active_[0] && !js_pill_active_[1]) {
             ImGui::SetTooltip("%s", tooltip);
         }
 
@@ -849,6 +894,23 @@ void DroAndJogPanel::render(
                   1,
                   ImVec2(C_z.x, C_z.y + z_reach));
 
+    if (a_jog_enabled_) {
+        doArrowButton("##JogAPlus",
+                      P_a,
+                      ImVec2(z_w, arm_inset),
+                      core::Axis::A, true,
+                      "Jog A+ (Home)",
+                      0,
+                      ImVec2(C_a.x, C_a.y - z_reach));
+        doArrowButton("##JogAMinus",
+                      ImVec2(P_a.x, P_a.y + z_h - arm_inset),
+                      ImVec2(z_w, arm_inset),
+                      core::Axis::A, false,
+                      "Jog A- (End)",
+                      1,
+                      ImVec2(C_a.x, C_a.y + z_reach));
+    }
+
     // Draw Hub Sockets & Analog Thumbstick Knobs
     const float font_sz = std::max(11.0f, base_font_sz * scale);
     const float knob_r  = hub_r * 0.78f;
@@ -862,13 +924,18 @@ void DroAndJogPanel::render(
 
     renderCenterKnob(dl, C_xy, knob_r, "X/Y", dro_font, font_sz, js_xy_active_, xy_btn_hovered && !step_jog_mode_, js_xy_drag_);
 
-    if (js_z_active_ && std::abs(js_z_drag_) > 2.0f) {
-        const ImVec2 knob_z = ImVec2(C_z.x, C_z.y + js_z_drag_);
-        dl->AddLine(C_z, knob_z, theme::pal().stick_shadow, 6.0f);
-        dl->AddLine(C_z, knob_z, theme::withAlpha(theme::pal().jog_accent, 220), 3.5f);
+    for (int p = 0; p < pill_count; ++p) {
+        const ImVec2 c = pill_hubs[p].center;
+        const float  d = js_pill_drag_[p];
+        if (js_pill_active_[p] && std::abs(d) > 2.0f) {
+            const ImVec2 knob = ImVec2(c.x, c.y + d);
+            dl->AddLine(c, knob, theme::pal().stick_shadow, 6.0f);
+            dl->AddLine(c, knob, theme::withAlpha(theme::pal().jog_accent, 220), 3.5f);
+        }
+        const char label[2] = {pill_hubs[p].name, '\0'};
+        renderCenterKnob(dl, c, knob_r, label, dro_font, font_sz, js_pill_active_[p],
+                         pill_hovered[p] && !step_jog_mode_, ImVec2(0.0f, d));
     }
-
-    renderCenterKnob(dl, C_z, knob_r, "Z", dro_font, font_sz, js_z_active_, z_btn_hovered && !step_jog_mode_, ImVec2(0.0f, js_z_drag_));
 
     // Advance cursor cleanly below the jog pad
     ImGui::SetCursorScreenPos(ImVec2(screen_pos.x, screen_pos.y + cross_sz + 14.0f));
@@ -886,12 +953,13 @@ void DroAndJogPanel::render(
 
     ImGui::Spacing();
 #ifdef __APPLE__
-    const char* hint_text = step_jog_mode_ ? "Keys: arrows X / Y, Page Up / Down Z"
-                                           : "Keys: arrows X / Y, Page Up / Down Z, Cmd: one step";
+    const char* one_step = ", Cmd: one step";
 #else
-    const char* hint_text = step_jog_mode_ ? "Keys: arrows X / Y, Page Up / Down Z"
-                                           : "Keys: arrows X / Y, Page Up / Down Z, Ctrl: one step";
+    const char* one_step = ", Ctrl: one step";
 #endif
+    char hint_text[128];
+    std::snprintf(hint_text, sizeof(hint_text), "Keys: arrows X / Y, Page Up / Down Z%s%s",
+                  a_jog_enabled_ ? ", Home / End A" : "", step_jog_mode_ ? "" : one_step);
     const ImVec2 hint_sz  = ImGui::CalcTextSize(hint_text);
     if (hint_sz.x <= pad_avail_w) {
         ImGui::SetCursorPosX((pad_avail_w - hint_sz.x) * 0.5f);
@@ -1152,7 +1220,7 @@ void DroAndJogPanel::handleKeyboardJog(
 
     // Never steal keys from text fields (MDI input, numeric inputs) or while E-Stop is active
     if (io.WantTextInput || telemetry.state == core::ControllerState::EStop) {
-        if (kb_axis_active_[0] != 0 || kb_axis_active_[1] != 0 || kb_axis_active_[2] != 0) {
+        if (kb_axis_active_ != std::array<int, 4>{0, 0, 0, 0}) {
             controller.jogStop();
             kb_axis_active_ = {0, 0, 0, 0};
         }
@@ -1162,7 +1230,7 @@ void DroAndJogPanel::handleKeyboardJog(
     // Step mode, or Ctrl (Cmd on macOS) held in continuous mode: each key press moves one step increment
     if (step_jog_mode_ || io.KeyCtrl) {
         // Stop any residual continuous jogging if user switched to step mode while keys were held
-        if (kb_axis_active_[0] != 0 || kb_axis_active_[1] != 0 || kb_axis_active_[2] != 0) {
+        if (kb_axis_active_ != std::array<int, 4>{0, 0, 0, 0}) {
             controller.jogStop();
             kb_axis_active_ = {0, 0, 0, 0};
         }
@@ -1176,6 +1244,13 @@ void DroAndJogPanel::handleKeyboardJog(
         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow,  false)) controller.jogStep(core::Axis::Y, -step, feed);
         if (ImGui::IsKeyPressed(ImGuiKey_PageUp,     false)) controller.jogStep(core::Axis::Z,  step, feed);
         if (ImGui::IsKeyPressed(ImGuiKey_PageDown,   false)) controller.jogStep(core::Axis::Z, -step, feed);
+        if (a_jog_enabled_) {
+            // A takes the step value as shown, in degrees
+            const bool imperial = controller.getConfig().linear_units == core::LinearUnits::Imperial;
+            const double a_step = imperial ? step / 25.4 : step;
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) controller.jogStep(core::Axis::A,  a_step, feed);
+            if (ImGui::IsKeyPressed(ImGuiKey_End,  false)) controller.jogStep(core::Axis::A, -a_step, feed);
+        }
         return;
     }
 
@@ -1190,13 +1265,19 @@ void DroAndJogPanel::handleKeyboardJog(
         ImGuiKey       neg_key;
     };
 
-    static const AxisKeyBinding kBindings[3] = {
+    static const AxisKeyBinding kBindings[4] = {
         {core::Axis::X, 0, ImGuiKey_RightArrow, ImGuiKey_LeftArrow},
         {core::Axis::Y, 1, ImGuiKey_UpArrow,    ImGuiKey_DownArrow},
         {core::Axis::Z, 2, ImGuiKey_PageUp,     ImGuiKey_PageDown},
+        {core::Axis::A, 3, ImGuiKey_Home,       ImGuiKey_End},
     };
 
     for (const auto& b : kBindings) {
+        if (b.axis == core::Axis::A && !a_jog_enabled_) {
+            if (kb_axis_active_[3] != 0) controller.jogStopAxis(core::Axis::A);
+            kb_axis_active_[3] = 0;
+            continue;
+        }
         bool pos_down = ImGui::IsKeyDown(b.pos_key);
         bool neg_down = ImGui::IsKeyDown(b.neg_key);
 

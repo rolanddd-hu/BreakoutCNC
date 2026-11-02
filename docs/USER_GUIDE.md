@@ -86,7 +86,8 @@ Keyboard:
 | **Esc** | E-stop, whatever has keyboard focus |
 | Arrow keys | Jog X / Y |
 | Page Up / Page Down | Jog Z |
-| Ctrl (Cmd on macOS) + arrow / Page key | One step of the *Step Increment* size, also in continuous mode |
+| Home / End | Jog A+ / A- (BreakoutMill, when A is not slaved to another axis) |
+| Ctrl (Cmd on macOS) + arrow / Page / Home / End key | One step of the *Step Increment* size, also in continuous mode |
 | F11 | Full screen |
 | F12 | Performance overlay (frame times, USB timing) |
 
@@ -104,6 +105,9 @@ Keyboard:
   **Jog Speed** scales the jog feed. Several axes can be jogged at once from the keyboard. In continuous mode, hold
   **Ctrl** (**Cmd** on macOS) and each arrow / Page Up / Page Down press moves one step of the step increment size
   instead, like in Mach3.
+- **A axis (rotary):** in BreakoutMill, when A is an independent axis (*Dual-Motor Gantry* set to *None*), an **A**
+  pad appears next to Z and **Home / End** jog A+ / A-. A moves in degrees: the step buttons give 0.01 / 0.1 / 1 /
+  10 degrees (0.001 to 1 degree in inch mode). When A follows another axis it has no jog controls of its own.
 - **Limit Override** (only shown during a limit alarm) lets you jog off a triggered limit switch.
 - **CYCLE START / EMERGENCY STOP** (or **RESET E-STOP** while in E-stop) at the bottom.
 
@@ -183,7 +187,8 @@ the udev rule; on Windows no driver is needed.
   once everything works. If a motor stalls or loses steps, lower them again.
 - **Step Active Low / Dir Invert:** if an axis moves the wrong way, tick **Dir Invert** for it. Step Active Low is
   only needed for drivers that step on the falling edge.
-- **Gantry (dual motor):** at the bottom of this section the A output can follow X or Y, for a second gantry motor.
+- **Gantry (dual motor):** at the bottom of this section the A output can follow X, Y or Z, for a second motor on
+  that axis (a dual-motor gantry or a Z axis with two screws). It then copies every step of its master axis.
 
 ### 5.3 E-stop, limits and homing
 
@@ -207,6 +212,11 @@ the udev rule; on Windows no driver is needed.
 - **Require homing for G53 / G28 / G30** (on by default): programs that move in machine coordinates are refused until
   the axes are homed. Turn it off only on a machine without home switches; machine coordinates then continue from the
   position saved when the app was last closed.
+- **Program start: Lift Z before the first rapid** (on by default): when a program starts from its first line and the
+  first move is a G0 that moves in X or Y, Z goes up first and X / Y follow, so the tool is not dragged sideways at a
+  low height. A G0 without a Z word lifts to **Safe Z** (work Z of the tool tip), a G0 to a higher Z lifts to that Z.
+  Untick it to run the first rapid exactly as written, with all axes moving together. **Run From Line** always lifts
+  to Safe Z before it moves to the start point.
 
 After this section: power the drivers, jog each axis slowly in both directions, check the direction and the distance
 (mark a position, jog 100 mm, measure), then try **HOME ALL**.

@@ -802,7 +802,7 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
                     if (a == 3 && cfg.gantryMasterAxis() >= 0) {
                         // The slaved A motor only moves with its master: nudge the master and watch both motors
                         ImGui::TextWrapped("Moves with %c: nudge %c and check that both gantry motors turn the same way.",
-                                           "XY"[cfg.gantryMasterAxis()], "XY"[cfg.gantryMasterAxis()]);
+                                           "XYZ"[cfg.gantryMasterAxis()], "XYZ"[cfg.gantryMasterAxis()]);
                         ImGui::TableSetColumnIndex(3);
                         ImGui::Text("DirInv: %s", cfg.axes[a].dir_active_low ? "ON" : "OFF");
                         char flip_a[48];
@@ -813,7 +813,7 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
                             modified = true;
                         }
                         ImGui::TableSetColumnIndex(4);
-                        ImGui::TextDisabled("Checked with %c", "XY"[cfg.gantryMasterAxis()]);
+                        ImGui::TextDisabled("Checked with %c", "XYZ"[cfg.gantryMasterAxis()]);
                         continue;
                     }
                     ImGui::BeginDisabled(!can_jog);

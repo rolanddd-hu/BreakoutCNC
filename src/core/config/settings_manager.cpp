@@ -88,6 +88,7 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
     std::string section;
     std::string line;
     bool has_macro_button_count = false;
+    bool has_start_safe_z = false;
     while (std::getline(ifs, line)) {
         std::string t = trim(line);
         if (t.empty() || t[0] == ';' || t[0] == '#') continue;
@@ -176,12 +177,17 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "pulse_rate_khz")      s.machine.pulse_rate_khz      = static_cast<uint8_t>(std::atoi(val.c_str()));
             // Older settings files only knew A-follows-X
             if (key == "slave_a_to_x" && toBool(val)) s.machine.gantry_slave = core::GantrySlave::AFollowsX;
-            if (key == "gantry_slave")        s.machine.gantry_slave        = static_cast<core::GantrySlave>(std::clamp(std::atoi(val.c_str()), 0, 2));
+            if (key == "gantry_slave")        s.machine.gantry_slave        = static_cast<core::GantrySlave>(std::clamp(std::atoi(val.c_str()), 0, 3));
             // limit_override is deliberately NOT restored: end-stops are always active after a restart
             if (key == "dwell_p_milliseconds") s.machine.dwell_p_milliseconds = toBool(val);
             if (key == "estop_pin")           s.machine.estop_pin           = static_cast<uint8_t>(std::atoi(val.c_str()));
             if (key == "estop_invert")        s.machine.estop_invert        = toBool(val);
             if (key == "require_homing")      s.machine.require_homing      = toBool(val);
+            if (key == "start_lift_to_safe_z") s.machine.start_lift_to_safe_z = toBool(val);
+            if (key == "start_safe_z_mm") {
+                s.machine.start_safe_z_mm = std::atof(val.c_str());
+                has_start_safe_z = true;
+            }
             if (key == "spindle_pwm_ratio")   s.machine.spindle_pwm_ratio   = static_cast<float>(std::atof(val.c_str()));
             if (key == "spindle_ramp_up_s")   s.machine.spindle_ramp_up_s   = std::max(0.0, std::atof(val.c_str()));
             if (key == "spindle_ramp_down_s") s.machine.spindle_ramp_down_s = std::max(0.0, std::atof(val.c_str()));
@@ -422,6 +428,9 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
         }
     }
 
+    // Older settings files lifted to the M6 safe Z at program start: keep that height
+    if (!has_start_safe_z) s.machine.start_safe_z_mm = s.machine.tool_change.safe_z_mm;
+
     return true;
 }
 
@@ -504,6 +513,8 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "estop_pin = " << static_cast<int>(s.machine.estop_pin) << "\n";
     ofs << "estop_invert = " << (s.machine.estop_invert ? 1 : 0) << "\n";
     ofs << "require_homing = " << (s.machine.require_homing ? 1 : 0) << "\n";
+    ofs << "start_lift_to_safe_z = " << (s.machine.start_lift_to_safe_z ? 1 : 0) << "\n";
+    ofs << "start_safe_z_mm = " << s.machine.start_safe_z_mm << "\n";
     ofs << "spindle_pwm_ratio = " << s.machine.spindle_pwm_ratio << "\n";
     ofs << "spindle_ramp_up_s = " << s.machine.spindle_ramp_up_s << "\n";
     ofs << "spindle_ramp_down_s = " << s.machine.spindle_ramp_down_s << "\n\n";

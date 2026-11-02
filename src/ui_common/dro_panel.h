@@ -2,6 +2,7 @@
 #include "core/controller/motion_controller.h"
 #include "ui_common/macro_button.h"
 #include "imgui.h"
+#include <array>
 #include <cstddef>
 #include <functional>
 
@@ -39,8 +40,9 @@ public:
 
 private:
     MacroColorMenu cp_color_menu_; // "Button Color" in the pinned macro buttons' right-click menu
-    // Keyboard jogging: Arrow Left/Right = X-/X+, Arrow Up/Down = Y+/Y-, PgUp/PgDn = Z+/Z-.
-    // Called every frame from render(). Supports simultaneous multi-axis motion.
+    // Keyboard jogging: Arrow Left/Right = X-/X+, Arrow Up/Down = Y+/Y-, PgUp/PgDn = Z+/Z-, Home/End = A+/A-
+    // (A only while it is an independent axis). Called every frame from render(). Supports simultaneous
+    // multi-axis motion.
     void handleKeyboardJog(core::IMotionController& controller, const core::TelemetrySnapshot& telemetry);
 
     bool  step_jog_mode_    = false;
@@ -51,12 +53,13 @@ private:
     float min_height_       = 350.0f;
     float allocated_height_ = -1.0f;
     std::array<int, 4> kb_axis_active_{0, 0, 0, 0}; // -1 = negative jog, 0 = idle, +1 = positive jog per axis
+    bool  a_jog_enabled_    = false; // A shown and not slaved to another axis (set by render())
 
-    // Virtual Analog Joystick state (for X/Y and Z continuous drag)
+    // Virtual Analog Joystick state (X/Y cross, and the Z and A pills for continuous drag)
     bool   js_xy_active_ = false;
     ImVec2 js_xy_drag_{0.0f, 0.0f};
-    bool   js_z_active_  = false;
-    float  js_z_drag_    = 0.0f;
+    std::array<bool, 2>  js_pill_active_{false, false}; // [0] = Z, [1] = A
+    std::array<float, 2> js_pill_drag_{0.0f, 0.0f};
 
     // Interactive Probe Z Modal state
     bool   show_probe_z_modal_ = false;
