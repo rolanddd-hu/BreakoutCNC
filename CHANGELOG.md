@@ -3,6 +3,16 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## Unreleased
+
+### Fixed
+- A script cancel or E-stop that arrived in the moment a Lua script was starting (a macro, M6 or homing script) could
+  be lost, so the script kept running. The cancel now always reaches the script.
+
+### Project
+- Unit tests no longer depend on fixed waits: the multi-axis jog, camera and script cancel tests wait for the actual
+  state (and keep continuous jogs refreshed), so they pass on slow or busy CI runners.
+
 ## 0.1 - first public release (GPL-3.0-or-later)
 
 First public release. Experimental: BreakoutMill has been tested against the RNR board on the bench, BreakoutCut's

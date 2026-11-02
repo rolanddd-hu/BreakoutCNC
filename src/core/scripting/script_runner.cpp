@@ -91,8 +91,8 @@ std::string ScriptRunner::getActiveScriptName() const {
 }
 
 bool ScriptRunner::executeClaimed(bool is_file, const std::string& source, std::string* out_error) {
-    // Precondition: is_running_ was set to true by the caller (atomically claimed)
-    cancel_requested_ = false;
+    // Precondition: is_running_ was set to true and cancel_requested_ cleared by the caller (atomically claimed).
+    // Clearing the cancel flag here instead would erase a cancel() (E-stop) that arrived before this thread ran.
     {
         std::lock_guard<std::mutex> lock(name_mutex_);
         active_script_name_ = is_file ? source : std::string("<inline_script>");
@@ -118,6 +118,7 @@ bool ScriptRunner::runStringBlocking(const std::string& code, std::string* out_e
         if (out_error) *out_error = "Another script is already running";
         return false;
     }
+    cancel_requested_ = false;
     return executeClaimed(false, code, out_error);
 }
 
@@ -126,6 +127,7 @@ bool ScriptRunner::runFileBlocking(const std::string& filepath, std::string* out
         if (out_error) *out_error = "Another script is already running";
         return false;
     }
+    cancel_requested_ = false;
     return executeClaimed(true, filepath, out_error);
 }
 
@@ -147,6 +149,7 @@ bool ScriptRunner::startAsync(bool is_file, const std::string& source, ScriptCom
             }
         }
         if (reject.empty()) {
+            cancel_requested_ = false;
             thread_done_ = false;
             worker_thread_ = std::thread([this, is_file, source, on_complete]() {
                 std::string err;

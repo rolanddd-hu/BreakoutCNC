@@ -525,14 +525,7 @@ int main() {
         runner.cancel();
 
         // Wait for worker thread to cleanly abort
-        auto start = std::chrono::steady_clock::now();
-        while (runner.isRunning()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-            if (elapsed > 2.0) break;
-        }
-
-        assert(!runner.isRunning());
+        assert(waitUntil([&] { return !runner.isRunning(); }));
         assert(script_aborted.load());
         std::cout << "  -> Abort message received: \"" << final_err << "\"\n";
         assert(final_err.find("aborted") != std::string::npos || final_err.find("E-STOP") != std::string::npos);
@@ -612,46 +605,52 @@ int main() {
         assert(controller.getTelemetry().state == rnr::core::ControllerState::EStop);
         assert(controller.resetFromEStop());
 
-        // Start jogging X, Y, and Z simultaneously!
-        controller.jogStartContinuous(rnr::core::Axis::X, true, 0.5);
-        controller.jogStartContinuous(rnr::core::Axis::Y, true, 0.5);
-        controller.jogStartContinuous(rnr::core::Axis::Z, true, 0.5);
+        // Continuous jog is a dead-man control: like the UI, keep refreshing the held axes while waiting, so a slow
+        // machine (CI runners) cannot let them time out. No fixed sleeps: each check waits for its condition.
+        bool hold_x = true;
+        auto refreshJogs = [&] {
+            if (hold_x) controller.jogStartContinuous(rnr::core::Axis::X, true, 0.5);
+            controller.jogStartContinuous(rnr::core::Axis::Y, true, 0.5);
+            controller.jogStartContinuous(rnr::core::Axis::Z, true, 0.5);
+        };
+        auto holdUntil = [&](auto pred) {
+            return waitUntil([&] { refreshJogs(); return pred(controller.getTelemetry()); });
+        };
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-
+        // Start jogging X, Y, and Z simultaneously
+        refreshJogs();
+        assert(holdUntil([](const rnr::core::TelemetrySnapshot& t) {
+            return t.state == rnr::core::ControllerState::Jogging &&
+                   t.work_pos_mm[0] > 0.0 && t.work_pos_mm[1] > 0.0 && t.work_pos_mm[2] > 0.0;
+        }));
         auto tel1 = controller.getTelemetry();
-        assert(tel1.state == rnr::core::ControllerState::Jogging);
-        assert(tel1.work_pos_mm[0] > 0.0);
-        assert(tel1.work_pos_mm[1] > 0.0);
-        assert(tel1.work_pos_mm[2] > 0.0);
         std::cout << "  -> Multi-axis jog active: X=" << tel1.work_pos_mm[0]
                   << ", Y=" << tel1.work_pos_mm[1]
                   << ", Z=" << tel1.work_pos_mm[2] << " mm\n";
 
-        // Stop only X axis
+        // Stop only X axis; Y and Z are still held
+        hold_x = false;
         controller.jogStopAxis(rnr::core::Axis::X);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        assert(holdUntil([](const rnr::core::TelemetrySnapshot& t) { return t.axis_vel_mm_min[0] == 0.0; }));
 
         auto tel2 = controller.getTelemetry();
-        double x_stopped_pos = tel2.work_pos_mm[0];
-        // Y and Z must have continued moving forward!
+        const double x_stopped_pos = tel2.work_pos_mm[0];
+        // Y and Z must have continued moving forward
         assert(tel2.work_pos_mm[1] > tel1.work_pos_mm[1]);
         assert(tel2.work_pos_mm[2] > tel1.work_pos_mm[2]);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        // Y and Z keep advancing while X stays where it stopped
+        assert(holdUntil([&](const rnr::core::TelemetrySnapshot& t) {
+            return t.work_pos_mm[1] > tel2.work_pos_mm[1] && t.work_pos_mm[2] > tel2.work_pos_mm[2];
+        }));
         auto tel3 = controller.getTelemetry();
-        // X must have come to a complete halt
-        assert(std::abs(tel3.work_pos_mm[0] - x_stopped_pos) < 0.2);
-        // Y and Z still advancing
-        assert(tel3.work_pos_mm[1] > tel2.work_pos_mm[1]);
-        assert(tel3.work_pos_mm[2] > tel2.work_pos_mm[2]);
+        assert(std::abs(tel3.work_pos_mm[0] - x_stopped_pos) < 1e-6);
 
         // Stop all remaining axes
         controller.jogStop();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(waitUntil([&] { return controller.getTelemetry().state == rnr::core::ControllerState::Idle; }));
 
         auto tel4 = controller.getTelemetry();
-        assert(tel4.state == rnr::core::ControllerState::Idle);
         assert(tel4.axis_vel_mm_min[0] == 0.0 && tel4.axis_vel_mm_min[1] == 0.0 && tel4.axis_vel_mm_min[2] == 0.0);
         controller.disconnect();
 
@@ -1421,12 +1420,11 @@ int main() {
         cam_cfg.top_down_camera_index   = sim_top_idx;
         cam_cfg.monitoring_camera_index = sim_mon_idx;
         cam_mgr.applyConfig(cam_cfg, true, true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
         rnr::core::CameraFrame frame{};
         uint64_t seq = 0;
-        bool got_frame = cam_mgr.getLatestFrame(rnr::core::CameraRole::TopDown, frame, seq);
-        assert(got_frame);
+        // The simulated camera's first frame arrives from its own thread
+        assert(waitUntil([&] { return cam_mgr.getLatestFrame(rnr::core::CameraRole::TopDown, frame, seq); }));
         assert(frame.width == 640 && frame.height == 360);
         assert(frame.rgba.size() == static_cast<size_t>(640 * 360 * 4));
 
