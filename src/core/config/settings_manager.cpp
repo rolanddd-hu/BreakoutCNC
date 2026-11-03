@@ -126,6 +126,8 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "follow_torch")            s.ui.follow_torch            = toBool(val);
             if (key == "minimal_layout")          s.ui.minimal_layout          = toBool(val);
             if (key == "light_theme")             s.ui.light_theme             = toBool(val);
+            if (key == "dark_theme_id")           s.ui.dark_theme_id           = val;
+            if (key == "light_theme_id")          s.ui.light_theme_id          = val;
             if (key == "step_jog_mode")           s.ui.step_jog_mode           = toBool(val);
             if (key == "step_size_mm")            s.ui.step_size_mm            = static_cast<float>(std::atof(val.c_str()));
             if (key == "jog_speed_pct")           s.ui.jog_speed_pct           = static_cast<float>(std::atof(val.c_str()));
@@ -184,6 +186,9 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "estop_invert")        s.machine.estop_invert        = toBool(val);
             if (key == "require_homing")      s.machine.require_homing      = toBool(val);
             if (key == "start_lift_to_safe_z") s.machine.start_lift_to_safe_z = toBool(val);
+            if (key == "corner_tolerance_mm") s.machine.corner_tolerance_mm = std::atof(val.c_str());
+            if (key == "limit_curve_speed")   s.machine.limit_curve_speed   = toBool(val);
+            if (key == "curve_accel_pct")     s.machine.curve_accel_pct     = std::atoi(val.c_str());
             if (key == "start_safe_z_mm") {
                 s.machine.start_safe_z_mm = std::atof(val.c_str());
                 has_start_safe_z = true;
@@ -461,6 +466,8 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "follow_torch = " << (s.ui.follow_torch ? 1 : 0) << "\n";
     ofs << "minimal_layout = " << (s.ui.minimal_layout ? 1 : 0) << "\n";
     ofs << "light_theme = " << (s.ui.light_theme ? 1 : 0) << "\n";
+    ofs << "dark_theme_id = " << s.ui.dark_theme_id << "\n";
+    ofs << "light_theme_id = " << s.ui.light_theme_id << "\n";
     ofs << "step_jog_mode = " << (s.ui.step_jog_mode ? 1 : 0) << "\n";
     ofs << "step_size_mm = " << s.ui.step_size_mm << "\n";
     ofs << "jog_speed_pct = " << s.ui.jog_speed_pct << "\n";
@@ -515,6 +522,9 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "require_homing = " << (s.machine.require_homing ? 1 : 0) << "\n";
     ofs << "start_lift_to_safe_z = " << (s.machine.start_lift_to_safe_z ? 1 : 0) << "\n";
     ofs << "start_safe_z_mm = " << s.machine.start_safe_z_mm << "\n";
+    ofs << "corner_tolerance_mm = " << s.machine.corner_tolerance_mm << "\n";
+    ofs << "limit_curve_speed = " << (s.machine.limit_curve_speed ? 1 : 0) << "\n";
+    ofs << "curve_accel_pct = " << s.machine.curve_accel_pct << "\n";
     ofs << "spindle_pwm_ratio = " << s.machine.spindle_pwm_ratio << "\n";
     ofs << "spindle_ramp_up_s = " << s.machine.spindle_ramp_up_s << "\n";
     ofs << "spindle_ramp_down_s = " << s.machine.spindle_ramp_down_s << "\n\n";

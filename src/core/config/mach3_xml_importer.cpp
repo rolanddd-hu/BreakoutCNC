@@ -598,16 +598,17 @@ Mach3MigrationReport Mach3XmlImporter::importFromString(
     }
     int pulse_rates = 0;
     if (R.integer("PulseRates", pulse_rates) && pulse_rates > 0) {
-        cfg.pulse_rate_khz = static_cast<uint8_t>(std::clamp(pulse_rates, 10, 100));
+        cfg.pulse_rate_khz = core::MachineConfig::snapPulseRateKhz(pulse_rates);
         add("Units & Core", "Step Pulse Rate", fmt("%d kHz (RNR plugin)", pulse_rates), fmt("%u kHz", cfg.pulse_rate_khz),
-            MigrationSeverity::Ok, "Same rate the RNR board used under Mach3.");
+            cfg.pulse_rate_khz == pulse_rates ? MigrationSeverity::Ok : MigrationSeverity::Warning,
+            cfg.pulse_rate_khz == pulse_rates ? "Same rate the RNR board used under Mach3."
+                                              : "Rounded up to a rate the board offers (25, 50 or 100 kHz).");
     } else {
         int idx = -1;
         const int kernel = P.integer("PulseSpeed", idx) ? kernelSpeedKhz(idx) : 0;
         // Keep the kernel speed the drives were used with, but never below what the fastest axis needs (+25%)
         int target = std::max(kernel, static_cast<int>(std::ceil(needed_khz * 1.25)));
-        target = std::clamp(((target + 4) / 5) * 5, 10, 100);
-        cfg.pulse_rate_khz = static_cast<uint8_t>(target);
+        cfg.pulse_rate_khz = core::MachineConfig::snapPulseRateKhz(std::max(target, 1));
         add("Units & Core", "Step Pulse Rate",
             kernel > 0 ? fmt("Kernel %d kHz (PulseSpeed=%d)", kernel, idx) : "Not set",
             fmt("%u kHz", cfg.pulse_rate_khz), MigrationSeverity::Ok,

@@ -52,7 +52,8 @@ struct PlannerOptions {
 // Look-ahead trajectory planner that streams 25 ms motion slices.
 //  * Every move accelerates/decelerates within the per-axis acceleration limits.
 //  * Velocity is carried through smooth junctions (junction-deviation corner speed), and drops to zero at
-//    hard boundaries (output changes, rapid<->feed, dwell, tool change, program stop, program end).
+//    hard boundaries (output changes, rapid<->feed, dwell, tool change, program stop, program end, G61 moves).
+//  * Optionally the speed is also limited on curves (MachineConfig::limit_curve_speed).
 //  * Planning happens in windows, so arbitrarily long programs never have to be sliced up front.
 //  * Segment starts are chained from the previous end, so discontinuous coordinates can never become a
 //    single-slice jump.
@@ -106,6 +107,8 @@ private:
     uint8_t outputsFor(const core::ToolpathSegment& s) const noexcept;
     std::array<double, 4> targetFor(const core::ToolpathSegment& s) const;
     bool buildMotionItem(const core::ToolpathSegment& s, const std::array<double, 4>& from, MotionItem& out) const;
+    double cornerToleranceFor(const core::ToolpathSegment& s) const noexcept;
+    double curveSpeedLimit(const std::vector<MotionItem>& win, size_t i, double tolerance_mm) const;
     void emitSegmentProfile(const MotionItem& m, double v_in, double v_out, std::deque<PlannedSlice>& out, size_t& count);
     void emitSliceAt(const MotionItem& m, double s_mm, std::deque<PlannedSlice>& out, size_t& count);
     void flushToCommittedPosition(std::deque<PlannedSlice>& out, size_t& count);
@@ -129,6 +132,14 @@ private:
     double                 v_entry_ = 0.0;  // Velocity at pos_ entering the next segment (mm/s)
     double                 t_next_  = 0.0;  // Time into the current motion run of the next slice sample
     bool                   have_prev_dir_ = false;
+    // Moves committed since the last stop, newest last: the curve speed limit of a junction must not depend on where
+    // a planning window starts. Partial after setInitialMotion (the moves before the entry point are not known).
+    struct RecentMove {
+        std::array<double, 4> start{};
+        double                length = 0.0;
+    };
+    std::deque<RecentMove> recent_moves_;
+    bool                   recent_moves_partial_ = false;
     std::array<double, 4>  prev_unit_{};
     const core::ToolpathSegment* last_motion_meta_ = nullptr;
     uint8_t                last_motion_mask_ = 0;

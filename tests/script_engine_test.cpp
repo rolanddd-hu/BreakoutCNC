@@ -31,6 +31,7 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <sstream>
 
@@ -546,6 +547,8 @@ int main() {
         settings.machine.scripting.macro_buttons[1].has_color = true;
         settings.machine.scripting.macro_buttons[1].color_rgb = 0xC0392B;
         settings.ui.light_theme = true;
+        settings.ui.dark_theme_id  = "monokai";
+        settings.ui.light_theme_id = "solarized_light";
 
         std::string test_ini = "test_scripting_settings.ini";
         bool save_ok = rnr::config::SettingsManager::saveToFile(test_ini, settings);
@@ -568,6 +571,7 @@ int main() {
         assert(loaded.machine.scripting.macro_buttons[1].color_rgb == 0xC0392B);
         assert(!loaded.machine.scripting.macro_buttons[2].has_color);
         assert(loaded.ui.light_theme);
+        assert(loaded.ui.dark_theme_id == "monokai" && loaded.ui.light_theme_id == "solarized_light");
 
         std::filesystem::remove(test_ini);
 
@@ -588,6 +592,8 @@ int main() {
         assert(legacy_loaded.machine.scripting.macro_buttons[0].path == "scripts/cut/laser_offset.lua");
         assert(!legacy_loaded.machine.scripting.macro_buttons[0].has_color);
         assert(!legacy_loaded.ui.light_theme);
+        // Settings from before the theme variants keep the default themes
+        assert(legacy_loaded.ui.dark_theme_id == "dark" && legacy_loaded.ui.light_theme_id == "light");
         std::filesystem::remove(test_ini);
         std::cout << "  -> PASSED: Dynamic macro buttons serialize and deserialize accurately.\n";
     }
@@ -1252,8 +1258,8 @@ int main() {
         // A slaved to Y takes Y's tuning
         assert(c.gantry_slave == rnr::core::GantrySlave::AFollowsY && c.gantryMasterAxis() == 1);
         assert(std::abs(c.axes[3].steps_per_mm - 640.0) < 1e-9);
-        // Step rate: Mach3 kernel 35 kHz (PulseSpeed list position 1) covers 15.5 kHz needed
-        assert(c.pulse_rate_khz == 35);
+        // Step rate: Mach3 kernel 35 kHz (PulseSpeed list position 1) covers 15.5 kHz needed, rounded up to 50
+        assert(c.pulse_rate_khz == 50);
         // Parallel-port inputs: suggested wiring plan
         assert(c.estop_pin == 1 && c.estop_invert);
         assert(c.probe.probe_pin == 3 && c.probe.probe_invert);
@@ -1314,7 +1320,7 @@ int main() {
         assert(std::abs(ci.axes[0].soft_limit_max_mm - 24.0 * 25.4) < 1e-9 && ci.axes[0].soft_limits_enabled);
         assert(std::abs(ci.axes[0].home_pulloff_mm - 2.54) < 1e-9); // Pull-off in native units
         assert(ci.axes[0].dir_active_low && ci.axes[0].step_active_low);
-        assert(ci.pulse_rate_khz == 75);
+        assert(ci.pulse_rate_khz == 100); // 75 is not a board rate: rounded up
         assert(ci.gantry_slave == rnr::core::GantrySlave::AFollowsX);
         assert(ci.probe.probe_pin == 4 && ci.probe.probe_invert);
         assert(ci.estop_pin == 0);   // Port 1 input was ignored by the RNR plugin
@@ -2908,8 +2914,347 @@ int main() {
         std::cout << "  -> PASSED: A follows Z copies Z steps, slaved A refuses jogs, independent A jogs.\n";
     }
 
+    // ========================================================================
+    // Test 43: Step pulse rate limited to the board's 25 / 50 / 100 kHz
+    // ========================================================================
+    {
+        std::cout << "\n[Test 43] Testing the step pulse rate choices...\n";
+        using rnr::core::MachineConfig;
+        static_assert(MachineConfig::snapPulseRateKhz(10) == 25 && MachineConfig::snapPulseRateKhz(25) == 25);
+        static_assert(MachineConfig::snapPulseRateKhz(35) == 50 && MachineConfig::snapPulseRateKhz(50) == 50);
+        static_assert(MachineConfig::snapPulseRateKhz(75) == 100 && MachineConfig::snapPulseRateKhz(100) == 100);
+        static_assert(MachineConfig::snapPulseRateKhz(0) == 100 && MachineConfig::snapPulseRateKhz(255) == 100);
+
+        rnr::core::RnRController controller;
+        controller.setSimulatorMode(true);
+        for (const auto& [in, out] : {std::pair<int, int>{25, 25}, {50, 50}, {100, 100}, {35, 50}, {0, 100}}) {
+            auto cfg = controller.getConfig();
+            cfg.pulse_rate_khz = static_cast<uint8_t>(in);
+            controller.applyConfig(cfg);
+            assert(controller.getConfig().pulse_rate_khz == out);
+        }
+
+        // The rate caps the axis speed: 200 steps/mm at 25 kHz gives 0.95 * 25000 / 200 mm/s
+        MachineConfig vcfg;
+        vcfg.axes[0].steps_per_mm      = 200.0;
+        vcfg.axes[0].max_velocity_mm_s = 500.0;
+        vcfg.pulse_rate_khz            = 25;
+        assert(std::abs(rnr::planner::TrajectoryPlanner::axisVelocityLimit(vcfg, 0) - 118.75) < 1e-9);
+        vcfg.pulse_rate_khz = 50;
+        assert(std::abs(rnr::planner::TrajectoryPlanner::axisVelocityLimit(vcfg, 0) - 237.5) < 1e-9);
+        std::cout << "  -> PASSED: pulse rates snap to 25 / 50 / 100 kHz and cap the axis speed.\n";
+    }
+
+    // ========================================================================
+    // Test 44: G61 / G64 P, corner tolerance and the curve speed limit
+    // ========================================================================
+    {
+        std::cout << "\n[Test 44] Testing exact stop, corner tolerance and curve speed...\n";
+        using rnr::core::SegmentType;
+        using rnr::core::ToolpathSegment;
+        using rnr::gcode::GCodeParser;
+
+        // Modal state per move; the P word is not a dwell and the Q word not a peck depth
+        const auto parsed = GCodeParser::parse(
+            "G21 G90 F600\nG1 X1\nG61\nG1 X2\nG64 P0.05 Q0.01\nG1 X3\nG64\nG1 X4\nG20\nG64 P0.001\nG1 X5\nG64 P0\nG1 X6\n");
+        assert(parsed.errors.empty());
+        std::vector<ToolpathSegment> moves;
+        for (const auto& s : parsed.segments) {
+            assert(s.type != SegmentType::Dwell);
+            if (s.type == SegmentType::CutLinear) moves.push_back(s);
+        }
+        assert(moves.size() == 6);
+        assert(!moves[0].exact_stop && moves[1].exact_stop && !moves[2].exact_stop);
+        assert(moves[0].corner_tolerance_mm == 0.0 && std::abs(moves[2].corner_tolerance_mm - 0.05) < 1e-9);
+        assert(moves[3].corner_tolerance_mm == 0.0);
+        assert(std::abs(moves[4].corner_tolerance_mm - 0.0254) < 1e-9);
+        assert(moves[5].corner_tolerance_mm == 0.0);
+        assert(GCodeParser::parse("G64 P99\n").warnings.size() == 1);
+
+        rnr::core::MachineConfig cfg;
+        for (auto& ax : cfg.axes) {
+            ax.steps_per_mm       = 200.0;
+            ax.max_velocity_mm_s  = 500.0;
+            ax.acceleration_mm_s2 = 200.0;
+            ax.deceleration_mm_s2 = 200.0;
+        }
+        const auto lineSeg = [](std::array<double, 4> a, std::array<double, 4> b, double feed) {
+            ToolpathSegment s{};
+            s.type = SegmentType::CutLinear;
+            s.start_xyza_mm = a;
+            s.end_xyza_mm = b;
+            s.length_mm = std::hypot(b[0] - a[0], b[1] - a[1]);
+            s.feed_mm_min = feed;
+            return s;
+        };
+        const auto slice = [](const std::vector<ToolpathSegment>& segs, const rnr::core::MachineConfig& c) {
+            return rnr::planner::TrajectoryPlanner::sliceProgram(segs, c);
+        };
+
+        // G61: a slice lands exactly on the joint of two moves in a straight line and the speed drops to zero
+        ToolpathSegment first = lineSeg({0, 0, 0, 0}, {50, 0, 0, 0}, 3000.0);
+        ToolpathSegment second = lineSeg({50, 0, 0, 0}, {100, 0, 0, 0}, 3000.0);
+        const auto through = slice({first, second}, cfg);
+        first.exact_stop = true;
+        const auto stopped = slice({first, second}, cfg);
+        assert(stopped.size() > through.size());
+        bool on_joint = false;
+        for (const auto& s : stopped) {
+            if (s.target_pos_mm[0] == 50.0) on_joint = true;
+        }
+        assert(on_joint);
+
+        // A bigger tolerance takes a square corner faster; G64 P overrides the setting
+        const auto cornerSlices = [&](double setting, double g64p) {
+            auto c = cfg;
+            c.corner_tolerance_mm = setting;
+            c.limit_curve_speed = false;
+            ToolpathSegment a = lineSeg({0, 0, 0, 0}, {20, 0, 0, 0}, 6000.0);
+            ToolpathSegment b = lineSeg({20, 0, 0, 0}, {20, 20, 0, 0}, 6000.0);
+            a.corner_tolerance_mm = b.corner_tolerance_mm = g64p;
+            return slice({a, b}, c).size();
+        };
+        assert(cornerSlices(1.0, 0.0) < cornerSlices(0.02, 0.0));
+        assert(cornerSlices(0.02, 1.0) == cornerSlices(1.0, 0.0));
+
+        // 5 mm radius circle in 0.2 mm moves at 6350 mm/min: measure the speed and how far the slices leave the path
+        std::vector<ToolpathSegment> circle;
+        constexpr double kR = 5.0;
+        const int kN = static_cast<int>(2.0 * 3.14159265358979 * kR * 3.0 / 0.2);
+        std::array<double, 4> prev = {kR, 0, 0, 0};
+        for (int i = 1; i <= kN; ++i) {
+            const double t = i * 0.2 / kR;
+            const std::array<double, 4> p = {kR * std::cos(t), kR * std::sin(t), 0, 0};
+            circle.push_back(lineSeg(prev, p, 6350.0));
+            prev = p;
+        }
+        const auto measure = [&](bool limit, double& max_speed, double& max_error) {
+            auto c = cfg;
+            c.limit_curve_speed = limit;
+            const auto slices = slice(circle, c);
+            max_speed = 0.0;
+            max_error = 0.0;
+            for (size_t i = 1; i < slices.size(); ++i) {
+                const auto& p0 = slices[i - 1].target_pos_mm;
+                const auto& p1 = slices[i].target_pos_mm;
+                max_speed = std::max(max_speed, std::hypot(p1[0] - p0[0], p1[1] - p0[1]) / 0.025);
+                max_error = std::max(max_error, kR - std::hypot(0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])));
+            }
+        };
+        double speed_off = 0.0, error_off = 0.0, speed_on = 0.0, error_on = 0.0;
+        measure(false, speed_off, error_off);
+        measure(true, speed_on, error_on);
+        std::cout << "  limit off: " << speed_off << " mm/s, " << error_off << " mm; limit on: " << speed_on
+                  << " mm/s, " << error_on << " mm\n";
+        assert(speed_off > 100.0);                      // Full feed on a 5 mm radius without the limit
+        assert(speed_on < std::sqrt(8.0 * kR * 0.02) / 0.025 * 1.05); // Slice chord within the 0.02 mm tolerance
+        assert(error_on < 0.022);                       // 0.02 mm tolerance + chord of the 0.2 mm moves
+
+        // Curve acceleration: the speed follows the square root of the percentage (tolerance large enough not to limit)
+        const auto peakAtAccel = [&](int pct) {
+            auto c = cfg;
+            c.corner_tolerance_mm = 1.0;
+            c.curve_accel_pct = pct;
+            const auto slices = slice(circle, c);
+            double peak = 0.0;
+            for (size_t i = 1; i < slices.size(); ++i) {
+                const auto& p0 = slices[i - 1].target_pos_mm;
+                const auto& p1 = slices[i].target_pos_mm;
+                peak = std::max(peak, std::hypot(p1[0] - p0[0], p1[1] - p0[1]) / 0.025);
+            }
+            return peak;
+        };
+        const double peak100 = peakAtAccel(100), peak200 = peakAtAccel(200), peak25 = peakAtAccel(25);
+        std::cout << "  curve acceleration 25% / 100% / 200%: " << peak25 << " / " << peak100 << " / " << peak200 << " mm/s\n";
+        assert(peak200 / peak100 > 1.3 && peak200 / peak100 < 1.5);
+        assert(peak25 / peak100 > 0.45 && peak25 / peak100 < 0.55);
+
+        // No sudden speed changes: the limit of a junction must not depend on where a planning window starts.
+        // 30 mm radius in 0.05 mm moves with 3-decimal coordinates used to step down by 28 mm/s in one slice.
+        const auto maxPathAccel = [&](const std::vector<ToolpathSegment>& segs) {
+            const auto slices = slice(segs, cfg);
+            double prev_speed = 0.0, worst = 0.0;
+            for (size_t i = 1; i + 1 < slices.size(); ++i) {
+                const auto& p0 = slices[i - 1].target_pos_mm;
+                const auto& p1 = slices[i].target_pos_mm;
+                const double speed = std::hypot(p1[0] - p0[0], p1[1] - p0[1]) / 0.025;
+                if (i > 1) worst = std::max(worst, std::abs(speed - prev_speed) / 0.025);
+                prev_speed = speed;
+            }
+            return worst;
+        };
+        const auto round3 = [](double x) { return std::round(x * 1000.0) / 1000.0; };
+        std::vector<ToolpathSegment> rounded;
+        std::array<double, 4> rp = {30, 0, 0, 0};
+        for (int i = 1; i <= 60000; ++i) {
+            const double t = i * 0.05 / 30.0;
+            const std::array<double, 4> p = {round3(30.0 * std::cos(t)), round3(30.0 * std::sin(t)), 0, 0};
+            rounded.push_back(lineSeg(rp, p, 6350.0));
+            rp = p;
+        }
+        const double rounded_accel = maxPathAccel(rounded);
+        std::cout << "  rounded arc max acceleration: " << rounded_accel << " mm/s2\n";
+        assert(rounded_accel < 350.0);
+
+        // G61: an arc stops once at its end, not at every chord; a subdivided move stops once too
+        const auto arcSegs = [](const char* mode) {
+            return GCodeParser::parse(std::string("G21 G90 F3000\nG0 X20 Y0\n") + mode + "\nG3 X-20 Y0 I-20 J0\nG64\n",
+                                      {0, 0, 0, 0}, 0.3).segments;
+        };
+        const auto arc_g61 = arcSegs("G61");
+        size_t arc_stops = 0;
+        for (const auto& s : arc_g61) {
+            if (s.exact_stop) ++arc_stops;
+        }
+        assert(arc_stops == 1 && arc_g61.back().exact_stop);
+        assert(slice(arc_g61, cfg).size() < slice(arcSegs("G64"), cfg).size() + 40);
+
+        rnr::core::SurfaceHeightMap flat_map;
+        flat_map.is_valid = true;
+        flat_map.points_x = 2;
+        flat_map.points_y = 2;
+        flat_map.min_x = 0.0;
+        flat_map.max_x = 100.0;
+        flat_map.min_y = 0.0;
+        flat_map.max_y = 100.0;
+        flat_map.grid_z = {0.0, 0.0, 0.0, 0.0};
+        ToolpathSegment warp_in = lineSeg({0, 0, 0, 0}, {20, 0, 0, 0}, 3000.0);
+        warp_in.exact_stop = true;
+        const auto warped = rnr::planner::TrajectoryPlanner::warpToolpathWithHeightMap({warp_in}, flat_map, 2.0);
+        assert(warped.size() == 10);
+        for (size_t i = 0; i < warped.size(); ++i) assert(warped[i].exact_stop == (i + 1 == warped.size()));
+
+        // Long straight moves with a small kink are not slowed down by the curve limit
+        ToolpathSegment k1 = lineSeg({0, 0, 0, 0}, {100, 0, 0, 0}, 3000.0);
+        ToolpathSegment k2 = lineSeg({100, 0, 0, 0}, {200, 0.1, 0, 0}, 3000.0);
+        auto kc = cfg;
+        const size_t kink_on = slice({k1, k2}, kc).size();
+        kc.limit_curve_speed = false;
+        assert(kink_on == slice({k1, k2}, kc).size());
+
+        // Settings: range is enforced and both values are saved
+        rnr::core::RnRController controller;
+        controller.setSimulatorMode(true);
+        auto ccfg = controller.getConfig();
+        ccfg.corner_tolerance_mm = 100.0;
+        controller.applyConfig(ccfg);
+        assert(controller.getConfig().corner_tolerance_mm == rnr::core::MachineConfig::kMaxCornerToleranceMm);
+        ccfg = controller.getConfig();
+        ccfg.curve_accel_pct = 1000;
+        controller.applyConfig(ccfg);
+        assert(controller.getConfig().curve_accel_pct == rnr::core::MachineConfig::kMaxCurveAccelPct);
+
+        const std::string ini = (std::filesystem::temp_directory_path() / "breakout_corner_settings_test.ini").string();
+        rnr::config::PersistentSettings ps;
+        ps.machine.corner_tolerance_mm = 0.05;
+        ps.machine.limit_curve_speed   = false;
+        ps.machine.curve_accel_pct     = 150;
+        assert(rnr::config::SettingsManager::saveToFile(ini, ps));
+        rnr::config::PersistentSettings back;
+        assert(rnr::config::SettingsManager::loadFromFile(ini, back));
+        assert(back.machine.corner_tolerance_mm == 0.05 && !back.machine.limit_curve_speed);
+        assert(back.machine.curve_accel_pct == 150);
+        std::filesystem::remove(ini);
+        std::filesystem::remove(ini + ".bak");
+        std::cout << "  -> PASSED: G61 stops, G64 P and the setting set the corner speed, curves stay within limits.\n";
+    }
+
+    // ========================================================================
+    // Test 45: Dragging a settings slider (applyConfig on every frame) against a fake board
+    // ========================================================================
+    {
+        std::cout << "\n[Test 45] Testing a settings slider drag against a fake board...\n";
+        auto fake = std::make_unique<FakeBoardDriver>();
+        FakeBoardDriver* fb = fake.get();
+        rnr::core::MachineController mc(std::move(fake));
+        const auto waitFor = [](const std::function<bool()>& done) {
+            for (int i = 0; i < 400; ++i) {
+                if (done()) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            return false;
+        };
+        assert(waitFor([&] { return mc.resetFromEStop(); }));
+        mc.jogStep(rnr::core::Axis::X, 2.0, 600.0);
+        assert(waitFor([&] { return mc.getTelemetry().state == rnr::core::ControllerState::Idle; }));
+
+        const auto drag = [&](int ticks) {
+            for (int i = 0; i < ticks; ++i) {
+                auto cfg = mc.getConfig();
+                cfg.curve_accel_pct = 25 + (i % 176);
+                mc.applyConfig(cfg);
+            }
+        };
+
+        // Idle: nothing but configuration reaches the board, and the position does not move
+        const int configure0 = fb->count("configure");
+        const int32_t steps0 = fb->steps(0);
+        const int estop0 = fb->count("estop"), cancel0 = fb->count("cancel"), outputs0 = fb->count("outputs");
+        const int positions0 = fb->count("positions"), slices0 = fb->count("slice_internal");
+        const auto t0 = std::chrono::steady_clock::now();
+        drag(120);
+        const auto drag_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const int idle_configures = fb->count("configure") - configure0;
+        std::cout << "  idle: 120 ticks sent " << idle_configures << " configure calls in " << drag_ms << " ms\n";
+        assert(idle_configures == 120);
+        assert(fb->count("estop") == estop0 && fb->count("cancel") == cancel0 && fb->count("outputs") == outputs0);
+        assert(fb->count("positions") == positions0 && fb->count("slice_internal") == slices0);
+        assert(fb->steps(0) == steps0);
+        assert(mc.getTelemetry().state == rnr::core::ControllerState::Idle);
+
+        // During a job: nothing is sent until motion stops, and the job ends where it should
+        assert(mc.loadGCodeString("G90 G21\nG1 X20 F1200\n"));
+        mc.startJob();
+        assert(waitFor([&] { return mc.getTelemetry().state == rnr::core::ControllerState::RunningGCode; }));
+        const int configure1 = fb->count("configure");
+        for (int i = 0; i < 10; ++i) {
+            drag(1);
+            assert(fb->count("configure") == configure1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        assert(waitFor([&] { return mc.getTelemetry().state == rnr::core::ControllerState::Idle; }));
+        assert(fb->steps(0) == static_cast<int32_t>(std::llround(20.0 * mc.getConfig().axes[0].steps_per_mm)));
+        assert(waitFor([&] { return fb->count("configure") == configure1 + 1; })); // Latest values, applied once
+        std::cout << "  job: 10 ticks sent nothing during motion, 1 configure after it; status message: \""
+                  << mc.getTelemetry().active_fault_message << "\"\n";
+        std::cout << "  -> PASSED: a slider drag only sends configuration, and waits for motion to stop.\n";
+    }
+
+    // ========================================================================
+    // Test 46: Canned cycle words: G82 P for all holes, warning for pecks without Q
+    // ========================================================================
+    {
+        std::cout << "\n[Test 46] Testing G82 P and G73 / G83 without Q...\n";
+        using rnr::core::SegmentType;
+        using rnr::gcode::GCodeParser;
+        const auto dwells = [](const std::string& gcode) {
+            std::vector<double> out;
+            for (const auto& s : GCodeParser::parse(gcode).segments) {
+                if (s.type == SegmentType::Dwell) out.push_back(s.dwell_seconds);
+            }
+            return out;
+        };
+        const std::string head = "G21 G90 F300\nG0 Z10\n";
+        // P on the first hole applies to all of them; a new P replaces it
+        auto d = dwells(head + "G82 X5 Z-2 R2 P0.5\nX15\nX25 P0.2\nX35\nG80\n");
+        assert(d.size() == 4 && d[0] == 0.5 && d[1] == 0.5 && d[2] == 0.2 && d[3] == 0.2);
+        // G80 ends the cycle: the next G82 does not inherit P; a G4 inside the cycle does not change it
+        assert(dwells(head + "G82 X5 Z-2 R2 P0.5\nG80\nG82 X15 Z-2 R2\nG80\n").size() == 1);
+        d = dwells(head + "G82 X5 Z-2 R2 P0.5\nG4 P3\nX15\nG80\n");
+        assert(d.size() == 3 && d[0] == 0.5 && d[1] == 3.0 && d[2] == 0.5);
+
+        const auto warnings = [](const std::string& gcode) { return GCodeParser::parse(gcode).warnings.size(); };
+        assert(warnings(head + "G83 X5 Z-3 R2 Q1\nX15\nG80\n") == 0);
+        assert(warnings(head + "G73 X5 Z-3 R2 Q1\nX15\nG80\n") == 0);
+        assert(warnings(head + "G83 X5 Z-3 R2\nX15\nG80\n") == 1); // Once per cycle, not per hole
+        assert(warnings(head + "G73 X5 Z-3 R2\nG80\nG83 X15 Z-3 R2\nG80\n") == 2);
+        assert(warnings(head + "G83 X5 Z-3 R2 Q1\nG80\nG83 X15 Z-3 R2\nG80\n") == 1); // Q does not outlive the cycle
+        assert(warnings(head + "G81 X5 Z-3 R2\nG80\n") == 0);
+        std::cout << "  -> PASSED: G82 P lasts for the cycle, pecks without Q warn.\n";
+    }
+
     std::cout << "\n====================================================\n";
-    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (42/42)\n";
+    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (46/46)\n";
     std::cout << "====================================================\n";
     return 0;
 }

@@ -56,9 +56,13 @@ void sanitizeConfig(MachineConfig& c) {
             ax.soft_limits_enabled = false;
         }
     }
-    if (c.pulse_rate_khz == 0 || c.pulse_rate_khz > 100) c.pulse_rate_khz = 100;
+    c.pulse_rate_khz = MachineConfig::snapPulseRateKhz(c.pulse_rate_khz);
     if (c.estop_pin > 12) c.estop_pin = 0;
     c.start_safe_z_mm = std::isfinite(c.start_safe_z_mm) ? std::clamp(c.start_safe_z_mm, 0.0, 1000.0) : 25.0;
+    c.corner_tolerance_mm = std::isfinite(c.corner_tolerance_mm)
+        ? std::clamp(c.corner_tolerance_mm, MachineConfig::kMinCornerToleranceMm, MachineConfig::kMaxCornerToleranceMm)
+        : 0.02;
+    c.curve_accel_pct = std::clamp(c.curve_accel_pct, MachineConfig::kMinCurveAccelPct, MachineConfig::kMaxCurveAccelPct);
     if (c.probe.probe_pin > 12) c.probe.probe_pin = 0;
     c.spindle_ramp_up_s   = std::clamp(std::isfinite(c.spindle_ramp_up_s) ? c.spindle_ramp_up_s : 0.0, 0.0, 30.0);
     c.spindle_ramp_down_s = std::clamp(std::isfinite(c.spindle_ramp_down_s) ? c.spindle_ramp_down_s : 0.0, 0.0, 30.0);

@@ -14,6 +14,7 @@
 #include "ui_common/file_dialog.h"
 #include "ui_common/mach3_migration_dialog.h"
 #include "ui_common/gantry_slave_combo.h"
+#include "ui_common/corner_settings.h"
 #include "ui_common/program_start_settings.h"
 #include "ui_common/camera_panel.h"
 #include "imgui.h"
@@ -39,6 +40,8 @@ int main(int argc, char** argv) {
 
     core::RnRController controller;
     saved_settings.machine = controller.getConfig();
+    // Off unless the settings file says otherwise: slowing down on curves changes the cut and locks the THC anti-dive
+    saved_settings.machine.limit_curve_speed = false;
     bool had_saved_settings = config::SettingsManager::loadFromFile(settings_file, saved_settings);
     if (!had_saved_settings) {
         // Fallback to legacy settings file if present
@@ -296,10 +299,14 @@ int main(int argc, char** argv) {
         markSettingsDirty();
     });
 
-    // Dark / light theme button in the custom title bar
+    // Light / dark theme buttons in the custom title bar: restore the theme chosen in each family, then the active one
+    ui::theme::setTheme(ui::theme::findTheme(ui::theme::Mode::Dark, saved_settings.ui.dark_theme_id.c_str()));
+    ui::theme::setTheme(ui::theme::findTheme(ui::theme::Mode::Light, saved_settings.ui.light_theme_id.c_str()));
     ui::theme::setMode(saved_settings.ui.light_theme ? ui::theme::Mode::Light : ui::theme::Mode::Dark);
     window.setOnThemeChanged([&](bool light) {
-        saved_settings.ui.light_theme = light;
+        saved_settings.ui.light_theme    = light;
+        saved_settings.ui.dark_theme_id  = ui::theme::themeInfo(ui::theme::familyTheme(ui::theme::Mode::Dark)).id;
+        saved_settings.ui.light_theme_id = ui::theme::themeInfo(ui::theme::familyTheme(ui::theme::Mode::Light)).id;
         markSettingsDirty();
     });
 
@@ -1628,6 +1635,17 @@ int main(int argc, char** argv) {
                             ImGui::TextColored(ui::theme::pal().heading, "PROGRAM START");
                             ImGui::Spacing();
                             if (ui::renderProgramStartSettings(cfg)) changed = true;
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::Spacing();
+
+                        // Constant velocity: corner tolerance and curve speed limit
+                        ImGui::BeginChild("##PlasmaCornersCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                        {
+                            ImGui::TextColored(ui::theme::pal().heading, "CORNERS & CURVES");
+                            ImGui::Spacing();
+                            if (ui::renderCornerSettings(cfg)) changed = true;
                         }
                         ImGui::EndChild();
 

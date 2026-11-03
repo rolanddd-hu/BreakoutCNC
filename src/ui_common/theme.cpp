@@ -1,6 +1,9 @@
 #include "ui_common/theme.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <initializer_list>
 
 namespace rnr::ui::theme {
 
@@ -361,7 +364,179 @@ const Palette kLight = [] {
     return p;
 }();
 
+// Variant themes: a few key colors (0xRRGGBB) from which the palette and the ImGui style are derived. Status
+// colors (ok / warn / danger, E-stop) and the DRO readout keep the values of the dark or light base theme.
+struct ThemeSpec {
+    uint32_t window, panel, frame, border, title; // Backgrounds from outermost to innermost, borders, title bar
+    uint32_t text, text_dim, heading;
+    uint32_t accent;                              // Headers, highlighted borders, current line
+    uint32_t grab;                                // Check marks and slider handles
+    uint32_t primary;                             // Primary / selected button fill
+    // Lua syntax highlighting: default, keyword, cnc.*, built-ins, Mach3 calls, strings, numbers, comments
+    uint32_t syn[8];
+};
+
+constexpr ImVec4 hex(uint32_t rgb, float a = 1.0f) {
+    return ImVec4(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f, a);
+}
+
+// Inspired by Sublime Text's Monokai: warm charcoal, purple selection
+constexpr ThemeSpec kMonokai = {
+    0x1E1F1C, 0x272822, 0x34352D, 0x49483E, 0x191A17,
+    0xF8F8F2, 0xA59F85, 0xA59F85,
+    0xAE81FF, 0xAE81FF, 0x7A56C8,
+    {0xF8F8F2, 0xF92672, 0x66D9EF, 0xA6E22E, 0xFD971F, 0xE6DB74, 0xAE81FF, 0x75715E}};
+// Inspired by Mariana: slate blue-gray
+constexpr ThemeSpec kMariana = {
+    0x283038, 0x303841, 0x3B4550, 0x4F5B66, 0x232A31,
+    0xD8DEE9, 0xA6ACB9, 0xA6ACB9,
+    0x6699CC, 0x6699CC, 0x4F7FB8,
+    {0xD8DEE9, 0xC695C6, 0x6699CC, 0x5FB4B4, 0xF99157, 0x99C794, 0xF9AE58, 0xA6ACB9}};
+// Inspired by Solarized (dark)
+constexpr ThemeSpec kSolarizedDark = {
+    0x002B36, 0x073642, 0x0D3F4C, 0x1F5361, 0x00222B,
+    0xA9B7B7, 0x7A8F95, 0x839496,
+    0x268BD2, 0x268BD2, 0x1F78B8,
+    {0x93A1A1, 0x859900, 0x268BD2, 0xB58900, 0xCB4B16, 0x2AA198, 0xD33682, 0x586E75}};
+// Inspired by Ayu Light: near-white, blue accents, orange controls
+constexpr ThemeSpec kAyuLight = {
+    0xF3F4F5, 0xFCFCFC, 0xFFFFFF, 0xD9DCE0, 0xECEEF0,
+    0x4A5056, 0x828A92, 0x828A92,
+    0x399EE6, 0xFF9940, 0x399EE6,
+    {0x5C6166, 0xFA8D3E, 0x399EE6, 0xD9952B, 0xF07171, 0x86B300, 0xA37ACC, 0x9DA2A6}};
+// Inspired by Solarized (light)
+constexpr ThemeSpec kSolarizedLight = {
+    0xEEE8D5, 0xFDF6E3, 0xFFFBF0, 0xD3CBB7, 0xE4DDC8,
+    0x485A62, 0x7B8C91, 0x7B8C91,
+    0x268BD2, 0x268BD2, 0x268BD2,
+    {0x586E75, 0x859900, 0x268BD2, 0xB58900, 0xCB4B16, 0x2AA198, 0xD33682, 0x93A1A1}};
+
+struct ThemeEntry {
+    ThemeInfo        info;
+    const ThemeSpec* spec; // nullptr: the base dark / light theme as is
+};
+
+constexpr ThemeEntry kThemes[] = {
+    {{"dark", "Dark", Mode::Dark}, nullptr},
+    {{"monokai", "Monokai", Mode::Dark}, &kMonokai},
+    {{"mariana", "Mariana", Mode::Dark}, &kMariana},
+    {{"solarized_dark", "Solarized Dark", Mode::Dark}, &kSolarizedDark},
+    {{"light", "Light", Mode::Light}, nullptr},
+    {{"ayu_light", "Ayu Light", Mode::Light}, &kAyuLight},
+    {{"solarized_light", "Solarized Light", Mode::Light}, &kSolarizedLight},
+};
+constexpr int kThemeCount = static_cast<int>(sizeof(kThemes) / sizeof(kThemes[0]));
+
+float channel(float c) { return std::clamp(c, 0.0f, 1.0f); }
+
+ImVec4 mix(const ImVec4& a, const ImVec4& b, float t) {
+    return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+}
+
+ImVec4 toVec(ImU32 c) {
+    return ImVec4(((c >> IM_COL32_R_SHIFT) & 0xFF) / 255.0f, ((c >> IM_COL32_G_SHIFT) & 0xFF) / 255.0f,
+                  ((c >> IM_COL32_B_SHIFT) & 0xFF) / 255.0f, ((c >> IM_COL32_A_SHIFT) & 0xFF) / 255.0f);
+}
+
+ImU32 toU32(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
+
+ImVec4 withA(const ImVec4& c, float a) { return ImVec4(c.x, c.y, c.z, a); }
+
+float luminance(const ImVec4& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; }
+
+// Gives a neutral color the hue of `hue` while keeping its brightness (k = how much)
+ImVec4 colorize(const ImVec4& c, const ImVec4& hue, float k) {
+    const float scale = luminance(c) / std::max(0.02f, luminance(hue));
+    const ImVec4 tinted(channel(hue.x * scale), channel(hue.y * scale), channel(hue.z * scale), c.w);
+    return mix(c, tinted, k);
+}
+
+void colorizeAll(std::initializer_list<ImU32*> colors, const ImVec4& hue, float k) {
+    for (ImU32* c : colors) *c = toU32(colorize(toVec(*c), hue, k));
+}
+
+constexpr ImVec4 kBlack = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+
+Palette buildPalette(const ThemeEntry& e) {
+    const bool light = e.info.mode == Mode::Light;
+    Palette p = light ? kLight : kDark;
+    if (!e.spec) return p;
+    const ThemeSpec& t = *e.spec;
+    const ImVec4 window = hex(t.window), panel = hex(t.panel), frame = hex(t.frame), border = hex(t.border);
+    const ImVec4 text = hex(t.text), text_dim = hex(t.text_dim), accent = hex(t.accent), primary = hex(t.primary);
+
+    // Drawn surfaces (jog pad, probing pad, gauge bezels) take the theme's hue
+    colorizeAll({&p.segment_bg, &p.segment_border, &p.segment_hover, &p.gc_row_selected,
+                 &p.probe_card_bg, &p.probe_card_border, &p.jog_body, &p.jog_face, &p.jog_groove, &p.jog_bevel_mid,
+                 &p.jog_bevel_lit, &p.jog_bevel_shade, &p.knob_base, &p.knob_base_hover, &p.knob_face,
+                 &p.knob_face_hover, &p.knob_dimple, &p.knob_dimple_shadow, &p.knob_rim_shadow, &p.stick_shadow,
+                 &p.pp_tile, &p.pp_tile_border, &p.pp_center_tile, &p.pp_pocket_bg, &p.pp_pocket_shadow,
+                 &p.readout_bezel, &p.readout_bezel_border},
+                panel, 0.75f);
+
+    p.clear_bg           = mix(window, kBlack, light ? 0.05f : 0.25f);
+    p.title_bg           = toU32(hex(t.title));
+    p.title_separator    = toU32(border);
+    p.title_text         = toU32(text);
+    p.title_icon         = toU32(mix(text, hex(t.title), 0.15f));
+    p.title_icon_hover   = toU32(text);
+    p.segment_text       = toU32(text_dim);
+    p.segment_text_hover = toU32(text);
+
+    p.card_bg            = panel;
+    p.card_border        = border;
+    p.heading            = hex(t.heading);
+    p.console_bg         = light ? frame : mix(window, kBlack, 0.2f);
+    p.console_time       = text_dim;
+    p.dro_secondary      = text_dim;
+    p.text_muted         = text_dim;
+    p.text_info          = light ? mix(accent, kBlack, 0.25f) : accent;
+    p.macro_btn          = primary;
+
+    p.btn_primary        = primary;
+    p.btn_primary_hov    = hoveredOf(primary);
+    p.btn_primary_act    = activeOf(primary);
+    p.btn_neutral        = mix(frame, text, light ? 0.12f : 0.10f);
+    p.btn_neutral_hov    = mix(frame, text, light ? 0.20f : 0.18f);
+    p.btn_neutral_act    = mix(frame, text, light ? 0.28f : 0.04f);
+    p.surface_inset      = withA(light ? frame : mix(window, kBlack, 0.1f), 0.98f);
+    p.border_accent      = withA(accent, light ? 1.0f : 0.85f);
+    p.card_active_bg     = mix(panel, accent, 0.16f);
+
+    p.gc_row_even        = toU32(light ? frame : mix(frame, window, 0.6f));
+    p.gc_row_odd         = toU32(light ? mix(frame, panel, 0.7f) : mix(frame, window, 0.3f));
+    p.gc_separator       = toU32(withA(border, 0.8f));
+    p.gc_text            = toU32(text);
+    p.gc_num             = toU32(text_dim);
+    p.gc_accent_current  = toU32(accent);
+    p.gc_num_current     = toU32(light ? mix(accent, kBlack, 0.2f) : accent);
+    p.gc_selected_border = toU32(withA(accent, 0.65f));
+    p.gc_row_current     = toU32(mix(light ? frame : panel, accent, light ? 0.22f : 0.28f));
+
+    p.jog_accent         = toU32(accent);
+    p.icon_hover         = toU32(accent);
+    p.icon_active        = toU32(activeOf(accent));
+    p.pp_dash_line       = toU32(withA(accent, 0.85f));
+
+    ImVec4* syn[] = {&p.syn_default, &p.syn_keyword, &p.syn_cnc, &p.syn_builtin,
+                     &p.syn_mach3, &p.syn_string, &p.syn_number, &p.syn_comment};
+    for (int i = 0; i < 8; ++i) *syn[i] = hex(t.syn[i]);
+    return p;
+}
+
+// Palettes of all themes, built on first use (after kDark / kLight above)
+const Palette& themePalette(int index) {
+    static const auto palettes = [] {
+        std::array<Palette, kThemeCount> all{};
+        for (int i = 0; i < kThemeCount; ++i) all[i] = buildPalette(kThemes[i]);
+        return all;
+    }();
+    return palettes[index];
+}
+
 Mode s_mode = Mode::Dark;
+int  s_theme = 0;
+int  s_family_theme[2] = {0, 4}; // Last dark / light theme
 
 void applyStyle(ImGuiStyle& style, Mode m) {
     style.WindowRounding    = 6.0f;
@@ -431,7 +606,47 @@ void applyStyle(ImGuiStyle& style, Mode m) {
     }
 }
 
-float channel(float c) { return std::clamp(c, 0.0f, 1.0f); }
+// ImGui style colors of a variant theme, on top of its base dark / light style
+void applySpecStyle(ImGuiStyle& style, const ThemeSpec& t, Mode m) {
+    const bool light = m == Mode::Light;
+    const ImVec4 window = hex(t.window), panel = hex(t.panel), frame = hex(t.frame), border = hex(t.border);
+    const ImVec4 text = hex(t.text), accent = hex(t.accent), primary = hex(t.primary);
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = text;
+    colors[ImGuiCol_TextDisabled]         = hex(t.text_dim);
+    colors[ImGuiCol_WindowBg]             = window;
+    colors[ImGuiCol_ChildBg]              = panel;
+    colors[ImGuiCol_PopupBg]              = withA(panel, 0.98f);
+    colors[ImGuiCol_Border]               = border;
+    colors[ImGuiCol_FrameBg]              = frame;
+    colors[ImGuiCol_FrameBgHovered]       = mix(frame, accent, 0.15f);
+    colors[ImGuiCol_FrameBgActive]        = mix(frame, accent, 0.28f);
+    colors[ImGuiCol_TitleBg]              = hex(t.title);
+    colors[ImGuiCol_TitleBgActive]        = hex(t.title);
+    colors[ImGuiCol_Header]               = mix(frame, accent, light ? 0.18f : 0.20f);
+    colors[ImGuiCol_HeaderHovered]        = mix(frame, accent, light ? 0.30f : 0.32f);
+    colors[ImGuiCol_HeaderActive]         = mix(frame, accent, light ? 0.42f : 0.45f);
+    colors[ImGuiCol_Button]               = mix(frame, light ? text : accent, light ? 0.12f : 0.14f);
+    colors[ImGuiCol_ButtonHovered]        = mix(frame, light ? text : accent, light ? 0.20f : 0.26f);
+    colors[ImGuiCol_ButtonActive]         = primary;
+    colors[ImGuiCol_CheckMark]            = hex(t.grab);
+    colors[ImGuiCol_SliderGrab]           = hex(t.grab);
+    colors[ImGuiCol_SliderGrabActive]     = hoveredOf(hex(t.grab));
+    colors[ImGuiCol_Separator]            = border;
+    colors[ImGuiCol_SeparatorHovered]     = accent;
+    colors[ImGuiCol_SeparatorActive]      = accent;
+    colors[ImGuiCol_ResizeGrip]           = withA(accent, 0.25f);
+    colors[ImGuiCol_ResizeGripHovered]    = withA(accent, 0.65f);
+    colors[ImGuiCol_ResizeGripActive]     = withA(accent, 0.95f);
+    colors[ImGuiCol_Tab]                  = mix(panel, window, 0.5f);
+    colors[ImGuiCol_TabHovered]           = mix(panel, accent, 0.30f);
+    colors[ImGuiCol_TabSelected]          = light ? panel : mix(panel, accent, 0.18f);
+    colors[ImGuiCol_ScrollbarBg]          = window;
+    colors[ImGuiCol_ScrollbarGrab]        = mix(window, text, 0.22f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = mix(window, text, 0.32f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = mix(window, text, 0.42f);
+    colors[ImGuiCol_TextSelectedBg]       = withA(accent, 0.35f);
+}
 
 } // namespace
 
@@ -441,11 +656,46 @@ const Palette* g_active = &kDark;
 
 Mode mode() noexcept { return s_mode; }
 
-void setMode(Mode m) {
-    s_mode = m;
-    detail::g_active = (m == Mode::Light) ? &kLight : &kDark;
-    applyStyle(ImGui::GetStyle(), m);
+int themeCount() noexcept { return kThemeCount; }
+
+const ThemeInfo& themeInfo(int index) noexcept { return kThemes[std::clamp(index, 0, kThemeCount - 1)].info; }
+
+int activeTheme() noexcept { return s_theme; }
+
+int familyTheme(Mode m) noexcept { return s_family_theme[m == Mode::Light ? 1 : 0]; }
+
+int nextTheme(int index) noexcept {
+    index = std::clamp(index, 0, kThemeCount - 1);
+    const Mode m = kThemes[index].info.mode;
+    for (int step = 1; step < kThemeCount; ++step) {
+        const int i = (index + step) % kThemeCount;
+        if (kThemes[i].info.mode == m) return i;
+    }
+    return index;
 }
+
+int findTheme(Mode m, const char* id) noexcept {
+    int fallback = -1;
+    for (int i = 0; i < kThemeCount; ++i) {
+        if (kThemes[i].info.mode != m) continue;
+        if (fallback < 0) fallback = i;
+        if (id && std::strcmp(kThemes[i].info.id, id) == 0) return i;
+    }
+    return fallback;
+}
+
+void setTheme(int index) {
+    index = std::clamp(index, 0, kThemeCount - 1);
+    const ThemeEntry& e = kThemes[index];
+    s_theme = index;
+    s_mode  = e.info.mode;
+    s_family_theme[s_mode == Mode::Light ? 1 : 0] = index;
+    detail::g_active = &themePalette(index);
+    applyStyle(ImGui::GetStyle(), s_mode);
+    if (e.spec) applySpecStyle(ImGui::GetStyle(), *e.spec, s_mode);
+}
+
+void setMode(Mode m) { setTheme(familyTheme(m)); }
 
 ImVec4 contrastText(const ImVec4& bg) noexcept {
     // Relative luminance (sRGB weights); the threshold leans to white text on mid-tone fills

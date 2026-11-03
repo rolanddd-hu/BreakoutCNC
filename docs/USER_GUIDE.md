@@ -74,10 +74,17 @@ example by a power cut while saving.
 | **Right: settings** | Collapsible sections for spindle, connection, tools, probing, work offsets, camera, inputs and outputs, limits and motors |
 | **Bottom strip** | Every output and input with its function (click inputs to simulate them in the simulator), Diagnostics |
 
-Title bar: **FULL / MINIMAL** switches to a simplified layout for running jobs; the icons on the right switch between
-the dark and light theme (sun / moon), toggle full screen (also F11), minimize, maximize and close. The app starts in
-the dark theme (all screenshots in this guide use it); the choice is saved. The toolpath view stays dark in the light
-theme.
+Title bar: **FULL / MINIMAL** switches to a simplified layout for running jobs; the icons on the right choose the color
+theme (sun: light themes, moon: dark themes), toggle full screen (also F11), minimize, maximize and close. Clicking the
+sun or moon switches to the last theme used in that group; clicking it again goes to the group's next theme. The active
+group's icon is underlined and its tooltip names the current theme:
+
+| Dark themes (moon) | Light themes (sun) |
+|---|---|
+| Dark, Monokai, Mariana, Solarized Dark | Light, Ayu Light, Solarized Light |
+
+The app starts in the Dark theme (all screenshots in this guide use it); the choice is saved. Status colors (OK, warning,
+alarm) are the same in every theme of a group, and the toolpath view stays dark in the light themes.
 
 Keyboard:
 
@@ -106,7 +113,7 @@ Keyboard:
   **Ctrl** (**Cmd** on macOS) and each arrow / Page Up / Page Down press moves one step of the step increment size
   instead, like in Mach3.
 - **A axis (rotary):** in BreakoutMill, when A is an independent axis (*Dual-Motor Gantry* set to *None*), an **A**
-  pad appears next to Z and **Home / End** jog A+ / A-. A moves in degrees: the step buttons give 0.01 / 0.1 / 1 /
+  pad appears to the left of the X/Y pad and **Home / End** jog A+ / A-. A moves in degrees: the step buttons give 0.01 / 0.1 / 1 /
   10 degrees (0.001 to 1 degree in inch mode). When A follows another axis it has no jog controls of its own.
 - **Limit Override** (only shown during a limit alarm) lets you jog off a triggered limit switch.
 - **CYCLE START / EMERGENCY STOP** (or **RESET E-STOP** while in E-stop) at the bottom.
@@ -173,6 +180,11 @@ Work through them in this order, with the stepper drivers **powered off** until 
 USB**). The yellow line *Simulator (no board)* changes to the board's name. If the board is not found on Linux, check
 the udev rule; on Windows no driver is needed.
 
+While the board is connected, **Step pulse rate** appears under the buttons: 25, 50 or 100 kHz, the same choice as the
+RNR Mach3 plugin. Each axis is limited to 0.95 × rate ÷ Steps/mm (at 25 kHz and 200 steps/mm: about 7100 mm/min).
+If an axis loses steps at high speed, try 50 or 25 kHz, as long as that limit still covers your rapids. It can be
+changed while the machine is idle.
+
 ### 5.2 Units and motors
 
 *Motors*:
@@ -217,6 +229,20 @@ the udev rule; on Windows no driver is needed.
   low height. A G0 without a Z word lifts to **Safe Z** (work Z of the tool tip), a G0 to a higher Z lifts to that Z.
   Untick it to run the first rapid exactly as written, with all axes moving together. **Run From Line** always lifts
   to Safe Z before it moves to the start point.
+- **Corners & curves: Corner tolerance** (0.02 mm by default) sets how fast the machine goes through corners. A larger
+  value is faster and less precise. `G64 P<value>` in a program overrides it for the moves that follow, in the
+  program's units; `G64` or `G64 P0` goes back to this setting. `G61` makes the machine stop at the end of every
+  programmed move (a whole arc counts as one move) until the next `G64`, which is exact but much slower on programs
+  with many short moves.
+- **Limit speed on curves** (on by default in BreakoutMill, off in BreakoutCut): slows down on curves made of many short moves, to keep the sideways
+  acceleration near the axis limits and the tool close to the path. The path error is usually about the corner
+  tolerance, and can be up to about twice that on very uneven paths; it is not a guaranteed maximum. Untick it to run
+  these curves at full feed. On a plasma table, slowing down changes the cut and, below the THC minimum speed, locks
+  the torch height control on those curves.
+- **Curve acceleration** (100% by default, 25-200%): how much sideways acceleration curves may use, in percent of the
+  axis acceleration. Lower it for a heavy or vibrating machine. Above 100% small curves run faster, but the motors can
+  lose steps, so raise it gradually and test. Speed grows with the square root: 200% is about 1.4x as fast. If the
+  corner tolerance is what limits a curve, this slider has no effect until the tolerance is raised too.
 
 After this section: power the drivers, jog each axis slowly in both directions, check the direction and the distance
 (mark a position, jog 100 mm, measure), then try **HOME ALL**.

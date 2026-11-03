@@ -20,7 +20,9 @@ struct AppUiSettings {
     bool        follow_torch            = false;
     float       toolpath_simplify_px    = 1.0f;  // Toolpath view drawing tolerance (ToolpathViewport::setSimplifyPx)
     bool        minimal_layout          = false; // false = Full layout, true = Minimal (big viewport) layout
-    bool        light_theme             = false; // Title bar theme button: false = dark, true = light
+    bool        light_theme             = false; // Title bar theme buttons: false = a dark theme is active
+    std::string dark_theme_id           = "dark";  // Theme last chosen with the dark (moon) button
+    std::string light_theme_id          = "light"; // Theme last chosen with the light (sun) button
 
     bool        step_jog_mode           = false;
     float       step_size_mm            = 10.0f;

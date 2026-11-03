@@ -420,9 +420,60 @@ void IoStatusBar::renderUsbConnectionSection(
     }
     ImGui::PopStyleVar(2);
 
+    if (telemetry.usb_connected && !telemetry.simulator_mode) {
+        renderPulseRateSetting(controller, telemetry, on_settings_changed);
+    }
+
     // Row 3: Hardware specs
     ImGui::TextColored(theme::pal().text_muted,
                        "Hardware: VID 0xA720 | PID 0xF803");
+}
+
+void IoStatusBar::renderPulseRateSetting(
+    core::IMotionController& controller,
+    const core::TelemetrySnapshot& telemetry,
+    const std::function<void()>& on_settings_changed)
+{
+    core::MachineConfig cfg = controller.getConfig();
+    const auto& rates = core::MachineConfig::kPulseRatesKhz;
+
+    ImGui::Spacing();
+    ImGui::BeginChild("##PulseRateCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY,
+                      ImGuiWindowFlags_NoScrollbar);
+    ImGui::TextColored(theme::pal().heading, "STEP PULSE RATE");
+    ImGui::Spacing();
+
+    // Changing it reconfigures the board, so only while nothing moves
+    const bool can_change = telemetry.state == core::ControllerState::Idle ||
+                            telemetry.state == core::ControllerState::EStop;
+    ImGui::BeginDisabled(!can_change);
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float n       = static_cast<float>(rates.size());
+    const float btn_w   = std::max(ImGui::CalcTextSize("100 kHz").x + 32.0f,
+                                   std::floor((ImGui::GetContentRegionAvail().x - spacing * (n - 1.0f)) / n));
+    for (size_t i = 0; i < rates.size(); ++i) {
+        if (i > 0) ImGui::SameLine(0.0f, spacing);
+        char label[32];
+        std::snprintf(label, sizeof(label), "%u kHz##PulseRate%u", rates[i], rates[i]);
+        const bool selected = cfg.pulse_rate_khz == rates[i];
+        if (selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        theme::pal().btn_primary);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pal().btn_primary_hov);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  theme::pal().btn_primary_act);
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_primary));
+        }
+        if (ImGui::Button(label, ImVec2(btn_w, 28.0f)) && !selected) {
+            cfg.pulse_rate_khz = rates[i];
+            controller.applyConfig(cfg);
+            if (on_settings_changed) on_settings_changed();
+        }
+        if (selected) ImGui::PopStyleColor(4);
+    }
+    ImGui::EndDisabled();
+    if (!can_change && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Stop the machine to change the step pulse rate.");
+    }
+    ImGui::EndChild();
 }
 
 void IoStatusBar::renderGlobalAlarmBanner(

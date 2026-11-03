@@ -6,10 +6,12 @@ namespace rnr::planner {
 
 namespace {
 
-// Corner tolerance used by the junction-deviation cornering model (mm). Larger = faster corners.
-constexpr double kJunctionDeviationMm = 0.02;
 // Upper bound on segments examined per planning window
 constexpr size_t kMaxWindowSegments = 4000;
+// Curve radius estimate: points this far along the path on each side of a junction, so that rounding in the
+// coordinates of very short moves does not read as a tight curve
+constexpr double kCurveSpanMm = 0.5;
+constexpr int    kCurveSpanMaxSegments = 32;
 
 bool isCutType(core::SegmentType t) noexcept {
     return t == core::SegmentType::CutLinear || t == core::SegmentType::CutArcCW || t == core::SegmentType::CutArcCCW;
@@ -130,6 +132,7 @@ void StreamingPlanner::setInitialMotion(double v_mm_s, const std::array<double, 
     v_entry_       = std::max(0.0, v_mm_s);
     prev_unit_     = unit_dir;
     have_prev_dir_ = v_entry_ > 1e-9;
+    recent_moves_partial_ = have_prev_dir_;
 }
 
 bool StreamingPlanner::isProgramSegment(const core::ToolpathSegment* s) const noexcept {
@@ -381,6 +384,88 @@ void StreamingPlanner::emitNonMotion(const core::ToolpathSegment& seg, std::dequ
     }
 }
 
+double StreamingPlanner::cornerToleranceFor(const core::ToolpathSegment& s) const noexcept {
+    return s.corner_tolerance_mm > 0.0 ? s.corner_tolerance_mm : cfg_.corner_tolerance_mm;
+}
+
+// Highest speed through the junction between win[i - 1] and win[i] that keeps the sideways acceleration within the
+// axis limits and the straight line between two motion slices within the tolerance of the path.
+double StreamingPlanner::curveSpeedLimit(const std::vector<MotionItem>& win, size_t i, double tolerance_mm) const {
+    size_t back = i - 1;
+    double back_len = win[back].length;
+    std::array<double, 4> p0 = win[back].start;
+    size_t recent_used = 0;
+    for (int s = 0; s < kCurveSpanMaxSegments && back_len < kCurveSpanMm; ++s) {
+        if (back > 0) {
+            back_len += win[--back].length;
+            p0 = win[back].start;
+        } else if (recent_used < recent_moves_.size()) {
+            ++recent_used;
+            const auto& r = recent_moves_[recent_moves_.size() - recent_used];
+            back_len += r.length;
+            p0 = r.start;
+        } else {
+            // Entered at speed with the path behind unknown: this estimate could be lower than the one the speed
+            // was planned with, so the corner speed alone applies for the first moves
+            if (recent_moves_partial_) return 1e9;
+            break;
+        }
+    }
+    size_t fwd = i;
+    double fwd_len = win[fwd].length;
+    for (int s = 0; s < kCurveSpanMaxSegments && fwd_len < kCurveSpanMm && fwd + 1 < win.size(); ++s) {
+        fwd_len += win[++fwd].length;
+    }
+
+    const auto& p1 = win[i].start;
+    const auto& p2 = win[fwd].end;
+    double aa = 0.0, bb = 0.0, ab = 0.0, cc = 0.0;
+    for (size_t a = 0; a < 4; ++a) {
+        const double u = p1[a] - p0[a], v = p2[a] - p1[a], w = p2[a] - p0[a];
+        aa += u * u;
+        bb += v * v;
+        ab += u * v;
+        cc += w * w;
+    }
+    double limit = 1e9;
+    const double dt = opts_.slice_dt_sec;
+
+    // A single corner: a slice that spans it cuts the corner by (slice length / 2) * sin(turn / 2)
+    double c = 0.0;
+    for (size_t a = 0; a < 4; ++a) c += win[i - 1].unit[a] * win[i].unit[a];
+    const double sin_half_turn = std::sqrt(std::max(0.0, 0.5 * (1.0 - c)));
+    if (sin_half_turn > 1e-9) limit = std::min(limit, 2.0 * tolerance_mm / (dt * sin_half_turn));
+
+    // Radius of the circle through the three points: R = |a| |b| |c| / (2 |a x b|)
+    const double cross2 = aa * bb - ab * ab;
+    if (aa <= 1e-12 || bb <= 1e-12 || cross2 <= 1e-18) return limit;
+    const double radius = std::sqrt(aa * bb * cc) / (2.0 * std::sqrt(cross2));
+
+    // A slice is a chord of the curve: it stays inside by (slice length)^2 / (8 R)
+    limit = std::min(limit, std::sqrt(8.0 * radius * tolerance_mm) / dt);
+
+    // Sideways acceleration v^2 / R, split over the axes along the direction of the turn
+    std::array<double, 4> turn{};
+    double turn_len2 = 0.0;
+    for (size_t a = 0; a < 4; ++a) {
+        turn[a] = (p2[a] - p1[a]) / std::sqrt(bb) - (p1[a] - p0[a]) / std::sqrt(aa);
+        turn_len2 += turn[a] * turn[a];
+    }
+    if (turn_len2 > 1e-18) {
+        const double turn_len = std::sqrt(turn_len2);
+        const double accel_scale = std::clamp(cfg_.curve_accel_pct, core::MachineConfig::kMinCurveAccelPct,
+                                              core::MachineConfig::kMaxCurveAccelPct) / 100.0;
+        for (size_t a = 0; a < 4; ++a) {
+            const double share = std::abs(turn[a]) / turn_len;
+            if (share > 1e-6) {
+                const double axis_accel = std::max(1.0, std::min(cfg_.axes[a].acceleration_mm_s2, cfg_.axes[a].deceleration_mm_s2));
+                limit = std::min(limit, std::sqrt(axis_accel * accel_scale * radius / share));
+            }
+        }
+    }
+    return limit;
+}
+
 size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) {
     size_t count = 0;
     const size_t total = sourceSize();
@@ -401,7 +486,7 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
         junction.clear();
         bool hard_end = false;
         double window_len = 0.0;
-        double v_peak = 0.0;
+        double v_peak = cfg_.limit_curve_speed ? v_entry_ : 0.0;
         double min_decel = 1e9;
         std::array<double, 4> from = pos_;
         size_t idx = next_;
@@ -433,8 +518,13 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
             v_peak    = std::max(v_peak, m.v_max);
             min_decel = std::min(min_decel, m.decel);
             ++idx;
+            if (s.exact_stop) {
+                hard_end = true; // G61: land on the end of this move and stop
+                break;
+            }
             const double brake = (v_peak * v_peak) / (2.0 * min_decel);
-            if (window_len >= 2.0 * brake + 1.0 && win.size() >= 2) {
+            if (window_len >= 2.0 * brake + 1.0 && win.size() >= 2 &&
+                (!cfg_.limit_curve_speed || window_len - win.front().length >= brake + kCurveSpanMm)) {
                 break;
             }
         }
@@ -446,6 +536,8 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
         // If the previous committed run ended at a boundary that requires a stop, the new run starts from rest
         if (!have_prev_dir_) {
             v_entry_ = 0.0;
+            recent_moves_.clear();
+            recent_moves_partial_ = false;
         } else {
             // Junction between the last committed segment and the first window segment
             double c = 0.0;
@@ -467,10 +559,28 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
             } else if (c > -0.999999) {
                 const double sin_half = std::sqrt(std::max(0.0, 0.5 * (1.0 + c)));
                 const double a_j = std::min(win[i - 1].accel, win[i].accel);
-                vj = std::sqrt(std::max(0.0, a_j * kJunctionDeviationMm * sin_half / std::max(1e-9, 1.0 - sin_half)));
+                vj = std::sqrt(std::max(0.0, a_j * cornerToleranceFor(*win[i].seg) * sin_half / std::max(1e-9, 1.0 - sin_half)));
                 vj = std::min(vj, vcap);
             }
+            if (cfg_.limit_curve_speed && vj > 0.0) {
+                vj = std::min(vj, curveSpeedLimit(win, i, cornerToleranceFor(*win[i].seg)));
+            }
             junction[i] = vj;
+        }
+
+        // The next window can still see more path after these junctions and may lower their curve limit: plan to stand
+        // still before them, so the speed committed now can always meet that limit. Never reached, see the commit below.
+        double unsettled_len = 0.0;
+        if (cfg_.limit_curve_speed && !hard_end) {
+            size_t first_unsettled = n;
+            double tail = 0.0;
+            for (size_t k = n; k-- > 1;) {
+                tail += win[k].length;
+                if (tail >= kCurveSpanMm || n - 1 - k >= static_cast<size_t>(kCurveSpanMaxSegments)) break;
+                first_unsettled = k;
+                unsettled_len = tail;
+            }
+            for (size_t k = first_unsettled; k < n; ++k) junction[k] = 0.0;
         }
 
         // Backward pass: from standstill at the end of the window
@@ -491,7 +601,7 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
             const double brake = (v_peak * v_peak) / (2.0 * min_decel);
             double remaining = window_len;
             commit = 0;
-            while (commit < n && (remaining - win[commit].length) >= brake) {
+            while (commit < n && (remaining - win[commit].length) >= brake + unsettled_len) {
                 remaining -= win[commit].length;
                 ++commit;
             }
@@ -507,6 +617,8 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
             v_in = v_out;
             prev_unit_ = win[k].unit;
             have_prev_dir_ = true;
+            recent_moves_.push_back({win[k].start, win[k].length});
+            if (recent_moves_.size() > static_cast<size_t>(kCurveSpanMaxSegments)) recent_moves_.pop_front();
         }
         v_entry_ = v_in;
 
@@ -774,6 +886,7 @@ std::vector<core::ToolpathSegment> TrajectoryPlanner::warpToolpathWithHeightMap(
 
                 core::ToolpathSegment sub = seg;
                 sub.segment_index = out.size();
+                sub.exact_stop = seg.exact_stop && (k == num_sub - 1); // G61: stop at the end of the programmed move
                 sub.start_xyza_mm = {
                     seg.start_xyza_mm[0] + dx * u0,
                     seg.start_xyza_mm[1] + dy * u0,

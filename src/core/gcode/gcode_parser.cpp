@@ -178,6 +178,9 @@ ParseResult GCodeParser::parse(
     bool   canned_return_r = false; // false=G98 (return to initial Z), true=G99 (return to R plane)
     double canned_r_mm     = 5.0;
     double canned_q_mm     = 2.0;
+    double canned_dwell_p  = -1.0;  // G82 P, kept for the following holes of the cycle
+    bool   canned_q_given  = false; // A Q word was given for the current G73 / G83 cycle
+    bool   warned_no_q     = false; // Warned once per cycle
     double canned_z_mm     = 0.0;
     double canned_init_z   = cur_pos[2];
     bool   program_ended   = false;
@@ -192,6 +195,8 @@ ParseResult GCodeParser::parse(
     uint16_t spindle_rpm       = 0; // 0 = not programmed (controller keeps the operator's speed)
     uint8_t  current_wcs       = 0; // 0=G54 .. 5=G59
     uint16_t tlo_tool          = core::kTloInherit; // G43 H<n> in effect (0 = G49)
+    bool     exact_stop        = false; // G61 / G61.1 in effect (G64 = constant velocity)
+    double   corner_tolerance_mm = 0.0; // G64 P in effect, 0 = the machine setting
 
     // Separate bounding boxes for cutting moves vs. rapid moves so G28/G53/origin rapids don't distort Fit View
     std::array<double, 3> cut_bmin = {0.0, 0.0, 0.0}, cut_bmax = {0.0, 0.0, 0.0};
@@ -220,6 +225,8 @@ ParseResult GCodeParser::parse(
         seg.spindle_rpm     = spindle_rpm;
         seg.workspace_index = current_wcs;
         seg.tlo_tool        = tlo_tool;
+        seg.exact_stop      = exact_stop;
+        seg.corner_tolerance_mm = corner_tolerance_mm;
         return seg;
     };
 
@@ -314,8 +321,11 @@ ParseResult GCodeParser::parse(
 
         // H word (tool length offset register) used by G43 on the same block
         int h_word = -1;
+        // G64 P<tolerance> Q<...> on this block: these words are not a dwell or a peck depth
+        bool is_g64 = false;
         for (const auto& w : words) {
             if (w.letter == 'H') h_word = static_cast<int>(std::lround(w.value));
+            if (w.letter == 'G' && static_cast<int>(std::round(w.value * 10.0)) == 640) is_g64 = true;
         }
 
         // Pass 1: modal setup G-codes, M-codes, Feed (F), Spindle (S), Tool (T), Dwell (P)
@@ -419,7 +429,12 @@ ParseResult GCodeParser::parse(
                     case 500: // G50 Scaling off
                     case 610: // G61 Exact stop
                     case 611: // G61.1
-                    case 640: // G64 Constant velocity
+                        exact_stop = true;
+                        break;
+                    case 640: // G64 Constant velocity (P word handled below)
+                        exact_stop = false;
+                        corner_tolerance_mm = 0.0;
+                        break;
                     case 690: // G69 Rotation off
                     case 940: // G94 Feed per minute
                         break;
@@ -513,7 +528,8 @@ ParseResult GCodeParser::parse(
             } else if (w.letter == 'P') {
                 dwell_p = w.value;
             } else if (w.letter == 'Q') {
-                if (w.value > 0.0) {
+                if (w.value > 0.0 && !is_g64) {
+                    canned_q_given = true;
                     canned_q_mm = w.value * unit_scale;
                 }
             } else if (w.letter == 'O' || w.letter == 'N' || w.letter == 'H' || w.letter == 'D' || w.letter == 'L') {
@@ -521,6 +537,29 @@ ParseResult GCodeParser::parse(
             } else if (std::string("XYZAIJKR").find(w.letter) == std::string::npos) {
                 addError(line_idx, std::string("Unsupported word '") + w.letter + "'");
             }
+        }
+
+        if (is_g64 && dwell_p >= 0.0) {
+            // P0 is the same as a plain G64: back to the machine setting
+            const double tol_mm = dwell_p * unit_scale;
+            corner_tolerance_mm = (tol_mm > 0.0) ? std::clamp(tol_mm, core::MachineConfig::kMinCornerToleranceMm,
+                                                              core::MachineConfig::kMaxCornerToleranceMm)
+                                                 : 0.0;
+            if (tol_mm > 0.0 && corner_tolerance_mm != tol_mm) {
+                addWarning(line_idx, "G64 P is limited to 0.001 .. 5 mm");
+            }
+        }
+        if (is_g64) dwell_p = -1.0;
+
+        // Canned cycle words last until the cycle ends
+        if (active_g_motion != 82) {
+            canned_dwell_p = -1.0;
+        } else if (!is_dwell && !is_g64 && dwell_p >= 0.0) {
+            canned_dwell_p = dwell_p;
+        }
+        if (active_g_motion != 73 && active_g_motion != 83) {
+            canned_q_given = false;
+            warned_no_q    = false;
         }
 
         // Emit M6 ToolChange segment if M6/M06 was present on this line
@@ -649,6 +688,11 @@ ParseResult GCodeParser::parse(
             if (feed_mm_min <= 0.0) {
                 addError(line_idx, "Drilling cycle without a feed rate (F)");
             }
+            if ((active_g_motion == 73 || active_g_motion == 83) && !canned_q_given && !warned_no_q) {
+                addWarning(line_idx, formatGCode('G', active_g_motion) + " without a Q word: pecking every " +
+                                         std::to_string(canned_q_mm) + " mm");
+                warned_no_q = true;
+            }
             const double drill_z   = canned_z_mm;
             const double retract_z = canned_return_r ? canned_r_mm : std::max(canned_init_z, canned_r_mm);
 
@@ -703,9 +747,9 @@ ParseResult GCodeParser::parse(
             }
 
             // Optional G82 dwell at bottom
-            if (active_g_motion == 82 && dwell_p > 0.0) {
+            if (active_g_motion == 82 && canned_dwell_p > 0.0) {
                 core::ToolpathSegment dseg = baseSegment(core::SegmentType::Dwell, line_idx);
-                dseg.dwell_seconds = options.dwell_p_milliseconds ? (dwell_p / 1000.0) : dwell_p;
+                dseg.dwell_seconds = options.dwell_p_milliseconds ? (canned_dwell_p / 1000.0) : canned_dwell_p;
                 result.segments.push_back(dseg);
             }
 
@@ -834,6 +878,7 @@ ParseResult GCodeParser::parse(
                         seg.start_xyza_mm = prev_pt;
                         seg.end_xyza_mm   = next_pt;
                         seg.length_mm     = calcDist4D(prev_pt, next_pt);
+                        seg.exact_stop    = exact_stop && (s == steps); // G61: stop at the end of the arc, not at its chords
 
                         result.total_cut_length_mm += seg.length_mm;
                         expandBBox(cut_bmin, cut_bmax, prev_pt, first_cut_pt);

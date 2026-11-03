@@ -3,6 +3,34 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## 0.3
+
+### Added
+- More color themes, inspired by editor color schemes: Monokai, Mariana and Solarized Dark next to Dark, and Ayu Light
+  and Solarized Light next to Light. The title bar has a sun button (light themes) and a moon button (dark themes);
+  clicking the active one goes to the next theme of that group. Both choices are saved.
+- G-code **G61** (full stop at the end of every move) and **G64** / **G64 P<tolerance>** (constant velocity, with its
+  own corner tolerance for the moves that follow) now take effect. Before, they were accepted and ignored.
+- *Limits & Homing* > **Corners & curves**: **Corner tolerance** (was fixed at 0.02 mm), **Limit speed on curves**
+  and **Curve acceleration** (25-200% of the axis acceleration).
+- *Connection* > **Step pulse rate** (25 / 50 / 100 kHz, like the RNR Mach3 plugin), shown while the board is
+  connected. Before, the rate could only be changed in the settings file and
+  was always 100 kHz unless a Mach3 profile set it.
+
+### Changed
+- BreakoutMill: curves made of many short moves are no longer run at full feed: the speed is limited to keep the
+  sideways acceleration near the axis limits and the tool close to the path. Curvy programs take longer and are more
+  accurate; untick **Limit speed on curves** for the previous behaviour. In BreakoutCut this setting is off by default.
+- The A jog pad sits to the left of the X/Y pad (Z stays on the right), so the jog pad is symmetrical.
+- Pulse rates are limited to 25, 50 and 100 kHz: other values in old settings or Mach3 profiles (such as 35 or 75 kHz)
+  are rounded up to the next of these.
+
+### Fixed
+- G82: a P word now applies to all following holes of the cycle. Before, only holes with their own P dwelled.
+- G73 and G83 without a Q word now give a warning. They still peck with the last Q (2 mm if there was none).
+- The *Dual-Motor Gantry* setting left the text wrap width pushed when A followed another axis, which could make
+  ImGui assert or wrap later text wrongly.
+
 ## 0.2
 
 ### Added

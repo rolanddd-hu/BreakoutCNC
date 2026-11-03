@@ -550,11 +550,12 @@ void DroAndJogPanel::render(
     const ImVec2 screen_pos = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    const ImVec2 P_xy = screen_pos;
+    // Layout: [A]  [XY cross]  [Z], with the A pill only when A is an independent axis
+    const ImVec2 P_a  = screen_pos;
+    const ImVec2 P_xy = ImVec2(screen_pos.x + (a_jog_enabled_ ? z_w + gap : 0.0f), screen_pos.y);
     const ImVec2 P_z  = ImVec2(P_xy.x + cross_sz + gap, P_xy.y);
     const ImVec2 C_xy = ImVec2(P_xy.x + cross_sz * 0.5f, P_xy.y + cross_sz * 0.5f);
     const ImVec2 C_z  = ImVec2(P_z.x + z_w * 0.5f, P_z.y + z_h * 0.5f);
-    const ImVec2 P_a  = ImVec2(P_z.x + z_w + gap, P_xy.y);
     const ImVec2 C_a  = ImVec2(P_a.x + z_w * 0.5f, P_a.y + z_h * 0.5f);
 
     const float bevel_w = std::max(3.0f, std::round(4.5f * scale));

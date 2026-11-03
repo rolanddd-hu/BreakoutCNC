@@ -416,7 +416,7 @@ enum class GantrySlave : uint8_t {
 struct MachineConfig {
     LinearUnits     linear_units      = LinearUnits::Metric;
     std::array<AxisConfig, 4> axes{};
-    uint8_t          pulse_rate_khz    = 100;   // 10, 25, 50, or 100 kHz
+    uint8_t          pulse_rate_khz    = 100;   // 25, 50 or 100 kHz, the choices of the RNR Mach3 plugin
     uint8_t          slice_interval_ms = 4;     // Default 4ms per motion slice
     GantrySlave      gantry_slave      = GantrySlave::None; // Dual-motor axis: A motor follows X, Y or Z
     bool             limit_override    = false; // Allow jogging off an active end-stop switch (buf[2]=0x40)
@@ -430,6 +430,17 @@ struct MachineConfig {
     // start_safe_z_mm (work Z of the tool tip) is also the lift height of Run From Line.
     bool             start_lift_to_safe_z = true;
     double           start_safe_z_mm      = 25.0;
+    // Constant velocity motion. The tolerance sets the speed through corners; a larger value is faster and less
+    // precise. G64 P overrides it inside a program. limit_curve_speed also slows down on curves made of many short
+    // moves, to keep the sideways acceleration near the axis limits and the 25 ms slices close to the path.
+    static constexpr double kMinCornerToleranceMm = 0.001;
+    static constexpr double kMaxCornerToleranceMm = 5.0;
+    double           corner_tolerance_mm  = 0.02;
+    bool             limit_curve_speed    = true;
+    // Sideways acceleration allowed on curves, in percent of the axis acceleration
+    static constexpr int kMinCurveAccelPct = 25;
+    static constexpr int kMaxCurveAccelPct = 200;
+    int              curve_accel_pct      = 100;
     float            spindle_pwm_ratio  = 1.0f;  // Mill 0-10V AVI scaling
     double           spindle_ramp_up_s   = 0.0;   // Mill spindle spin-up ramp time (0..30s) before cutting starts
     double           spindle_ramp_down_s = 0.0;   // Mill spindle spin-down ramp time (0..30s)
@@ -461,6 +472,17 @@ struct MachineConfig {
     uint64_t                             workspace_revision = 0;
     // Runtime-only: same protection for the tool table (tool lengths measured by the controller)
     uint64_t                             tool_table_revision = 0;
+
+    // Step pulse rates the RNR board offers (its Mach3 plugin has the same three)
+    static constexpr std::array<uint8_t, 3> kPulseRatesKhz = {25, 50, 100};
+
+    // Rounds a pulse rate up to the next rate the board offers (anything above 50 or invalid gives 100)
+    static constexpr uint8_t snapPulseRateKhz(int khz) noexcept {
+        for (uint8_t r : kPulseRatesKhz) {
+            if (khz > 0 && khz <= r) return r;
+        }
+        return 100;
+    }
 
     // Axis index (0 = X, 1 = Y, 2 = Z) the A motor copies step-for-step, or -1 when A is an independent axis
     int gantryMasterAxis() const noexcept {
@@ -632,6 +654,8 @@ struct ToolpathSegment {
     std::array<double, 4> machine_target_mm = {0.0, 0.0, 0.0, 0.0};
     // Tool length offset in effect (G43 H<n>): 0 = none (G49), kTloInherit = not set by the program yet
     uint16_t              tlo_tool = kTloInherit;
+    bool                  exact_stop = false;           // G61: full stop at the end of this move
+    double                corner_tolerance_mm = 0.0;    // G64 P: 0 = use MachineConfig::corner_tolerance_mm
 };
 
 // ============================================================================

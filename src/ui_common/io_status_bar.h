@@ -24,6 +24,12 @@ public:
         GCodeProgramPanel* gcode_panel = nullptr);
 
     // Dedicated USB controller connection & hardware diagnostics section
+    // Step pulse rate choice of the RNR board, shown under the connect buttons while the board is connected
+    static void renderPulseRateSetting(
+        core::IMotionController& controller,
+        const core::TelemetrySnapshot& telemetry,
+        const std::function<void()>& on_settings_changed);
+
     static void renderUsbConnectionSection(
         core::IMotionController& controller,
         const core::TelemetrySnapshot& telemetry,

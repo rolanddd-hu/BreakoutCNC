@@ -169,8 +169,8 @@ static LRESULT CALLBACK CustomWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
             if (right)           return HTRIGHT;
             if (bottom)          return HTBOTTOM;
             if (top) {
-                // Keep caption buttons (theme/fullscreen/min/max/close in right 232px) clickable without top resize hijacking
-                if (pt.x < rc.right - 236) {
+                // Keep caption buttons (2 themes/fullscreen/min/max/close in right 278px) clickable without top resize hijacking
+                if (pt.x < rc.right - 282) {
                     return HTTOP;
                 }
             }
@@ -702,10 +702,10 @@ void AppWindow::renderCustomTitleBar() {
             pal.title_separator,
             1.0f);
 
-        // Control buttons geometry (theme, fullscreen, minimize, maximize: 46px each, close: 48px)
+        // Control buttons geometry (light themes, dark themes, fullscreen, minimize, maximize: 46px each, close: 48px)
         const float btn_w = 46.0f;
         const float close_w = 48.0f;
-        const float buttons_total_w = btn_w * 4.0f + close_w;
+        const float buttons_total_w = btn_w * 5.0f + close_w;
 
         // Left side: the window title
         const float title_x = pos.x + 12.0f;
@@ -945,34 +945,51 @@ void AppWindow::renderCustomTitleBar() {
             return pressed;
         };
 
-        const float thm_x = right_x - buttons_total_w;
+        const float thm_light_x = right_x - buttons_total_w;
+        const float thm_dark_x  = right_x - (btn_w * 4.0f + close_w);
         const float fs_x  = right_x - (btn_w * 3.0f + close_w);
         const float min_x = right_x - (btn_w * 2.0f + close_w);
 
-        // Dark / Light theme toggle: shows the theme a click switches to (sun = light, moon = dark)
-        const bool light = theme::isLight();
-        if (renderButton("##TitleThemeBtn", thm_x, btn_w, [light](ImDrawList* dl, float cx, float cy, ImU32 col) {
-            if (!light) {
-                dl->AddCircle(ImVec2(cx, cy), 3.4f, col, 16, 1.4f);
-                for (int r = 0; r < 8; ++r) {
-                    const float a = r * 0.7853982f; // 45 degree steps
-                    const float c = std::cos(a), s = std::sin(a);
-                    dl->AddLine(ImVec2(cx + c * 5.4f, cy + s * 5.4f), ImVec2(cx + c * 7.2f, cy + s * 7.2f), col, 1.3f);
+        // Light themes (sun) and dark themes (moon): a click switches to that family, or to its next theme when
+        // the family is already active. The active family's icon is underlined.
+        const auto draw_sun = [](ImDrawList* dl, float cx, float cy, ImU32 col) {
+            dl->AddCircle(ImVec2(cx, cy), 3.4f, col, 16, 1.4f);
+            for (int r = 0; r < 8; ++r) {
+                const float a = r * 0.7853982f; // 45 degree steps
+                const float c = std::cos(a), s = std::sin(a);
+                dl->AddLine(ImVec2(cx + c * 5.4f, cy + s * 5.4f), ImVec2(cx + c * 7.2f, cy + s * 7.2f), col, 1.3f);
+            }
+        };
+        const auto draw_moon = [](ImDrawList* dl, float cx, float cy, ImU32 col) {
+            // Crescent outline: circle (r 6) minus a circle (r 5) offset by (+3, -3); the two arcs meet at
+            // the circles' intersections (10.3 / 259.7 deg on the outer, 54.5 / 215.5 deg on the inner)
+            constexpr float kDeg = 0.01745329f;
+            dl->PathArcTo(ImVec2(cx, cy), 6.0f, 10.3f * kDeg, 259.7f * kDeg, 18);
+            dl->PathArcTo(ImVec2(cx + 3.0f, cy - 3.0f), 5.0f, 215.5f * kDeg, 54.5f * kDeg, 12);
+            dl->PathStroke(col, ImDrawFlags_Closed, 1.4f);
+        };
+        const auto theme_button = [&](const char* id, float x, theme::Mode family, auto draw_icon) {
+            const bool active = theme::mode() == family;
+            const int  target = active ? theme::nextTheme(theme::activeTheme()) : theme::familyTheme(family);
+            char tip[96];
+            std::snprintf(tip, sizeof(tip), "%s theme",
+                          theme::themeInfo(active ? theme::activeTheme() : target).name);
+            const bool pressed = renderButton(id, x, btn_w, draw_icon, false, tip);
+            if (active) {
+                const float cx = x + btn_w * 0.5f;
+                draw_list->AddLine(ImVec2(cx - 8.0f, pos.y + title_bar_h - 4.0f),
+                                   ImVec2(cx + 8.0f, pos.y + title_bar_h - 4.0f),
+                                   ImGui::ColorConvertFloat4ToU32(pal.border_accent), 2.0f);
+            }
+            if (pressed) {
+                theme::setTheme(target);
+                if (on_theme_changed_) {
+                    on_theme_changed_(theme::isLight());
                 }
-            } else {
-                // Crescent outline: circle (r 6) minus a circle (r 5) offset by (+3, -3); the two arcs meet at
-                // the circles' intersections (10.3 / 259.7 deg on the outer, 54.5 / 215.5 deg on the inner)
-                constexpr float kDeg = 0.01745329f;
-                dl->PathArcTo(ImVec2(cx, cy), 6.0f, 10.3f * kDeg, 259.7f * kDeg, 18);
-                dl->PathArcTo(ImVec2(cx + 3.0f, cy - 3.0f), 5.0f, 215.5f * kDeg, 54.5f * kDeg, 12);
-                dl->PathStroke(col, ImDrawFlags_Closed, 1.4f);
             }
-        }, false, light ? "Dark theme" : "Light theme")) {
-            theme::setMode(light ? theme::Mode::Dark : theme::Mode::Light);
-            if (on_theme_changed_) {
-                on_theme_changed_(theme::isLight());
-            }
-        }
+        };
+        theme_button("##TitleLightThemeBtn", thm_light_x, theme::Mode::Light, draw_sun);
+        theme_button("##TitleDarkThemeBtn", thm_dark_x, theme::Mode::Dark, draw_moon);
         const float max_x = right_x - (btn_w + close_w);
         const float cls_x = right_x - close_w;
 

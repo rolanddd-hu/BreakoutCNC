@@ -26,6 +26,7 @@ inline bool renderGantrySlaveCombo(core::MachineConfig& cfg) {
         ImGui::TextDisabled("The A motor copies every step of its master axis, so give it the same Steps/mm and "
                             "use its Invert Dir setting to match the motor's mounting. Homing does not square the "
                             "gantry: both motors move together. A cannot be jogged or programmed on its own.");
+        ImGui::PopTextWrapPos();
     } else {
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("A is an independent (rotary) axis: it has its own jog pad and the Home / End keys.");

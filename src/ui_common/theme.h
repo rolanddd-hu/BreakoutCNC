@@ -2,7 +2,7 @@
 #include <imgui.h>
 #include <cstdint>
 
-// Dark / light color theme. Colors are looked up by role from the active Palette: both palettes are built once at
+// Dark / light color themes. Colors are looked up by role from the active Palette: all palettes are built once at
 // startup and pal() is a single pointer read, so a lookup per widget costs the same as the literal it replaces.
 // Switching the theme swaps the pointer and re-applies the ImGui style colors; nothing is recomputed per frame.
 namespace rnr::ui::theme {
@@ -135,7 +135,26 @@ inline const Palette& pal() noexcept { return *detail::g_active; }
 Mode mode() noexcept;
 inline bool isLight() noexcept { return mode() == Mode::Light; }
 
+// Color themes: the default dark and light themes plus variants inspired by editor color schemes. Each belongs to
+// the dark or the light family; the title bar has one button per family that cycles through its themes.
+struct ThemeInfo {
+    const char* id;   // Stored in the settings
+    const char* name; // Shown in the title bar tooltip
+    Mode        mode;
+};
+int              themeCount() noexcept;
+const ThemeInfo& themeInfo(int index) noexcept;
+int              activeTheme() noexcept;
+// Theme of a family used when switching to it (the last one chosen there)
+int              familyTheme(Mode m) noexcept;
+// Next theme of the family after `index`, wrapping around
+int              nextTheme(int index) noexcept;
+// Index of the theme with this id in the family, or the family's default theme
+int              findTheme(Mode m, const char* id) noexcept;
+
 // Switches the palette and applies the matching ImGui style (needs a current ImGui context)
+void setTheme(int index);
+// Switches to the family's remembered theme
 void setMode(Mode m);
 
 // Readable text color (near-white or near-black) for a filled background
