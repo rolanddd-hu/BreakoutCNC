@@ -104,7 +104,8 @@ private:
     WriteResult writePacket(const protocol::OutputReportBuffer& packet);
 
     static constexpr size_t   kMaxQueuedWrites = 64;
-    static constexpr uint32_t kWriteTimeoutMs  = 50;
+    static constexpr uint32_t kWriteTimeoutMs  = 250;
+    static constexpr uint32_t kUrgentWriteTimeoutMs = 50; // Limit for a write that an urgent packet is waiting behind
 
     mutable std::mutex io_mutex_;               // Guards handle_, info_ and read state; held by open/close/read
     std::mutex write_mutex_;                    // Guards tx_buf_ / write_event_; handle_ changes hold both mutexes
@@ -114,6 +115,8 @@ private:
     bool writer_busy_ = false;
     bool writer_stop_ = false;
     std::atomic<bool> write_failed_{false};     // A queued write failed; reported by the next sendPacket()
+    std::atomic<bool> urgent_waiting_{false};   // An urgent packet (E-stop) is queued and not yet being written
+    uint16_t urgent_seq_ = 0;                   // Its sequence number; guarded by queue_mutex_
     std::thread writer_thread_;                 // Started by the first successful open()
     void* handle_ = nullptr;                    // Windows HANDLE / hid_device*
     std::atomic<bool> open_{false};             // Lock-free mirror of "handle_ is valid" for isOpen()

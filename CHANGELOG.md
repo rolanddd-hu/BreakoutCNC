@@ -9,6 +9,9 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
 - G15, G40 and G50 no longer switch on exact stop. In 0.3, a program with one of these codes (G40 is common in CAM
   program headers) stopped at the end of every move until the next G64, which made 3D programs jerky and much slower,
   and the *Corners & curves* settings had no effect on it.
+- A USB write to the board may now take up to 250 ms instead of 50 ms before it counts as failed, so a short pause on
+  the PC is less likely to stop a job with *USB WRITE FAILED WHILE STREAMING MOTION*. A software E-stop still only waits
+  up to 50 ms behind a stalled write.
 
 ## 0.3
 

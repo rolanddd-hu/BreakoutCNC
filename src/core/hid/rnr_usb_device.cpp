@@ -264,6 +264,7 @@ void RnrUsbDevice::closeLocked() {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         tx_queue_.clear();
+        urgent_waiting_.store(false);
     }
     queue_cv_.notify_all();
 #ifdef _WIN32
@@ -414,6 +415,8 @@ bool RnrUsbDevice::sendPacketUrgent(protocol::OutputReportBuffer& packet, uint16
             *out_assigned_seq = seq;
         }
         tx_queue_.push_back(packet);
+        urgent_seq_ = seq;
+        urgent_waiting_.store(true);
     }
     queue_cv_.notify_all();
     return true;
@@ -426,6 +429,7 @@ void RnrUsbDevice::writerLoop() {
         if (writer_stop_) return;
         const protocol::OutputReportBuffer packet = tx_queue_.front();
         tx_queue_.pop_front();
+        if (static_cast<uint16_t>(packet[3] | (packet[4] << 8)) == urgent_seq_) urgent_waiting_.store(false);
         writer_busy_ = true;
         lock.unlock();
 
@@ -472,7 +476,13 @@ RnrUsbDevice::WriteResult RnrUsbDevice::writePacket(const protocol::OutputReport
         if (err != ERROR_IO_PENDING) {
             return isDisconnectError(err) ? WriteResult::Disconnected : WriteResult::Failed;
         }
-        DWORD wait_res = WaitForSingleObject(ol.hEvent, kWriteTimeoutMs);
+        // A short USB pause must not stop a job, but an E-stop must not wait behind a stalled write
+        DWORD wait_res = WaitForSingleObject(ol.hEvent, kUrgentWriteTimeoutMs);
+        constexpr uint32_t kPollMs = 10;
+        for (uint32_t waited = kUrgentWriteTimeoutMs;
+             wait_res == WAIT_TIMEOUT && waited < kWriteTimeoutMs && !urgent_waiting_.load(); waited += kPollMs) {
+            wait_res = WaitForSingleObject(ol.hEvent, kPollMs);
+        }
         if (wait_res != WAIT_OBJECT_0) {
             // Cancel the write and WAIT for the cancellation to complete: the OVERLAPPED lives on this
             // stack frame, so the kernel must be finished with it before we return.
