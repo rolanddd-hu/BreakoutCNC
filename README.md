@@ -246,6 +246,7 @@ CNC machines, plasma torches and lasers can injure or kill. This software is pro
 
 - [docs/USER_GUIDE.md](docs/USER_GUIDE.md): user guide with screenshots: install, simulator, machine setup, Mach3
   migration, running jobs, probing, plasma / laser, troubleshooting.
+- [docs/GCODE_REFERENCE.md](docs/GCODE_REFERENCE.md): supported G codes and M codes, in programs and in MDI.
 - [docs/architecture/BOARD_DRIVERS.md](docs/architecture/BOARD_DRIVERS.md): machine core vs. board drivers, how to add
   a board.
 - [docs/architecture/SCRIPTING_ENGINE_SPEC.md](docs/architecture/SCRIPTING_ENGINE_SPEC.md): Lua scripting API.
