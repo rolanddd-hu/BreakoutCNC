@@ -142,6 +142,9 @@ Keyboard:
 - **Edit File** opens it in your text editor. When the file changes on disk, it is reloaded automatically (not while
   cutting).
 - **Set Next Line**: select a line (double-click) to start or resume from there.
+- **Go to line**: type a line number or N number and press Enter to select that line and show it. `N64000` looks for
+  that N number; a plain `64000` looks for it as an N number first, then as a line number in the file. It does not
+  change the next line: press **Set Next Line** for that. Not available while a job is running.
 - **MDI G-Code**: type a command (for example `G0 X0 Y0` or `G91 G1 Z-1 F100`) and press **Send MDI**.
 - **STOP / REWIND** stops the job and goes back to line 1, **FEED HOLD** pauses with a controlled stop.
 

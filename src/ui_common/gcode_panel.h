@@ -91,6 +91,10 @@ private:
     int    scroll_to_top_frames_        = 0;
     bool   show_spindle_warning_modal_  = false;
     char   mdi_input_buf_[256]{};
+    char   go_to_buf_[32]{};
+    std::string go_to_error_;                // Shown until the go-to text is edited
+    bool   scroll_to_line_requested_    = false;
+    size_t scroll_to_line_              = 0;
 
     // Machine type compatibility check state
     gcode::MachineType machine_type_    = gcode::MachineType::Mill;

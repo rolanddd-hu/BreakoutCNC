@@ -3,7 +3,9 @@
 #include "ui_common/app_window.h"
 #include "ui_common/frame_stats.h"
 #include "ui_common/file_dialog.h"
+#include "ui_common/gcode_line_lookup.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
@@ -125,6 +127,28 @@ void GCodeProgramPanel::render(
         ImGui::SetTooltip("Set selected G-Code line as the next line to execute on Cycle Start");
     }
 
+    // Go to line: selects the line and shows it, the program position does not change
+    ImGui::SameLine();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (btn_h - ImGui::GetFrameHeight()) * 0.5f);
+    ImGui::BeginDisabled(is_running || gcode_lines.empty());
+    ImGui::SetNextItemWidth(100.0f);
+    if (ImGui::InputTextWithHint("##GoToLine", "Go to line", go_to_buf_, sizeof(go_to_buf_),
+                                 ImGuiInputTextFlags_EnterReturnsTrue) && go_to_buf_[0] != '\0') {
+        if (const auto line = findGCodeLine(gcode_lines, go_to_buf_)) {
+            selected_line_            = *line;
+            scroll_to_line_           = *line;
+            scroll_to_line_requested_ = true;
+            go_to_error_.clear();
+        } else {
+            go_to_error_ = std::string("Line ") + go_to_buf_ + " not found";
+        }
+    }
+    if (ImGui::IsItemEdited()) go_to_error_.clear();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Line number or N number, then Enter");
+    }
+
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
     std::string display_filename;
@@ -137,6 +161,8 @@ void GCodeProgramPanel::render(
         // load_job_.path is never written by the worker, so reading it here is safe
         const std::string loading_name = std::filesystem::path(load_job_.path).filename().string();
         ImGui::TextColored(theme::pal().text_warn, "Loading %s...", loading_name.c_str());
+    } else if (!go_to_error_.empty()) {
+        ImGui::TextColored(theme::pal().text_warn, "%s", go_to_error_.c_str());
     } else {
         ImGui::TextDisabled("Next:#%04zu | %s (%zu pierces, %.0fmm)",
                             telemetry.active_gcode_line_index + 1,
@@ -237,7 +263,20 @@ void GCodeProgramPanel::render(
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild("##GCodeScroll", ImVec2(0.0f, exact_scroll_h), true, ImGuiWindowFlags_NoScrollWithMouse);
+    // The scrollbar is handled inside BeginChild. On a long program its grab would be only a few pixels tall, and a
+    // press just next to it would page instead of drag: use a larger grab, and let the bar follow the mouse from any press.
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+        ImGuiIO& io = ImGui::GetIO();
+        const float grab_min_size = style.GrabMinSize;
+        const bool  scroll_by_page = io.ConfigScrollbarScrollByPage;
+        style.GrabMinSize = 32.0f;
+        io.ConfigScrollbarScrollByPage = false;
+        ImGui::BeginChild("##GCodeScroll", ImVec2(0.0f, exact_scroll_h), true, ImGuiWindowFlags_NoScrollWithMouse);
+        style.GrabMinSize = grab_min_size;
+        io.ConfigScrollbarScrollByPage = scroll_by_page;
+    }
+    const bool scrollbar_held = ImGui::GetActiveID() == ImGui::GetWindowScrollbarID(ImGui::GetCurrentWindow(), ImGuiAxis_Y);
 
     if (scroll_to_top_requested_ || scroll_to_top_frames_ > 0) {
         ImGui::SetScrollY(0.0f);
@@ -264,7 +303,7 @@ void GCodeProgramPanel::render(
         float active_y  = static_cast<float>(telemetry.active_gcode_line_index) * kRowHeight;
         float cur_scr   = ImGui::GetScrollY();
         float view_span = static_cast<float>(visible_rows) * kRowHeight;
-        if (active_y < cur_scr || active_y >= cur_scr + view_span - kRowHeight) {
+        if (!scrollbar_held && (active_y < cur_scr || active_y >= cur_scr + view_span - kRowHeight)) {
             float target_top_line = std::max(0.0f, static_cast<float>(telemetry.active_gcode_line_index) - std::floor(visible_rows * 0.35f));
             float snapped_target  = std::clamp(target_top_line * kRowHeight, 0.0f, ImGui::GetScrollMaxY());
             ImGui::SetScrollY(snapped_target);
@@ -278,6 +317,12 @@ void GCodeProgramPanel::render(
         if (std::abs(cur_scr - snapped) > 0.05f) {
             ImGui::SetScrollY(snapped);
         }
+    }
+
+    if (scroll_to_line_requested_ && scroll_to_top_frames_ == 0 && !scroll_to_top_requested_) {
+        scroll_to_line_requested_ = false;
+        const float top_line = std::max(0.0f, static_cast<float>(scroll_to_line_) - std::floor(visible_rows * 0.35f));
+        ImGui::SetScrollY(std::clamp(top_line * kRowHeight, 0.0f, ImGui::GetScrollMaxY()));
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -958,20 +1003,6 @@ float GCodeProgramPanel::calculateDesiredHeight(float max_available_h, bool is_t
 
     return non_scroll_h + exact_scroll_h;
 }
-
-namespace {
-// Position of the digits of a leading "N<digits>" word (e.g. N100), or npos
-size_t fileLineNumberDigits(const std::string& line, size_t& end_digit) {
-    const size_t idx = line.find_first_not_of(" \t");
-    if (idx == std::string::npos || (line[idx] != 'N' && line[idx] != 'n')) return std::string::npos;
-    size_t d_idx = idx + 1;
-    while (d_idx < line.size() && (line[d_idx] == ' ' || line[d_idx] == '\t')) d_idx++;
-    if (d_idx >= line.size() || !std::isdigit(static_cast<unsigned char>(line[d_idx]))) return std::string::npos;
-    end_digit = d_idx;
-    while (end_digit < line.size() && std::isdigit(static_cast<unsigned char>(line[end_digit]))) end_digit++;
-    return d_idx;
-}
-} // namespace
 
 GCodeProgramPanel::ParsedLineDisplay GCodeProgramPanel::formatLine(const std::string& raw, size_t index) const {
     ParsedLineDisplay pld;

@@ -3,6 +3,16 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## Unreleased
+
+### Added
+- Program panel: **Go to line** selects and shows a line by its line number or N number.
+
+### Fixed
+- Program panel: the scrollbar can be dragged on long programs. Its grab was so small that a press next to it paged
+  through the program instead of dragging. It is larger now, and a press anywhere on the bar follows the mouse.
+- Program panel: while a job runs, the listing no longer jumps back to the active line during a scrollbar drag.
+
 ## 0.3.1
 
 ### Fixed

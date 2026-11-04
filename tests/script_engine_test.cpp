@@ -20,6 +20,7 @@
 #include "core/gcode/gcode_parser.h"
 #include "core/io/io_map.h"
 #include "ui_common/lua_guide_examples.h"
+#include "ui_common/gcode_line_lookup.h"
 #include <lua.h>
 #include <lauxlib.h>
 #include <map>
@@ -637,13 +638,13 @@ int main() {
         // Stop only X axis; Y and Z are still held
         hold_x = false;
         controller.jogStopAxis(rnr::core::Axis::X);
-        assert(holdUntil([](const rnr::core::TelemetrySnapshot& t) { return t.axis_vel_mm_min[0] == 0.0; }));
+        // Y and Z must have continued moving forward
+        assert(holdUntil([&](const rnr::core::TelemetrySnapshot& t) {
+            return t.axis_vel_mm_min[0] == 0.0 && t.work_pos_mm[1] > tel1.work_pos_mm[1] && t.work_pos_mm[2] > tel1.work_pos_mm[2];
+        }));
 
         auto tel2 = controller.getTelemetry();
         const double x_stopped_pos = tel2.work_pos_mm[0];
-        // Y and Z must have continued moving forward
-        assert(tel2.work_pos_mm[1] > tel1.work_pos_mm[1]);
-        assert(tel2.work_pos_mm[2] > tel1.work_pos_mm[2]);
 
         // Y and Z keep advancing while X stays where it stopped
         assert(holdUntil([&](const rnr::core::TelemetrySnapshot& t) {
@@ -944,8 +945,9 @@ int main() {
             mill_ctrl.applyConfig(mill_cfg);
             assert(mill_ctrl.getConfig().spindle_ramp_down_s == 2.0);
             assert(mill_ctrl.resetFromEStop());
-            assert(mill_ctrl.executeMdiCommand("S12000"));
-            assert(mill_ctrl.getTelemetry().spindle_pwm_duty == 500); // 12000 of 24000 RPM
+            // With a ramp the worker recomputes the duty every tick (0 while the spindle is off), so run the spindle
+            assert(mill_ctrl.executeMdiCommand("M3 S12000"));
+            assert(waitUntil([&] { return mill_ctrl.getTelemetry().spindle_pwm_duty == 500; })); // 12000 of 24000 RPM
         }
 
         // 3. Laser program detection
@@ -3304,8 +3306,41 @@ int main() {
         std::cout << "  -> PASSED: only G61 / G61.1 select exact stop.\n";
     }
 
+    // ========================================================================
+    // Test 48: Go to line in the program panel, by line number or N number
+    // ========================================================================
+    {
+        std::cout << "\n[Test 48] Testing go to line...\n";
+        using rnr::ui::findGCodeLine;
+        const std::vector<std::string> numbered = {"(header)", "N120 G00 G21", "N130 G71", "  n140 T3 M06", "G1 X1", "N0150 G1 X2", "N3 G1 X3"};
+        assert(findGCodeLine(numbered, "N130") == 2u);
+        assert(findGCodeLine(numbered, "n130") == 2u);
+        assert(findGCodeLine(numbered, " 130 ") == 2u); // Plain number: the N number shown in the listing
+        assert(findGCodeLine(numbered, "140") == 3u);   // Lower case, indented
+        assert(findGCodeLine(numbered, "150") == 5u);   // Leading zero in the file
+        assert(findGCodeLine(numbered, "3") == 6u);     // N3 wins over the third line of the file
+        assert(findGCodeLine(numbered, "5") == 4u);     // No N5: the fifth line of the file
+        assert(!findGCodeLine(numbered, "N5"));         // An N word is only ever an N number
+        assert(!findGCodeLine(numbered, "99"));
+        assert(!findGCodeLine(numbered, "0"));
+        assert(!findGCodeLine(numbered, ""));
+        assert(!findGCodeLine(numbered, "  "));
+        assert(!findGCodeLine(numbered, "N"));
+        assert(!findGCodeLine(numbered, "12a"));
+        assert(!findGCodeLine(numbered, "-3"));
+        assert(!findGCodeLine(numbered, "99999999999999999999999"));
+
+        const std::vector<std::string> plain = {"G21", "G90", "G1 X1 F100"};
+        assert(findGCodeLine(plain, "1") == 0u);
+        assert(findGCodeLine(plain, "3") == 2u);
+        assert(!findGCodeLine(plain, "4"));
+        assert(!findGCodeLine(plain, "N1"));
+        assert(!findGCodeLine({}, "1"));
+        std::cout << "  -> PASSED: line numbers and N numbers are found.\n";
+    }
+
     std::cout << "\n====================================================\n";
-    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (47/47)\n";
+    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (48/48)\n";
     std::cout << "====================================================\n";
     return 0;
 }
