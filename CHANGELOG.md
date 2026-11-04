@@ -3,6 +3,13 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## 0.3.1
+
+### Fixed
+- G15, G40 and G50 no longer switch on exact stop. In 0.3, a program with one of these codes (G40 is common in CAM
+  program headers) stopped at the end of every move until the next G64, which made 3D programs jerky and much slower,
+  and the *Corners & curves* settings had no effect on it.
+
 ## 0.3
 
 ### Added

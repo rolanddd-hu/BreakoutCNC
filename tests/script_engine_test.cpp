@@ -3253,8 +3253,52 @@ int main() {
         std::cout << "  -> PASSED: G82 P lasts for the cycle, pecks without Q warn.\n";
     }
 
+    // ========================================================================
+    // Test 47: Only G61 / G61.1 select exact stop: common CAM header codes must not
+    // ========================================================================
+    {
+        std::cout << "\n[Test 47] Testing that CAM header codes do not select exact stop...\n";
+        using rnr::gcode::GCodeParser;
+        const auto stopsOf = [](const std::string& gcode) {
+            std::vector<bool> out;
+            for (const auto& s : GCodeParser::parse(gcode).segments) out.push_back(s.exact_stop);
+            return out;
+        };
+        const std::string moves = "G1 X10 F1000\nG1 X20 Y1\n";
+        for (const char* code : {"G15", "G17", "G21", "G40", "G49", "G50", "G54", "G69", "G80", "G90", "G91.1", "G94"}) {
+            assert(stopsOf(std::string(code) + "\nG21 G90\n" + moves) == std::vector<bool>({false, false}));
+        }
+        // The header of the Vectric post that exposed this
+        assert(stopsOf("G00 G21 G17 G90 G40 G49 G80\nG71 G91.1\nG94\n" + moves) == std::vector<bool>({false, false}));
+        // G40 does not cancel an exact stop that is in effect, G64 does
+        assert(stopsOf("G21 G90 G61\nG40\n" + moves) == std::vector<bool>({true, true}));
+        assert(stopsOf("G21 G90 G61.1\n" + moves + "G64\nG1 X30\n") == std::vector<bool>({true, true, false}));
+
+        // The planner carries speed through a small corner after such a header
+        rnr::core::MachineConfig cfg;
+        cfg.is_mill = true;
+        for (auto& axis : cfg.axes) {
+            axis.steps_per_mm = 200.0;
+            axis.max_velocity_mm_s = 100.0;
+            axis.acceleration_mm_s2 = 300.0;
+            axis.deceleration_mm_s2 = 300.0;
+        }
+        const auto segs = GCodeParser::parse("G00 G21 G17 G90 G40 G49 G80\nG1 X10 F1000\nG1 X20 Y0.5\n").segments;
+        const auto slices = rnr::planner::TrajectoryPlanner::sliceProgram(segs, cfg);
+        double corner_speed = 0.0;
+        for (size_t i = 1; i < slices.size(); ++i) {
+            if (slices[i].target_pos_mm[0] >= 10.0) {
+                corner_speed = (slices[i].target_pos_mm[0] - slices[i - 1].target_pos_mm[0]) / 0.025;
+                break;
+            }
+        }
+        std::cout << "  speed at the corner: " << corner_speed << " mm/s\n";
+        assert(corner_speed > 10.0);
+        std::cout << "  -> PASSED: only G61 / G61.1 select exact stop.\n";
+    }
+
     std::cout << "\n====================================================\n";
-    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (46/46)\n";
+    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (47/47)\n";
     std::cout << "====================================================\n";
     return 0;
 }

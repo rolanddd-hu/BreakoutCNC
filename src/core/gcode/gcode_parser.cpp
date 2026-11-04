@@ -424,9 +424,6 @@ ParseResult GCodeParser::parse(
                     case 490: // G49 Tool length offset cancel
                         tlo_tool = 0;
                         break;
-                    case 150: // G15 Polar coordinates off
-                    case 400: // G40 Cutter compensation off
-                    case 500: // G50 Scaling off
                     case 610: // G61 Exact stop
                     case 611: // G61.1
                         exact_stop = true;
@@ -435,6 +432,9 @@ ParseResult GCodeParser::parse(
                         exact_stop = false;
                         corner_tolerance_mm = 0.0;
                         break;
+                    case 150: // G15 Polar coordinates off
+                    case 400: // G40 Cutter compensation off
+                    case 500: // G50 Scaling off
                     case 690: // G69 Rotation off
                     case 940: // G94 Feed per minute
                         break;
