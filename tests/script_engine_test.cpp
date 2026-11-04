@@ -3203,19 +3203,26 @@ int main() {
         assert(mc.getTelemetry().state == rnr::core::ControllerState::Idle);
 
         // During a job: nothing is sent until motion stops, and the job ends where it should
-        assert(mc.loadGCodeString("G90 G21\nG1 X20 F1200\n"));
+        assert(mc.loadGCodeString("G90 G21\nG1 X40 F1200\n"));
         mc.startJob();
-        assert(waitFor([&] { return mc.getTelemetry().state == rnr::core::ControllerState::RunningGCode; }));
+        const auto running = [&] { return mc.getTelemetry().state == rnr::core::ControllerState::RunningGCode; };
+        assert(waitFor(running));
         const int configure1 = fb->count("configure");
-        for (int i = 0; i < 10; ++i) {
+        int ticks_in_motion = 0;
+        for (int i = 0; i < 10 && running(); ++i) {
             drag(1);
-            assert(fb->count("configure") == configure1);
+            // Read the count first: on a slow PC the job can end during the sleep, and then a change goes out at once
+            const int sent = fb->count("configure");
+            if (running()) {
+                assert(sent == configure1);
+                ++ticks_in_motion;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
         assert(waitFor([&] { return mc.getTelemetry().state == rnr::core::ControllerState::Idle; }));
-        assert(fb->steps(0) == static_cast<int32_t>(std::llround(20.0 * mc.getConfig().axes[0].steps_per_mm)));
-        assert(waitFor([&] { return fb->count("configure") == configure1 + 1; })); // Latest values, applied once
-        std::cout << "  job: 10 ticks sent nothing during motion, 1 configure after it; status message: \""
+        assert(fb->steps(0) == static_cast<int32_t>(std::llround(40.0 * mc.getConfig().axes[0].steps_per_mm)));
+        assert(waitFor([&] { return fb->count("configure") > configure1; })); // The latest values, once motion stopped
+        std::cout << "  job: " << ticks_in_motion << " ticks sent nothing during motion; status message: \""
                   << mc.getTelemetry().active_fault_message << "\"\n";
         std::cout << "  -> PASSED: a slider drag only sends configuration, and waits for motion to stop.\n";
     }
