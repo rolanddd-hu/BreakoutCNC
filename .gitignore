@@ -28,3 +28,6 @@ imgui.ini
 *_decompiled.c
 *.asm
 /docs/Mach3*.xml
+
+# Hardware things
+/hardware/
