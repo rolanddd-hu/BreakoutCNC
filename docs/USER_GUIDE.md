@@ -74,6 +74,10 @@ example by a power cut while saving.
 | **Right: settings** | Collapsible sections for spindle, connection, tools, probing, work offsets, camera, inputs and outputs, limits and motors |
 | **Bottom strip** | Every output and input with its function (click inputs to simulate them in the simulator), Diagnostics |
 
+When GitHub has a newer release, the title bar shows **New version: x.y** next to the app name. The app checks once at
+startup; without an internet connection it shows nothing and works as usual. Nothing is downloaded or installed
+automatically: get the new version from the [releases page](https://github.com/rolanddd-hu/BreakoutCNC/releases).
+
 Title bar: **FULL / MINIMAL** switches to a simplified layout for running jobs; the icons on the right choose the color
 theme (sun: light themes, moon: dark themes), toggle full screen (also F11), minimize, maximize and close. Clicking the
 sun or moon switches to the last theme used in that group; clicking it again goes to the group's next theme. The active

@@ -1,3 +1,4 @@
+#include "breakout_version.h"
 #include "ui_common/app_window.h"
 #include "ui_common/frame_stats.h"
 #include "ui_common/theme.h"
@@ -497,6 +498,8 @@ void AppWindow::renderPerfOverlay() {
 int AppWindow::runLoop(const std::function<void()>& render_callback) {
     if (!window_) return 1;
 
+    update_checker_.start(BREAKOUTCNC_VERSION_STRING);
+
     using PerfClock = std::chrono::steady_clock;
     auto msSince = [](PerfClock::time_point t) {
         return std::chrono::duration<double, std::milli>(PerfClock::now() - t).count();
@@ -711,7 +714,7 @@ void AppWindow::renderCustomTitleBar() {
         const float title_x = pos.x + 12.0f;
         const float text_y = pos.y + 7.5f;
         draw_list->AddText(ImVec2(title_x, text_y), pal.title_text, title_.c_str());
-        const float title_end_x = title_x + ImGui::CalcTextSize(title_.c_str()).x;
+        float title_end_x = title_x + ImGui::CalcTextSize(title_.c_str()).x;
 
         // Custom Title Bar Segmented Toggles: [ PLASMA | LASER ] and [ FULL | MINIMAL ]
         const float buttons_start_x = right_x - buttons_total_w;
@@ -722,6 +725,24 @@ void AppWindow::renderCustomTitleBar() {
         const float mode_w   = (operation_mode_ptr_ != nullptr) ? (tab_w * 2.0f) : 0.0f;
         const float layout_w = (minimal_layout_ptr_ != nullptr) ? (tab_w * 2.0f) : 0.0f;
         const float total_groups_w = mode_w + ((mode_w > 0.0f && layout_w > 0.0f) ? tab_gap : 0.0f) + layout_w;
+
+        // A newer release on GitHub: a label next to the title, left out if the window is too narrow for it
+        const std::string new_version = update_checker_.availableVersion();
+        if (!new_version.empty()) {
+            const std::string label = "New version: " + new_version;
+            const float label_x = title_end_x + 14.0f;
+            const float label_w = ImGui::CalcTextSize(label.c_str()).x;
+            if (label_x + label_w + 16.0f + total_groups_w + 16.0f <= buttons_start_x) {
+                draw_list->AddText(ImVec2(label_x, text_y), ImGui::ColorConvertFloat4ToU32(pal.border_accent), label.c_str());
+                ImGui::SetCursorScreenPos(ImVec2(label_x, pos.y));
+                ImGui::InvisibleButton("##TitleNewVersion", ImVec2(label_w, title_bar_h));
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("BreakoutCNC %s is available, you have %s.\ngithub.com/rolanddd-hu/BreakoutCNC/releases",
+                                      new_version.c_str(), BREAKOUTCNC_VERSION_STRING);
+                }
+                title_end_x = label_x + label_w;
+            }
+        }
 
         const float group_y  = pos.y + (title_bar_h - tab_h) * 0.5f;
         float start_x        = pos.x + (size.x - total_groups_w) * 0.5f;

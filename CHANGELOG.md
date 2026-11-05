@@ -7,6 +7,8 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
 
 ### Added
 - Program panel: **Go to line** selects and shows a line by its line number or N number.
+- The title bar shows **New version: x.y** when GitHub has a newer release. The apps check once at startup, and skip
+  the label if there is no internet connection.
 
 ### Fixed
 - Program panel: the scrollbar can be dragged on long programs. Its grab was so small that a press next to it paged

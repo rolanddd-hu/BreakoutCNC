@@ -3,6 +3,7 @@
 #include <string>
 #include <functional>
 #include "core/diagnostics.h"
+#include "core/update/version_check.h"
 
 struct GLFWwindow;
 struct ImFont;
@@ -95,6 +96,8 @@ private:
     // Operation mode (Plasma / Laser) selector in title bar
     core::OperationMode* operation_mode_ptr_ = nullptr;
     std::function<void(core::OperationMode)> on_operation_mode_changed_;
+
+    core::UpdateChecker update_checker_; // Newer release on GitHub, shown in the title bar
 
     // Fullscreen and window geometry tracking
     bool is_fullscreen_ = false;
