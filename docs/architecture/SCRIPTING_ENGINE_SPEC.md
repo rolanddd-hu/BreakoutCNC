@@ -6,7 +6,7 @@ This specification details the architecture, language selection, API surface, co
 
 The goal is to provide CNC operators and machine integrators with an automation and customization framework similar to Mach3 and Mach4:
 1. **Event Hooks:** Automatically execute scripts on tool change (`M6`), homing buttons (`HOME ALL`, per-axis `H`), probe routines, and plasma torch-on (`M3` / Initial Height Sense).
-2. **Custom M-Codes:** Execute arbitrary user macro scripts when encountering `M100`..`M999` in G-code or MDI (e.g. pneumatic clamps, vacuum tables, mist spray, laser pointers).
+2. **Custom M-Codes:** Execute arbitrary user macro scripts when `M100`..`M999` is entered in MDI (e.g. pneumatic clamps, vacuum tables, mist spray, laser pointers).
 3. **UI Macro Buttons & REPL:** User-configurable quick-action buttons in the UI and a live Lua console.
 4. **Cross-Profile Support:** Shared core engine with tailored profiles and scripts for both CNC Milling and CNC Plasma Cutting.
 
@@ -247,9 +247,10 @@ function Message(msg) cnc.message(msg) end
 - If script homing is disabled in settings, defaults to native C++ homing.
 
 ### 5.3 Custom M-Codes (`M100`..`M999`)
-- **Trigger:** Parser or MDI encounters any M-code not reserved by standard RS-274 (`M100`..`M999`).
-- **Resolution:** Checks for `scripts/macros/M<number>.lua` (e.g. `scripts/macros/M101.lua`).
-- **Execution:** Runs the file synchronously with respect to G-code execution.
+- **Trigger:** An `M100`..`M999` command entered in MDI. A macro script can also be bound to a macro button.
+- **Resolution:** Checks for `scripts/macros/M<number>.lua` (e.g. `scripts/macros/M101.lua`). If scripting is disabled or the file is not found, the MDI command is rejected.
+- **Execution:** Starts the file asynchronously (`runFileAsync`).
+- **Inside G-code programs:** Not executed. The parser shows a warning and ignores the M-code, so a running job can never start an unexpected script.
 
 ### 5.4 Plasma Initial Height Sense Hook (`m3_touch.lua`)
 - **Trigger:** Prior to plasma arc ignition on `M3`.

@@ -102,13 +102,14 @@ add_library(rnr_core STATIC
     src/core/scripting/script_runner.cpp
     src/core/camera/camera_manager.cpp
     src/core/camera/camera_stream_server.cpp
+    src/core/update/version_check.cpp
 )
 target_include_directories(rnr_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(rnr_core PUBLIC lua_lib)
 
 # Platform-specific dependencies for rnr_core
 if(WIN32)
-    target_link_libraries(rnr_core PUBLIC hid setupapi ws2_32 mfplat mf mfreadwrite mfuuid ole32)
+    target_link_libraries(rnr_core PUBLIC hid setupapi ws2_32 winhttp mfplat mf mfreadwrite mfuuid ole32)
 else()
     # Cross-platform USB HID via hidapi on Linux / macOS
     FetchContent_Declare(

@@ -19,6 +19,7 @@
 #include "core/hid/rnr_protocol.h"
 #include "core/gcode/gcode_parser.h"
 #include "core/io/io_map.h"
+#include "core/update/version_check.h"
 #include "ui_common/lua_guide_examples.h"
 #include "ui_common/gcode_line_lookup.h"
 #include <lua.h>
@@ -3339,8 +3340,49 @@ int main() {
         std::cout << "  -> PASSED: line numbers and N numbers are found.\n";
     }
 
+    // ========================================================================
+    // Test 49: New version check: version comparison and the GitHub release response (no network)
+    // ========================================================================
+    {
+        std::cout << "\n[Test 49] Testing the new version check...\n";
+        using rnr::core::newerVersionInReleaseJson;
+        const auto release = [](const std::string& tag) {
+            return "{\"url\":\"x\",\"author\":{\"login\":\"a\"},\"tag_name\": \"" + tag + "\",\"body\":\"text\"}";
+        };
+
+        assert(newerVersionInReleaseJson(release("v0.3.2"), "0.3.1") == "0.3.2");
+        assert(newerVersionInReleaseJson(release("v0.4"), "0.3.1") == "0.4");
+        assert(newerVersionInReleaseJson(release("v1.0"), "0.9.9") == "1.0");
+        assert(newerVersionInReleaseJson(release("0.10"), "0.9") == "0.10"); // Numbers, not text: 10 > 9
+        assert(newerVersionInReleaseJson(release("v0.3.0.1"), "0.3") == "0.3.0.1");
+
+        assert(newerVersionInReleaseJson(release("v0.3.1"), "0.3.1").empty()); // The same version
+        assert(newerVersionInReleaseJson(release("v0.3"), "0.3.0").empty());   // Missing numbers count as 0
+        assert(newerVersionInReleaseJson(release("v0.3"), "0.3.1").empty());   // This build is newer
+
+        // Anything unexpected shows no label
+        assert(newerVersionInReleaseJson(release("v0.4-beta"), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("latest"), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release(""), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("v"), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("v1..2"), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("v1."), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("v99999999999"), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("v1.2.3.4.5"), "0.3.1").empty());
+        assert(newerVersionInReleaseJson(release("v0.4"), "unknown").empty());
+        assert(newerVersionInReleaseJson("", "0.3.1").empty());                                  // No internet connection
+        assert(newerVersionInReleaseJson("{\"message\":\"Not Found\"}", "0.3.1").empty());
+        assert(newerVersionInReleaseJson("{\"tag_name\":", "0.3.1").empty());                    // Cut off
+        assert(newerVersionInReleaseJson("{\"tag_name\":\"v0.4", "0.3.1").empty());
+        assert(newerVersionInReleaseJson("{\"tag_name\":4}", "0.3.1").empty());
+
+        rnr::core::UpdateChecker not_started;
+        assert(not_started.availableVersion().empty());
+        std::cout << "  -> PASSED: only a newer, well-formed release version is reported.\n";
+    }
+
     std::cout << "\n====================================================\n";
-    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (48/48)\n";
+    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (49/49)\n";
     std::cout << "====================================================\n";
     return 0;
 }
