@@ -9,6 +9,18 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
 - Program panel: **Go to line** selects and shows a line by its line number or N number.
 - The title bar shows **New version: x.y** when GitHub has a newer release. The apps check once at startup, and skip
   the label if there is no internet connection.
+- G-code **G68 A\<x\> B\<y\> R\<degrees\> [I]** rotates the program about (A, B), as in Mach3, until **G69**. Before,
+  G68 was an "Unsupported G-code" error.
+- Program check: after loading, the program panel lists every problem with its line, in a list that scrolls, instead
+  of the first three errors (warnings were hidden while there were errors). Click a message to show its line; problem
+  lines also get a dot with the message as a tooltip. When there are only warnings, the × in the corner of the card
+  clears them until the program is loaded again.
+- The checks Cycle Start makes (soft limits with the current work offset, homing for G53 / G28, tool lengths in tool
+  table mode) now show right after loading and update when you home, set a work zero or measure a tool. Cycle Start
+  used to report only the first problem.
+- New warnings: a feed above what the motor settings allow (the move runs slower), a spindle speed outside the VFD's
+  range, a cut while the spindle is off (BreakoutMill), A moves while A follows another axis, and an M3 / M4 with no
+  M5 after it.
 
 ### Fixed
 - Program panel: the scrollbar can be dragged on long programs. Its grab was so small that a press next to it paged

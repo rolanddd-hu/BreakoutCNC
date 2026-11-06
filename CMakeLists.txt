@@ -103,6 +103,7 @@ add_library(rnr_core STATIC
     src/core/camera/camera_manager.cpp
     src/core/camera/camera_stream_server.cpp
     src/core/update/version_check.cpp
+    src/core/controller/program_check.cpp
 )
 target_include_directories(rnr_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(rnr_core PUBLIC lua_lib)

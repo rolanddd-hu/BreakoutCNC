@@ -229,25 +229,9 @@ void GCodeProgramPanel::render(
         ImGui::PopStyleColor();
     }
 
-    // Program diagnostics: errors block Cycle Start, warnings are informational
-    if (!program->errors.empty() || !program->warnings.empty()) {
-        const bool has_errors = !program->errors.empty();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, has_errors ? theme::pal().surface_danger : theme::pal().surface_warn);
-        ImGui::BeginChild("##ProgramDiagnostics", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
-        ImGui::PushTextWrapPos(0.0f);
-        const auto& list = has_errors ? program->errors : program->warnings;
-        const ImVec4 col = has_errors ? theme::pal().text_danger : theme::pal().text_warn;
-        ImGui::TextColored(col, has_errors ? "Program cannot run - %zu error(s):" : "%zu warning(s):", list.size());
-        for (size_t i = 0; i < list.size() && i < 3; ++i) {
-            ImGui::TextColored(col, "Line %zu: %s", list[i].line + 1, list[i].text.c_str());
-        }
-        if (list.size() > 3) {
-            ImGui::TextDisabled("... and %zu more", list.size() - 3);
-        }
-        ImGui::PopTextWrapPos();
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-    }
+    // Program check: errors and Cycle Start problems stop the run, warnings are informational
+    updateProgramCheck(controller, program);
+    renderProgramDiagnostics(is_running);
 
     // Whole-Line Snap-Scrolled G-Code Listing
     constexpr float kRowHeight = 22.0f;
@@ -367,6 +351,36 @@ void GCodeProgramPanel::render(
             if (!is_running && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 selected_line_ = i;
                 controller.setNextGCodeLine(i);
+            }
+
+            // Problem marker: a dot at the right end of the row, the messages in a tooltip (none once warnings are cleared)
+            if (const auto [first, last] = issuesOnLine(i); first < last && !warnings_cleared_) {
+                bool blocks = false;
+                for (size_t k = first; k < last; ++k) {
+                    if (check_->issues[k].kind != core::ProgramIssueKind::Warning) blocks = true;
+                }
+                const ImVec4 mc = blocks ? theme::pal().text_danger : theme::pal().text_warn;
+                dl->AddCircleFilled(ImVec2(row_p1.x - 10.0f, row_p0.y + kRowHeight * 0.5f), 4.0f,
+                                    ImGui::GetColorU32(mc));
+                if (ImGui::IsItemHovered()) {
+                    // The listing runs with zero padding and spacing: give the tooltip its own
+                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 4.0f));
+                    ImGui::BeginTooltip();
+                    ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]); // UI font, not the listing's monospace font
+                    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+                    for (size_t k = first; k < last; ++k) {
+                        const auto& iss = check_->issues[k];
+                        ImGui::TextColored(iss.kind == core::ProgramIssueKind::Warning ? theme::pal().text_warn
+                                                                                       : theme::pal().text_danger,
+                                           "%s%s", iss.kind == core::ProgramIssueKind::StartBlocker ? "Cycle Start: " : "",
+                                           iss.text.c_str());
+                    }
+                    ImGui::PopTextWrapPos();
+                    ImGui::PopFont();
+                    ImGui::EndTooltip();
+                    ImGui::PopStyleVar(2);
+                }
             }
 
             const ParsedLineDisplay pld = formatLine(gcode_lines[i], i);
@@ -990,7 +1004,8 @@ float GCodeProgramPanel::calculateDesiredHeight(float max_available_h, bool is_t
     const float top_row_h = 34.0f;
     const float tool_change_h = is_tool_change ? (50.0f + spacing_y) : 0.0f;
     const float mdi_needed_h = spacing_y + 6.0f + ImGui::GetFrameHeight();
-    const float non_scroll_h = pad_y + top_row_h + spacing_y + tool_change_h + mdi_needed_h;
+    // The program check card (height of the last frame) sits above the listing and must not take its rows
+    const float non_scroll_h = pad_y + top_row_h + spacing_y + tool_change_h + diag_card_h_ + mdi_needed_h;
 
     int visible_rows;
     if (exact_rows > 0) {
@@ -1002,6 +1017,148 @@ float GCodeProgramPanel::calculateDesiredHeight(float max_available_h, bool is_t
     const float exact_scroll_h = static_cast<float>(visible_rows) * kRowHeight + 2.0f;
 
     return non_scroll_h + exact_scroll_h;
+}
+
+void GCodeProgramPanel::updateProgramCheck(core::IMotionController& controller,
+                                           const std::shared_ptr<const gcode::ParseResult>& program) {
+    check_ = controller.getProgramCheck();
+    if (check_ && check_->program == program) return;
+    // No check from the controller, or it belongs to another program (a load in between): parse results only
+    if (!parse_only_check_ || parse_only_check_->program != program) {
+        parse_only_check_ = std::make_shared<const core::ProgramCheckResult>(
+            core::buildProgramCheck(program, nullptr, core::MachineCheckInput{}));
+    }
+    check_ = parse_only_check_;
+}
+
+std::pair<size_t, size_t> GCodeProgramPanel::issuesOnLine(size_t line) const {
+    if (!check_ || check_->issues.empty()) return {0, 0};
+    const auto& v = check_->issues;
+    const auto lo = std::lower_bound(v.begin(), v.end(), line,
+                                     [](const core::ProgramIssue& a, size_t l) { return a.line < l; });
+    auto hi = lo;
+    while (hi != v.end() && hi->line == line) ++hi;
+    return {static_cast<size_t>(lo - v.begin()), static_cast<size_t>(hi - v.begin())};
+}
+
+void GCodeProgramPanel::renderProgramDiagnostics(bool is_running) {
+    diag_card_h_ = 0.0f;
+    warnings_cleared_ = false;
+    if (!check_ || check_->issues.empty()) return;
+    const auto& c = *check_;
+    const bool blocks = (c.error_count + c.blocker_count) > 0;
+    // Warnings can be cleared until the program is loaded again; errors and Cycle Start problems always show
+    if (!blocks && c.program && cleared_warnings_program_.lock() == c.program) {
+        warnings_cleared_ = true;
+        return;
+    }
+
+    std::string counts;
+    auto addCount = [&](size_t n, const char* one, const char* many) {
+        if (n == 0) return;
+        if (!counts.empty()) counts += ", ";
+        counts += std::to_string(n) + " " + (n == 1 ? one : many);
+    };
+    addCount(c.error_count, "error", "errors");
+    addCount(c.blocker_count, "Cycle Start problem", "Cycle Start problems");
+    addCount(c.warning_count, "warning", "warnings");
+    const char* title = (c.error_count > 0)   ? "Program cannot run"
+                        : (c.blocker_count > 0) ? "Cycle Start is blocked"
+                                                : "Program warnings";
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, blocks ? theme::pal().surface_danger : theme::pal().surface_warn);
+    ImGui::BeginChild("##ProgramDiagnostics", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+    constexpr float kClearBtn = 28.0f;
+    const float content_right = ImGui::GetWindowContentRegionMax().x;
+    // Leave room for the clear icon at the right end of the title line
+    ImGui::PushTextWrapPos(blocks ? 0.0f : content_right - kClearBtn - 8.0f);
+    ImGui::TextColored(blocks ? theme::pal().text_danger : theme::pal().text_warn, "%s: %s.", title, counts.c_str());
+    if (!is_running) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Click a message to show its line.");
+    }
+    ImGui::PopTextWrapPos();
+
+    if (!blocks) {
+        // Clear icon in the top-right corner, drawn over the card's padding so the title line keeps its height
+        const ImVec2 resume = ImGui::GetCursorPos();
+        ImGui::SetCursorPos(ImVec2(content_right - kClearBtn + 4.0f, std::max(0.0f, ImGui::GetStyle().WindowPadding.y - 6.0f)));
+        const bool clicked = ImGui::InvisibleButton("##ClearWarnings", ImVec2(kClearBtn, kClearBtn));
+        const bool hovered = ImGui::IsItemHovered();
+        const ImVec2 b0 = ImGui::GetItemRectMin(), b1 = ImGui::GetItemRectMax();
+        ImDrawList* cdl = ImGui::GetWindowDrawList();
+        if (hovered) cdl->AddRectFilled(b0, b1, ImGui::GetColorU32(ImGuiCol_ButtonHovered), 4.0f);
+        const ImVec2 mid((b0.x + b1.x) * 0.5f, (b0.y + b1.y) * 0.5f);
+        const float arm = 5.5f;
+        const ImU32 xc = ImGui::GetColorU32(theme::pal().text_warn);
+        cdl->AddLine(ImVec2(mid.x - arm, mid.y - arm), ImVec2(mid.x + arm, mid.y + arm), xc, 2.0f);
+        cdl->AddLine(ImVec2(mid.x - arm, mid.y + arm), ImVec2(mid.x + arm, mid.y - arm), xc, 2.0f);
+        if (hovered) ImGui::SetTooltip("Clear the warnings. They show again when the program is loaded again.");
+        if (clicked) cleared_warnings_program_ = c.program;
+        ImGui::SetCursorPos(resume);
+    }
+
+    // The list scrolls once it is taller than four lines, so every message can be read. Its height is the
+    // content height of the previous frame, capped (an auto-resizing child would not scroll).
+    const float line_h = ImGui::GetTextLineHeightWithSpacing();
+    const float max_h  = std::floor(line_h * 4.0f);
+    const float list_h = std::clamp(diag_list_content_h_, line_h, max_h);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::BeginChild("##ProgramDiagnosticsList", ImVec2(0.0f, list_h), ImGuiChildFlags_None);
+
+    constexpr size_t kMaxListed = 1000; // A garbage file can produce an error on every line
+    const size_t listed = std::min(c.issues.size(), kMaxListed);
+    const size_t last_line = c.issues.empty() ? 0 : c.issues.back().line + 1;
+    char widest[32];
+    std::snprintf(widest, sizeof(widest), "Line %zu", last_line);
+    const float line_col_w = ImGui::CalcTextSize(widest).x + 10.0f;
+    // Channel 0: hover highlight, channel 1: text (the highlight is known only after the text is laid out)
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->ChannelsSplit(2);
+    dl->ChannelsSetCurrent(1);
+
+    for (size_t k = 0; k < listed; ++k) {
+        const auto& iss = c.issues[k];
+        const ImVec4 col = (iss.kind == core::ProgramIssueKind::Warning) ? theme::pal().text_warn
+                                                                         : theme::pal().text_danger;
+        ImGui::PushID(static_cast<int>(k));
+        const float row_x = ImGui::GetCursorPosX();
+        ImGui::BeginGroup();
+        ImGui::TextColored(col, "Line %zu", iss.line + 1);
+        ImGui::SameLine(row_x + line_col_w);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(col, "%s%s", iss.kind == core::ProgramIssueKind::StartBlocker ? "Cycle Start: " : "",
+                           iss.text.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::EndGroup();
+        if (!is_running && iss.line < (c.program ? c.program->lines.size() : 0) && ImGui::IsItemHovered()) {
+            const ImVec2 r0 = ImGui::GetItemRectMin();
+            const ImVec2 r1(ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x, ImGui::GetItemRectMax().y);
+            dl->ChannelsSetCurrent(0);
+            dl->AddRectFilled(r0, r1, ImGui::GetColorU32(ImGuiCol_HeaderHovered));
+            dl->ChannelsSetCurrent(1);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                selected_line_            = iss.line;
+                scroll_to_line_           = iss.line;
+                scroll_to_line_requested_ = true;
+            }
+        }
+        ImGui::PopID();
+    }
+    dl->ChannelsMerge();
+    if (c.issues.size() > listed) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%zu more messages are not listed. The first %zu are shown.", c.issues.size() - listed, listed);
+        ImGui::PopTextWrapPos();
+    }
+    diag_list_content_h_ = ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y;
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    diag_card_h_ = ImGui::GetItemRectSize().y + ImGui::GetStyle().ItemSpacing.y; // For calculateDesiredHeight()
 }
 
 GCodeProgramPanel::ParsedLineDisplay GCodeProgramPanel::formatLine(const std::string& raw, size_t index) const {

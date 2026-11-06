@@ -20,6 +20,7 @@
 #include "core/gcode/gcode_parser.h"
 #include "core/io/io_map.h"
 #include "core/update/version_check.h"
+#include "core/controller/program_check.h"
 #include "ui_common/lua_guide_examples.h"
 #include "ui_common/gcode_line_lookup.h"
 #include <lua.h>
@@ -214,6 +215,7 @@ public:
     }
     void setNextGCodeLine(size_t) override {}
     std::shared_ptr<const rnr::gcode::ParseResult> getProgram() const override { return program_; }
+    std::shared_ptr<const rnr::core::ProgramCheckResult> getProgramCheck() const override { return nullptr; }
     void startJob() override { telemetry_.state = rnr::core::ControllerState::RunningGCode; }
     void pauseJob() override { telemetry_.state = rnr::core::ControllerState::PausedHold; }
     void stopJob() override { telemetry_.state = rnr::core::ControllerState::Idle; }
@@ -3381,8 +3383,252 @@ int main() {
         std::cout << "  -> PASSED: only a newer, well-formed release version is reported.\n";
     }
 
+    // ========================================================================
+    // Test 50: Program check after loading: parse problems plus the Cycle Start checks against the machine
+    // ========================================================================
+    {
+        std::cout << "\n[Test 50] Testing the program check (homing, tool table, soft limits, feed, spindle)...\n";
+        using namespace rnr::core;
+        using rnr::gcode::GCodeParser;
+        const auto run = [](const std::string& gcode, const MachineConfig* cfg, const MachineCheckInput& in) {
+            auto p = std::make_shared<const rnr::gcode::ParseResult>(GCodeParser::parse(gcode));
+            return buildProgramCheck(p, cfg, in);
+        };
+        const auto find = [](const ProgramCheckResult& r, ProgramIssueKind kind,
+                             const std::string& part) -> const ProgramIssue* {
+            for (const auto& i : r.issues) {
+                if (i.kind == kind && i.text.find(part) != std::string::npos) return &i;
+            }
+            return nullptr;
+        };
+        MachineCheckInput in;
+        in.frame.enabled = true;
+        in.homed = {true, true, true, true};
+        const MachineConfig base;
+
+        // A clean program has no issues, also without M30; an M3 / M4 without a later M5 gets a warning on its line
+        assert(run("G21 G90\nG0 X10 Y10\nG1 X20 F500\nM30\n", &base, in).issues.empty());
+        assert(run("G21 G90\nG0 X10 Y10\nG1 X20 F500\n", &base, in).issues.empty());
+        assert(run("G21 G90\nM3\nG1 X20 F500\nM5\nM30\n", &base, in).issues.empty());
+        {
+            const auto r = run("G21 G90\nM3\nG1 X20 F500\nM5\nM4\nG1 X0\nM30\n", &base, in); // M30 does not count
+            assert(r.warning_count == 1 && r.issues.size() == 1);
+            const auto* w = find(r, ProgramIssueKind::Warning, "M3 / M4 is not followed by M5");
+            assert(w && w->line == 4 && w->text.find("torch") != std::string::npos);
+        }
+
+        // Parse-only (no machine settings): parse errors and warnings, sorted by line
+        {
+            const auto r = run("G21 G90\nM100\nG41 D1\nG1 X10 F500\n", nullptr, in);
+            assert(r.error_count == 1 && r.warning_count == 1 && r.blocker_count == 0);
+            assert(r.issues[0].line == 1 && r.issues[0].kind == ProgramIssueKind::Warning);
+            assert(r.issues[1].line == 2 && r.issues[1].kind == ProgramIssueKind::Error);
+        }
+
+        // Soft limits: every line out of range is counted, the Cycle Start message keeps its old wording
+        {
+            MachineConfig cfg = base;
+            cfg.axes[0].soft_limits_enabled = true;
+            cfg.axes[0].soft_limit_min_mm = -1.0;
+            cfg.axes[0].soft_limit_max_mm = 50.0;
+            const std::string prog = "G21 G90\nG0 X100\nG1 X120 F500\nG0 X0\nM30\n";
+            const auto r = run(prog, &cfg, in);
+            assert(r.blocker_count == 1);
+            const auto* b = find(r, ProgramIssueKind::StartBlocker, "X goes to 120.000 mm");
+            assert(b && b->line == 1 && b->text.find("(1 more line)") != std::string::npos);
+            const auto m = checkProgramAgainstMachine(GCodeParser::parse(prog), cfg, in);
+            assert(m.start_refusal.find("line 2 exceeds soft limits") != std::string::npos);
+
+            MachineCheckInput shifted = in; // G54 X-60: X100 is inside, X120 is still 10 mm above
+            MachineConfig wide = cfg;         // (and G0 X0 goes to -60, inside a wider lower limit)
+            wide.axes[0].soft_limit_min_mm = -100.0;
+            shifted.frame.workspace_offsets[0][0] = -60.0;
+            const auto r2 = run(prog, &wide, shifted);
+            const auto* b2 = find(r2, ProgramIssueKind::StartBlocker, "X goes to 60.000 mm");
+            assert(r2.blocker_count == 1 && b2 && b2->line == 2 && b2->text.find("more line") == std::string::npos);
+
+            MachineCheckInput not_homed = in; // Soft limits only apply to homed axes
+            not_homed.homed = {false, true, true, true};
+            assert(run(prog, &cfg, not_homed).blocker_count == 0);
+        }
+
+        // Homing: machine coordinates on an axis that is not homed (not in the simulator)
+        {
+            MachineCheckInput not_homed = in;
+            not_homed.homed = {false, false, false, false};
+            const std::string prog = "G21 G90\nG0 X5\nG53 G0 Z0\nM30\n";
+            const auto r = run(prog, &base, not_homed);
+            const auto* b = find(r, ProgramIssueKind::StartBlocker, "machine coordinates (G53 / G28) on Z");
+            assert(r.blocker_count == 1 && b && b->line == 2);
+            not_homed.simulator = true;
+            assert(run(prog, &base, not_homed).blocker_count == 0);
+        }
+
+        // Tool table: every missing length and every tool change without its G43 is listed
+        {
+            MachineConfig cfg = base;
+            cfg.tool_table.mode = ToolLengthMode::ToolTable;
+            const std::string prog = "G21 G90\nT1 M6\nG43 H1\nG0 X0\nT2 M6\nG0 X5\nM30\n";
+            const auto r = run(prog, &cfg, in);
+            assert(find(r, ProgramIssueKind::StartBlocker, "T1 has no length"));
+            const auto* b = find(r, ProgramIssueKind::StartBlocker, "tool change to T2 is not followed by G43 H2");
+            assert(b && b->line == 4);
+            const auto m = checkProgramAgainstMachine(GCodeParser::parse(prog), cfg, in);
+            assert(m.start_refusal.find("no length") != std::string::npos);
+        }
+
+        // Feed faster than the axes: one warning on the first line, with the number of other lines
+        {
+            MachineConfig cfg = base;
+            cfg.axes[0].max_velocity_mm_s = 10.0; // 600 mm/min
+            const auto r = run("G21 G90\nG1 X10 F2000\nG1 X20\nG1 Y10\nM30\n", &cfg, in);
+            const auto* w = find(r, ProgramIssueKind::Warning, "F2000 mm/min is faster than the axes");
+            assert(r.warning_count == 1 && w && w->line == 1);
+            assert(w->text.find("at most 600 mm/min") != std::string::npos);
+            assert(w->text.find("(1 more line)") != std::string::npos);
+        }
+
+        // BreakoutMill: spindle speeds outside the VFD range, and cutting with the spindle off
+        {
+            MachineConfig cfg = base;
+            cfg.is_mill = true;
+            cfg.vfd.enabled = true;
+            cfg.vfd.max_rpm = 24000;
+            cfg.vfd.min_rpm = 6000;
+            const auto r = run("G21 G90\nM3 S30000\nG1 X10 F500\nS1000\nG1 X20\nM5\nM30\n", &cfg, in);
+            assert(r.warning_count == 2);
+            assert(find(r, ProgramIssueKind::Warning, "S30000 is above the VFD's maximum speed (24000 RPM)"));
+            assert(find(r, ProgramIssueKind::Warning, "S1000 is below the VFD's minimum speed (6000 RPM)"));
+
+            cfg.vfd.enabled = false;
+            const auto r2 = run("G21 G90\nG1 X10 F500\nM3 S10000\nG1 X20\nM5\nM30\n", &cfg, in);
+            const auto* w = find(r2, ProgramIssueKind::Warning, "spindle is off");
+            assert(r2.warning_count == 1 && w && w->line == 1);
+        }
+
+        // A slaved A motor: programmed A moves are not made
+        {
+            MachineConfig cfg = base;
+            cfg.gantry_slave = GantrySlave::AFollowsX;
+            const auto r = run("G21 G90\nG1 A10 F500\nM30\n", &cfg, in);
+            const auto* w = find(r, ProgramIssueKind::Warning, "A moves are not made");
+            assert(w && w->line == 1);
+        }
+
+        // The controller keeps the check of the loaded program and recomputes it only when an input changes
+        {
+            RnRController controller;
+            assert(controller.resetFromEStop());
+            controller.loadGCodeString("G21 G90\nM3\nG0 X10\nG1 X20 F500\n");
+            const auto c1 = controller.getProgramCheck();
+            assert(c1 && c1->program == controller.getProgram());
+            assert(find(*c1, ProgramIssueKind::Warning, "not followed by M5"));
+            assert(controller.getProgramCheck() == c1); // Cached
+
+            auto cfg = controller.getConfig();
+            cfg.axes[0].soft_limits_enabled = true;
+            cfg.axes[0].soft_limit_min_mm = -1.0;
+            cfg.axes[0].soft_limit_max_mm = 15.0;
+            controller.applyConfig(cfg);
+            controller.homeAxis(Axis::X);
+            for (int i = 0; i < 400 && controller.getTelemetry().state != ControllerState::Idle; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            assert(controller.getTelemetry().axis_homed[0]);
+            const auto c2 = controller.getProgramCheck();
+            assert(c2 != c1 && c2->blocker_count == 1);
+            controller.startJob(); // Refused with the same problem the panel lists
+            assert(controller.getTelemetry().active_fault_message.find("exceeds soft limits") != std::string::npos);
+
+            controller.loadGCodeString("G21 G90\nG41 D1\nG1 X10 F500\nM30\n");
+            const auto c3 = controller.getProgramCheck();
+            assert(c3->program == controller.getProgram() && c3->error_count == 1);
+        }
+        std::cout << "  -> PASSED: every problem is listed after loading, and Cycle Start refuses the same ones.\n";
+    }
+
+    // ========================================================================
+    // Test 51: G68 / G69 coordinate rotation (Mach3: G68 A<x> B<y> R<degrees> [I])
+    // ========================================================================
+    {
+        std::cout << "\n[Test 51] Testing G68 / G69 coordinate rotation...\n";
+        using rnr::gcode::GCodeParser;
+        const auto endOf = [](const std::string& gcode) {
+            const auto r = GCodeParser::parse(gcode);
+            assert(!r.hasErrors());
+            assert(!r.segments.empty());
+            return r.segments.back().end_xyza_mm;
+        };
+        const auto near = [](const std::array<double, 4>& p, double x, double y) {
+            return std::abs(p[0] - x) < 1e-6 && std::abs(p[1] - y) < 1e-6;
+        };
+        const auto hasError = [](const std::string& gcode, const std::string& part) {
+            for (const auto& e : GCodeParser::parse(gcode).errors) {
+                if (e.text.find(part) != std::string::npos) return true;
+            }
+            return false;
+        };
+
+        assert(near(endOf("G21 G90\nG68 A0 B0 R90\nG1 X10 Y0 F500\n"), 0.0, 10.0));        // Counterclockwise
+        assert(near(endOf("G21 G90\nG68 A10 B10 R180\nG0 X20 Y10\n"), 0.0, 10.0));          // About (A, B)
+        assert(near(endOf("G21 G90\nG68 A0 B0 R90\nG0 X10\nG91\nG0 X5\n"), 0.0, 15.0));    // G91 moves turn too
+        assert(near(endOf("G21 G90\nG68 A0 B0 R90\nG0 X10\nG69\nG0 X10\n"), 10.0, 10.0));  // G69 cancels
+        assert(near(endOf("G21 G90\nG68 A0 B0 R45\nG68 I0 R45\nG0 X10\n"), 0.0, 10.0));    // I: relative angle
+        assert(near(endOf("G21 G90\nG68 A10 B0 R90\nG68 R180\nG0 X30 Y0\n"), -10.0, 0.0)); // Centre kept
+        assert(near(endOf("G20 G90\nG68 A1 B0 R180\nG0 X3 Y0\n"), -25.4, 0.0));            // Inches
+        assert(near(endOf("G21 G90\nG0 Z5\nG68 A0 B0 R90\nG81 X10 Y0 Z-1 R2 F100\nG80\n"), 0.0, 10.0)); // Drill hole
+
+        // Arcs: I/J offsets turn with the program, the end lands on the rotated point
+        {
+            const auto r = GCodeParser::parse("G21 G90\nG68 A0 B0 R90\nG0 X10 Y0\nG3 X0 Y10 I-10 J0 F500\n");
+            assert(!r.hasErrors());
+            assert(near(r.segments.back().end_xyza_mm, -10.0, 0.0));
+            for (const auto& s : r.segments) {
+                if (s.type == rnr::core::SegmentType::CutArcCCW) {
+                    assert(std::abs(std::hypot(s.end_xyza_mm[0], s.end_xyza_mm[1]) - 10.0) < 0.01);
+                }
+            }
+        }
+
+        // A Z-only move keeps X and Y exactly
+        {
+            const auto r = GCodeParser::parse("G21 G90\nG68 A0 B0 R30\nG0 X10 Y3\nG1 Z-1 F100\n");
+            const auto& a = r.segments[r.segments.size() - 2].end_xyza_mm;
+            const auto& b = r.segments.back().end_xyza_mm;
+            assert(a[0] == b[0] && a[1] == b[1] && b[2] == -1.0);
+        }
+
+        // G68's A, B and I words are not the A axis, an unsupported word or an arc offset
+        {
+            const auto r = GCodeParser::parse("G21 G90\nG68 A5 B5 I0 R30\nG1 X10 F500\nM30\n");
+            assert(!r.hasErrors() && r.warnings.empty());
+            for (const auto& s : r.segments) assert(s.end_xyza_mm[3] == 0.0);
+            rnr::core::MachineConfig cfg;
+            cfg.gantry_slave = rnr::core::GantrySlave::AFollowsX;
+            rnr::core::MachineCheckInput in;
+            in.frame.enabled = true;
+            const auto check = rnr::core::buildProgramCheck(std::make_shared<const rnr::gcode::ParseResult>(r), &cfg, in);
+            for (const auto& i : check.issues) assert(i.text.find("A moves") == std::string::npos);
+        }
+        assert(hasError("G21 G90\nG1 X10 B5 F500\n", "Unsupported word 'B'")); // B outside G68 is still an error
+
+        // Not supported: axis words on the G68 line, G92 while rotated, G18 / G19 arcs while rotated
+        assert(hasError("G21 G90\nG68 A0 B0 R10 X5\n", "G68 cannot be combined"));
+        assert(hasError("G21 G90\nG68 R10\nG92 X0\n", "G92 is not supported while G68"));
+        assert(hasError("G21 G90\nG18\nG68 R10\nG2 X10 Z0 I5 K0 F500\n", "G18/G19 is not supported while G68"));
+
+        // MDI: each command is parsed alone, so G68 is refused there
+        {
+            rnr::core::RnRController controller;
+            assert(controller.resetFromEStop());
+            assert(!controller.executeMdiCommand("G68 A0 B0 R30"));
+            assert(controller.getTelemetry().active_fault_message.find("G68") != std::string::npos);
+        }
+        std::cout << "  -> PASSED: G68 turns the programmed XY points about (A, B); G69 cancels.\n";
+    }
+
     std::cout << "\n====================================================\n";
-    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (49/49)\n";
+    std::cout << "ALL SCRIPT ENGINE UNIT TESTS PASSED SUCCESSFULLY! (51/51)\n";
     std::cout << "====================================================\n";
     return 0;
 }

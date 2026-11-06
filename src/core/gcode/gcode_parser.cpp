@@ -189,12 +189,25 @@ ParseResult GCodeParser::parse(
 
     double   feed_mm_min       = options.initial_feed_mm_min; // 0 = no F programmed yet
     bool     torch_on          = false;
+    size_t   spindle_on_line   = SIZE_MAX; // Last M3 / M4 not yet followed by M5
     uint8_t  out_mask          = 0;
     uint16_t current_tool      = 1;
     uint16_t selected_tool     = 1;
     uint16_t spindle_rpm       = 0; // 0 = not programmed (controller keeps the operator's speed)
     uint8_t  current_wcs       = 0; // 0=G54 .. 5=G59
     uint16_t tlo_tool          = core::kTloInherit; // G43 H<n> in effect (0 = G49)
+
+    // G68 coordinate rotation (Mach3: G68 A<x> B<y> R<degrees> [I]): programmed XY points turn about the centre
+    // (A, B) by R degrees, counterclockwise. The centre is in work coordinates before the rotation; G69 cancels.
+    bool   rot_active = false;
+    double rot_cx = 0.0, rot_cy = 0.0, rot_deg = 0.0;
+    double rot_cos = 1.0, rot_sin = 0.0;
+    auto rotateXY = [&](double& x, double& y, bool inverse) {
+        const double s = inverse ? -rot_sin : rot_sin;
+        const double dx = x - rot_cx, dy = y - rot_cy;
+        x = rot_cx + dx * rot_cos - dy * s;
+        y = rot_cy + dx * s + dy * rot_cos;
+    };
     bool     exact_stop        = false; // G61 / G61.1 in effect (G64 = constant velocity)
     double   corner_tolerance_mm = 0.0; // G64 P in effect, 0 = the machine setting
 
@@ -323,9 +336,12 @@ ParseResult GCodeParser::parse(
         int h_word = -1;
         // G64 P<tolerance> Q<...> on this block: these words are not a dwell or a peck depth
         bool is_g64 = false;
+        // G68 A<x> B<y> I R<deg>: on this block A is the rotation centre (not the A axis), I and R are not arc words
+        bool is_g68 = false;
         for (const auto& w : words) {
             if (w.letter == 'H') h_word = static_cast<int>(std::lround(w.value));
             if (w.letter == 'G' && static_cast<int>(std::round(w.value * 10.0)) == 640) is_g64 = true;
+            if (w.letter == 'G' && static_cast<int>(std::round(w.value * 10.0)) == 680) is_g68 = true;
         }
 
         // Pass 1: modal setup G-codes, M-codes, Feed (F), Spindle (S), Tool (T), Dwell (P)
@@ -435,7 +451,14 @@ ParseResult GCodeParser::parse(
                     case 150: // G15 Polar coordinates off
                     case 400: // G40 Cutter compensation off
                     case 500: // G50 Scaling off
+                    case 680: // G68 Coordinate rotation (applied after the words below are read)
+                        break;
                     case 690: // G69 Rotation off
+                        rot_active = false;
+                        rot_cx = rot_cy = rot_deg = 0.0;
+                        rot_cos = 1.0;
+                        rot_sin = 0.0;
+                        break;
                     case 940: // G94 Feed per minute
                         break;
                     case 410:
@@ -462,16 +485,19 @@ ParseResult GCodeParser::parse(
                     case 3: // M3 Torch / Spindle CW ON
                         if (!torch_on) ++result.pierce_count;
                         torch_on = true;
+                        spindle_on_line = line_idx;
                         out_mask |= core::OutputBit::OUT1_TorchOrSpindle;
                         out_mask &= ~core::OutputBit::OUT2_SpindleDir;
                         break;
                     case 4: // M4 Spindle CCW ON (laser: dynamic power)
                         if (!torch_on) ++result.pierce_count;
                         torch_on = true;
+                        spindle_on_line = line_idx;
                         out_mask |= (core::OutputBit::OUT1_TorchOrSpindle | core::OutputBit::OUT2_SpindleDir);
                         break;
                     case 5:  // M5 Spindle / Torch OFF
                         torch_on = false;
+                        spindle_on_line = SIZE_MAX; // Only M5 clears it: M2 / M30 still get the warning
                         out_mask &= ~(core::OutputBit::OUT1_TorchOrSpindle | core::OutputBit::OUT2_SpindleDir);
                         break;
                     case 2:  // M2 Program End
@@ -534,6 +560,8 @@ ParseResult GCodeParser::parse(
                 }
             } else if (w.letter == 'O' || w.letter == 'N' || w.letter == 'H' || w.letter == 'D' || w.letter == 'L') {
                 // Program number / line number / offset register words: no motion effect
+            } else if (w.letter == 'B' && is_g68) {
+                // G68 rotation centre Y, applied below
             } else if (std::string("XYZAIJKR").find(w.letter) == std::string::npos) {
                 addError(line_idx, std::string("Unsupported word '") + w.letter + "'");
             }
@@ -589,12 +617,53 @@ ParseResult GCodeParser::parse(
         bool has_r   = false;
         double arc_i = 0.0, arc_j = 0.0, arc_k = 0.0, arc_r = 0.0;
 
+        // With G68 active, X and Y words are read in the unrotated frame: the current position is turned back
+        // first, and the target is rotated once all words are read
+        if (rot_active) rotateXY(target_pos[0], target_pos[1], true);
+
         auto axisWord = [&](size_t a, double v) {
             raw_axis[a] = v * unit_scale;
-            target_pos[a] = absolute_xyz ? (raw_axis[a] + g92_shift[a]) : (cur_pos[a] + raw_axis[a]);
+            target_pos[a] = absolute_xyz ? (raw_axis[a] + g92_shift[a]) : (target_pos[a] + raw_axis[a]);
             axes_given |= static_cast<uint8_t>(1U << a);
             has_xyz = true;
         };
+
+        if (is_g68) {
+            // G68 A<x> B<y> R<deg>: words left out keep their last value; with an I word (its value is ignored)
+            // the given values are added to the current rotation, as in Mach3
+            bool has_i = false;
+            double a_val = 0.0, b_val = 0.0, r_val = 0.0;
+            bool has_a = false, has_b = false, has_rr = false;
+            for (const auto& w : words) {
+                if (w.letter == 'I') has_i = true;
+                if (w.letter == 'A') { a_val = w.value * unit_scale; has_a = true; }
+                if (w.letter == 'B') { b_val = w.value * unit_scale; has_b = true; }
+                if (w.letter == 'R') { r_val = w.value; has_rr = true; }
+                if (w.letter == 'X' || w.letter == 'Y' || w.letter == 'Z' || w.letter == 'J' || w.letter == 'K') {
+                    has_xyz = true;
+                }
+            }
+            if (has_xyz) {
+                addError(line_idx, "G68 cannot be combined with X, Y, Z, J or K on the same line");
+                continue;
+            }
+            if (has_i) {
+                rot_cx += a_val;
+                rot_cy += b_val;
+                rot_deg += r_val;
+            } else {
+                if (has_a) rot_cx = a_val + g92_shift[0];
+                if (has_b) rot_cy = b_val + g92_shift[1];
+                if (has_rr) rot_deg = r_val;
+            }
+            rot_active = true;
+            rot_cos = std::cos(rot_deg * kPi / 180.0);
+            rot_sin = std::sin(rot_deg * kPi / 180.0);
+            // No motion on this block, but an M0 / M30 on it still counts
+            if (is_program_stop) result.segments.push_back(baseSegment(core::SegmentType::ProgramStop, line_idx));
+            if (ends_program) program_ended = true;
+            continue;
+        }
 
         for (const auto& w : words) {
             switch (w.letter) {
@@ -615,12 +684,39 @@ ParseResult GCodeParser::parse(
             }
         }
 
+        if (rot_active) {
+            // Back to work coordinates: rotate the target, or keep the exact XY when neither X nor Y was given
+            if (axes_given & 0x03) {
+                rotateXY(target_pos[0], target_pos[1], false);
+            } else {
+                target_pos[0] = cur_pos[0];
+                target_pos[1] = cur_pos[1];
+            }
+            // Arc centres turn with the program: I/J offsets as vectors, G90.1 centres as points
+            if (has_ijk) {
+                if (ij_incremental) {
+                    const double i0 = arc_i, j0 = arc_j;
+                    arc_i = i0 * rot_cos - j0 * rot_sin;
+                    arc_j = i0 * rot_sin + j0 * rot_cos;
+                } else {
+                    double px = arc_i + g92_shift[0], py = arc_j + g92_shift[1];
+                    rotateXY(px, py, false);
+                    arc_i = px - g92_shift[0];
+                    arc_j = py - g92_shift[1];
+                }
+            }
+        }
+
         // G92.1 / G92.2: cancel coordinate offsets
         if (is_g92_clear) {
             g92_shift = {0.0, 0.0, 0.0, 0.0};
         }
 
         // G92: make the current position read as the given coordinates (no motion)
+        if (is_g92 && rot_active) {
+            addError(line_idx, "G92 is not supported while G68 rotation is active (use G69 first)");
+            continue;
+        }
         if (is_g92) {
             if (!has_xyz) {
                 addError(line_idx, "G92 requires at least one axis word");
@@ -762,7 +858,11 @@ ParseResult GCodeParser::parse(
             if (active_g_motion != 0 && feed_mm_min <= 0.0) {
                 addError(line_idx, "Feed move without a feed rate (F word)");
             }
-            if (active_g_motion == 2 || active_g_motion == 3) {
+            if ((active_g_motion == 2 || active_g_motion == 3) && rot_active && active_plane != 17) {
+                // A rotated XZ / YZ arc no longer lies in an axis plane
+                addError(line_idx, "G2/G3 in G18/G19 is not supported while G68 rotation is active (G17 only)");
+                cur_pos = target_pos;
+            } else if (active_g_motion == 2 || active_g_motion == 3) {
                 // Determine plane axes (u_axis, v_axis, w_axis) for G17 (XY), G18 (XZ), or G19 (YZ)
                 size_t u_ax = 0, v_ax = 1, w_ax = 2;
                 double off_u = arc_i, off_v = arc_j;
@@ -907,6 +1007,8 @@ ParseResult GCodeParser::parse(
             program_ended = true;
         }
     }
+
+    result.spindle_on_without_m5_line = spindle_on_line;
 
     // Use cutting bounding box if any cutting moves exist; otherwise use all moves bounding box
     if (!first_cut_pt) {

@@ -15,6 +15,7 @@ struct ParseResult;
 }
 
 namespace rnr::core {
+struct ProgramCheckResult; // core/controller/program_check.h
 
 // ============================================================================
 // System Units of Measurement (Metric vs Imperial)
@@ -770,6 +771,10 @@ public:
     // Immutable snapshot of the loaded program (segments, lines, bounds, diagnostics); never null.
     // Hold the returned pointer for as long as the data is used - a reload never invalidates it.
     virtual std::shared_ptr<const gcode::ParseResult> getProgram() const = 0;
+    // Every problem of the loaded program: parse errors and warnings, and the checks against the machine settings
+    // and state (homing, tool table, soft limits with the current offsets) that Cycle Start makes. Recomputed only
+    // when the program or one of these inputs changes; may be null (no check available).
+    virtual std::shared_ptr<const ProgramCheckResult> getProgramCheck() const = 0;
     virtual void startJob() = 0;
     virtual void pauseJob() = 0;
     virtual void stopJob() = 0;
