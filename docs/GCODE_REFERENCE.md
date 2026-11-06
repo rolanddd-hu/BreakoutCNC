@@ -5,6 +5,9 @@ The codes BreakoutMill and BreakoutCut accept, in loaded programs and in MDI. Th
 [`machine_controller.cpp`](../src/core/controller/machine_controller.cpp).
 
 A program with errors won't start: Cycle Start is refused until the errors are fixed. Warnings don't stop a program.
+Right after loading, the program panel lists every error and warning with its line, together with the checks against
+the machine that Cycle Start makes (soft limits, homing, tool table) and a few machine warnings, such as a feed above
+the motor settings. The checks are in [`program_check.cpp`](../src/core/controller/program_check.cpp).
 
 ## G codes
 
@@ -23,6 +26,8 @@ A program with errors won't start: Cycle Start is refused until the errors are f
 | G54–G59 | Work offsets | |
 | G61 / G61.1 | Exact stop | |
 | G64 [P\<tol\>] | Constant velocity | P sets corner tolerance, limited to 0.001–5 mm |
+| G68 A\<x\> B\<y\> R\<deg\> [I] | Rotate the program (Mach3 form) | See [G68 rotation](#g68-rotation) |
+| G69 | Cancel G68 rotation | |
 | G73 / G81 / G82 / G83 | Drilling cycles | High-speed peck, simple, dwell, deep peck; G90 only |
 | G80 | Cancel drilling cycle | |
 | G98 / G99 | Cycle return to initial Z / R plane | |
@@ -31,8 +36,23 @@ A program with errors won't start: Cycle Start is refused until the errors are f
 | G92 | Set coordinate offset | Needs at least one axis word |
 | G92.1 / G92.2 | Clear G92 offsets | Both behave the same; G92.2 doesn't suspend the offsets for later restore |
 
-**Accepted but do nothing:** G15, G40, G50, G69 and G94. These are the "off" or default states, so they are safe in
+**Accepted but do nothing:** G15, G40, G50 and G94. These are the "off" or default states, so they are safe in
 CAM preambles.
+
+### G68 rotation
+
+`G68 A<x> B<y> R<degrees>` turns every following X/Y point of the program about the centre (A, B) by R degrees,
+counterclockwise for a positive R, until `G69`. It works as in Mach3:
+
+- A and B are the X and Y of the centre (on a G68 line, A is not the A axis). R is the angle in degrees.
+- A word that is left out keeps its last value (at first 0, so `G68 R30` turns about the work zero).
+- With an I word (its value is ignored), the given A, B and R are added to the current rotation instead of replacing
+  it: `G68 I0 R15` turns 15 degrees further.
+- Incremental moves (G91), arc centres (I/J, also with G90.1) and drilling cycle positions turn with the program.
+  Z, the A axis and G53 / G28 machine moves are not rotated.
+
+These give an error: X, Y, Z, J or K on the G68 line itself, and G92 or arcs in G18 / G19 while a rotation is active.
+G68 is refused in MDI, because each MDI command is run on its own.
 
 **MDI only:** G10 L2 or L20 P1–P6 sets work offsets. In a program, it's an "Unsupported G-code" error.
 

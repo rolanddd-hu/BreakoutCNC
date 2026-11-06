@@ -3,6 +3,7 @@
 #include "core/board/board_driver.h"
 #include "core/gcode/gcode_parser.h"
 #include "core/planner/trajectory_planner.h"
+#include "core/controller/program_check.h"
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -112,6 +113,7 @@ public:
     bool executeMdiCommand(const std::string& gcode_line) override;
     void setNextGCodeLine(size_t line_index) override;
     std::shared_ptr<const gcode::ParseResult> getProgram() const override;
+    std::shared_ptr<const ProgramCheckResult> getProgramCheck() const override;
 
     void startJob() override;
     void pauseJob() override;
@@ -231,6 +233,20 @@ private:
     std::shared_ptr<const gcode::ParseResult> unwarped_program_; // As parsed
     std::shared_ptr<const std::string>        program_text_;     // Source of the loaded program
     bool                                      program_reparse_needed_ = false;
+    uint64_t                                  config_revision_ = 0; // Bumped on every settings change (program check cache)
+    // Program check cache (getProgramCheck): recomputed only when the program or one of its inputs changes
+    struct ProgramCheckKey {
+        const void*           program = nullptr;
+        planner::FrameContext frame{};
+        std::array<bool, 4>   homed{};
+        bool                  simulator = false;
+        uint64_t              config_revision = 0;
+        uint64_t              tool_revision = 0;
+        bool operator==(const ProgramCheckKey& o) const;
+    };
+    mutable std::mutex                                program_check_mutex_; // Taken after mutex_, never before
+    mutable std::shared_ptr<const ProgramCheckResult> program_check_;
+    mutable ProgramCheckKey                           program_check_key_;
     SurfaceHeightMap   surface_height_map_{};
     std::thread        surface_probing_thread_{};
     std::atomic<bool>  surface_probing_cancel_requested_{false};

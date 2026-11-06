@@ -143,6 +143,21 @@ Keyboard:
   double-click once the file type is associated). Large files load in the background ("Loading …" is shown).
 - When a file looks like it was made for a different machine type (for example a mill program in BreakoutCut), you
   are asked before it is loaded.
+- **Program check:** right after loading, a card above the listing shows every problem of the program, with its line.
+  The lines also get a dot at the right end of the row: hover it to read the message. Click a message to show its line.
+  The list scrolls when there are more than four messages. There are three kinds:
+  - **Errors** (red): codes the app does not support, broken arcs, feed moves without F. The program cannot run until
+    the file is fixed.
+  - **Cycle Start problems** (red): checks against your machine as it is now, the same ones Cycle Start makes: a move
+    outside the soft limits with the current work offset, machine coordinates (G53 / G28) on an axis that is not homed,
+    a tool without a length in tool table mode. They update by themselves: after homing, a new work zero or measuring
+    the tool, the message goes away.
+  - **Warnings** (yellow): the program runs, but not exactly as written, for example a feed above what the motors are
+    set to (the move runs slower), a spindle speed outside the VFD's range, a cut while the spindle is off, A moves
+    while A follows another axis, or an M3 / M4 that no M5 switches off later (M2 / M30 do not count).
+
+  When there are only warnings, the **×** in the top-right corner of the card clears them (the card and the dots go
+  away) until the program is loaded again. Errors and Cycle Start problems cannot be cleared.
 - **Edit File** opens it in your text editor. When the file changes on disk, it is reloaded automatically (not while
   cutting).
 - **Set Next Line**: select a line (double-click) to start or resume from there.
@@ -405,7 +420,7 @@ BreakoutCNC also accepts common Mach3 script calls (`Code`, `GetDRO`, `SetDRO`, 
 
 1. **Home** the machine (**HOME ALL**), if it has home switches.
 2. **Load** the program (Load File, drop it on the window, or open it with the app). Check the toolpath and the part
-   size (*Part Bounds*) in the view.
+   size (*Part Bounds*) in the view, and the program check card above the listing, if one is shown.
 3. **Set the work zero:** jog to the zero point of the workpiece and press **Zero X / Zero Y**. For Z, use **PROBE Z**
    with the touch plate (or jog down to the surface and press **Zero Z**).
 4. Check the spindle speed: most programs start the spindle themselves (`M3 S…`); the spindle slider and the

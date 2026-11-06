@@ -410,6 +410,7 @@ void MachineController::applyConfigLocked(const MachineConfig& cfg_in) {
     config_ = cfg;
     config_.workspace_revision  = revision;
     config_.tool_table_revision = tt_revision;
+    ++config_revision_;
 
     telemetry_.operation_mode       = cfg.operation_mode;
     telemetry_.workspace_offsets_mm = cfg.workspace_offsets_mm;
@@ -452,6 +453,7 @@ void MachineController::setHuanyangVfdConfig(const HuanyangVfdConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
     config_.vfd = config;
     if (config_.vfd.min_rpm > config_.vfd.max_rpm) config_.vfd.min_rpm = config_.vfd.max_rpm;
+    ++config_revision_;
     if (config.enabled && !vfd_controller_.isRunning()) {
         vfd_controller_.start(config_.vfd);
     } else if (!config.enabled && vfd_controller_.isRunning()) {
@@ -1295,6 +1297,7 @@ void MachineController::setOperationMode(OperationMode mode) {
         return;
     }
     config_.operation_mode = mode;
+    ++config_revision_;
     telemetry_.operation_mode = mode;
 }
 
@@ -2327,6 +2330,11 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
         for (const auto& w : words) if (w.letter == letter) { out = w.value; return true; }
         return false;
     };
+    // Each MDI command is parsed on its own, so a rotation would not reach the next command
+    if (hasG(68)) {
+        telemetry_.active_fault_message = "MDI rejected: G68 rotation works only inside a program";
+        return false;
+    }
     const double unit_scale = hasG(20) || hasG(70) ? 25.4 : 1.0;
     const bool laser = (config_.operation_mode == OperationMode::Laser && !config_.is_mill);
 
@@ -2606,78 +2614,60 @@ bool MachineController::validateProgramForRunLocked(size_t start_seg) {
         telemetry_.active_fault_message = "Cannot start: program has errors. " + prog.firstErrorText();
         return false;
     }
-    if (!telemetry_.simulator_mode && config_.require_homing) {
-        for (size_t a = 0; a < 4; ++a) {
-            if (((prog.machine_axes_used >> a) & 1U) && !telemetry_.axis_homed[a]) {
-                telemetry_.active_fault_message = std::string("Cannot start: the program uses machine coordinates (G53/G28) on ") +
-                                                  kAxisNames[a] + ", which is not homed. Home the machine first, or turn off "
-                                                  "\"Require homing\" for a machine without home switches.";
-                return false;
-            }
-        }
-    }
-
-    if (config_.tool_table.mode == ToolLengthMode::ToolTable) {
-        // Every G43 H<n> must have a measured length, and after every tool change the program must
-        // select that tool's offset (otherwise the previous tool's length would still be applied).
-        const auto& tools = config_.tool_table.tools;
-        bool expect_tlo_after_change = false;
-        uint16_t changed_to = 0;
-        size_t change_line = 0;
-        for (size_t i = start_seg; i < prog.segments.size(); ++i) {
-            const auto& seg = prog.segments[i];
-            if (seg.tlo_tool != kTloInherit && seg.tlo_tool != 0 && tools.find(seg.tlo_tool) == tools.end()) {
-                telemetry_.active_fault_message = "Cannot start: line " + std::to_string(seg.gcode_line + 1) +
-                    " uses G43 H" + std::to_string(seg.tlo_tool) + ", but T" + std::to_string(seg.tlo_tool) +
-                    " has no length in the tool table";
-                return false;
-            }
-            if (seg.type == SegmentType::ToolChange && config_.tool_change.mode != ToolChangeMode::IgnoreM6) {
-                expect_tlo_after_change = true;
-                changed_to  = seg.tool_number;
-                change_line = seg.gcode_line;
-                continue;
-            }
-            const bool is_motion = seg.type == SegmentType::RapidMove || seg.type == SegmentType::CutLinear ||
-                                   seg.type == SegmentType::CutArcCW || seg.type == SegmentType::CutArcCCW;
-            if (expect_tlo_after_change && is_motion && seg.machine_axes_mask == 0) {
-                if (seg.tlo_tool != changed_to) {
-                    telemetry_.active_fault_message = "Cannot start: the tool change to T" + std::to_string(changed_to) +
-                        " on line " + std::to_string(change_line + 1) + " is not followed by G43 H" +
-                        std::to_string(changed_to) + " (required in tool table mode)";
-                    return false;
-                }
-                expect_tlo_after_change = false;
-            }
-        }
-    }
-
-    bool any_soft = false;
-    for (size_t a = 0; a < 4; ++a) {
-        if (config_.axes[a].soft_limits_enabled && telemetry_.axis_homed[a]) any_soft = true;
-    }
-    if (!any_soft) return true;
-
-    // Every programmed point must lie inside the soft limits (checked before any motion starts)
-    const auto frame = jobFrameLocked();
-    const auto& plan_off = frame.workspace_offsets[frame.plan_workspace];
-    for (size_t i = start_seg; i < prog.segments.size(); ++i) {
-        const auto& seg = prog.segments[i];
-        if (seg.type != SegmentType::RapidMove && seg.type != SegmentType::CutLinear &&
-            seg.type != SegmentType::CutArcCW && seg.type != SegmentType::CutArcCCW) {
-            continue;
-        }
-        const auto t = planner::TrajectoryPlanner::transformTarget(seg, frame);
-        std::array<double, 4> m{};
-        for (size_t a = 0; a < 4; ++a) m[a] = t[a] + plan_off[a];
-        std::string err;
-        if (!withinSoftLimitsLocked(m, &err)) {
-            telemetry_.active_fault_message = "Cannot start: line " + std::to_string(seg.gcode_line + 1) +
-                                              " exceeds soft limits (" + err + ")";
-            return false;
-        }
+    // Homing, tool table and soft limits: the same checks the program panel lists after loading
+    MachineCheckInput in;
+    in.frame            = jobFrameLocked();
+    in.homed            = telemetry_.axis_homed;
+    in.simulator        = telemetry_.simulator_mode;
+    in.start_segment    = start_seg;
+    in.include_warnings = false;
+    const auto check = checkProgramAgainstMachine(prog, config_, in);
+    if (!check.start_refusal.empty()) {
+        telemetry_.active_fault_message = check.start_refusal;
+        return false;
     }
     return true;
+}
+
+std::shared_ptr<const ProgramCheckResult> MachineController::getProgramCheck() const {
+    std::shared_ptr<const gcode::ParseResult> prog;
+    MachineCheckInput in;
+    ProgramCheckKey key;
+    MachineConfig cfg;
+    {
+        const auto wait_start = Clock::now();
+        std::lock_guard<std::mutex> lock(mutex_);
+        diag::controllerReadWait().add(Clock::now() - wait_start);
+        prog         = program_;
+        in.frame     = jobFrameLocked();
+        in.homed     = telemetry_.axis_homed;
+        in.simulator = telemetry_.simulator_mode;
+        key.program          = prog.get();
+        key.frame            = in.frame;
+        key.homed            = in.homed;
+        key.simulator        = in.simulator;
+        key.config_revision  = config_revision_;
+        key.tool_revision    = config_.tool_table_revision;
+        {
+            std::lock_guard<std::mutex> check_lock(program_check_mutex_);
+            if (program_check_ && key == program_check_key_) return program_check_;
+        }
+        cfg = config_;
+    }
+    // Only when the program or one of its inputs changed: a pass over the segments, outside the controller lock
+    auto result = std::make_shared<const ProgramCheckResult>(buildProgramCheck(prog, &cfg, in));
+    std::lock_guard<std::mutex> check_lock(program_check_mutex_);
+    program_check_     = result;
+    program_check_key_ = key;
+    return result;
+}
+
+bool MachineController::ProgramCheckKey::operator==(const ProgramCheckKey& o) const {
+    return program == o.program && homed == o.homed && simulator == o.simulator &&
+           config_revision == o.config_revision && tool_revision == o.tool_revision &&
+           frame.enabled == o.frame.enabled && frame.workspace_offsets == o.frame.workspace_offsets &&
+           frame.plan_workspace == o.frame.plan_workspace && frame.apply_tool_lengths == o.frame.apply_tool_lengths &&
+           frame.tool_lengths == o.frame.tool_lengths && frame.inherit_tlo_mm == o.frame.inherit_tlo_mm;
 }
 
 void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bool resume_in_place) {

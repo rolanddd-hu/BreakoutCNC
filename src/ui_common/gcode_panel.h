@@ -1,6 +1,8 @@
 #pragma once
 #include "core/controller/motion_controller.h"
 #include "core/gcode/gcode_parser.h"
+#include "core/controller/program_check.h"
+#include <memory>
 #include <string>
 #include <functional>
 #include <filesystem>
@@ -148,6 +150,20 @@ private:
     bool        has_file_line_numbers_ = false;
     float line_num_col_w_ = 62.0f;
     void updateLineNumberCache(const std::vector<std::string>& gcode_lines);
+
+    // Program check: every problem of the loaded program (parse errors and warnings, plus the Cycle Start checks
+    // against the machine). Taken from the controller each frame (cached there); parse-only when it has none.
+    std::shared_ptr<const core::ProgramCheckResult> check_;
+    std::shared_ptr<const core::ProgramCheckResult> parse_only_check_;
+    void updateProgramCheck(core::IMotionController& controller, const std::shared_ptr<const gcode::ParseResult>& program);
+    void renderProgramDiagnostics(bool is_running);
+    // Issues on one line (check_->issues is sorted by line): [first, last)
+    std::pair<size_t, size_t> issuesOnLine(size_t line) const;
+    float diag_list_content_h_ = 0.0f; // Height of the message list last frame (it scrolls above a maximum)
+    float diag_card_h_ = 0.0f;         // Height of the whole program check card last frame (0 = not shown)
+    // "Clear warnings": the program whose warnings were cleared (they show again for a new or re-loaded program)
+    std::weak_ptr<const gcode::ParseResult> cleared_warnings_program_;
+    bool warnings_cleared_ = false; // This frame: the card is hidden and warning markers are not drawn
 };
 
 } // namespace rnr::ui

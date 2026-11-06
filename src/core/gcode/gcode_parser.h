@@ -27,6 +27,7 @@ struct ParseResult {
     std::vector<ParseMessage>          warnings;
     // Axes moved in machine coordinates (G53 / G28 / G30): these axes must be homed before running.
     uint8_t                            machine_axes_used     = 0;
+    size_t                             spindle_on_without_m5_line = SIZE_MAX; // Last M3 / M4 with no M5 after it
 
     bool hasErrors() const noexcept { return !errors.empty(); }
     std::string firstErrorText() const {
@@ -72,7 +73,8 @@ public:
     // Mach3-style G-code parser:
     // Supports G0/G1/G2/G3 (IJK & R arcs in G17/G18/G19, G90.1/G91.1), G4, G20/G21/G70/G71,
     // G28/G30/G53 (machine coordinates), G40/G49, G54..G59, Canned Drilling Cycles (G73/G81/G82/G83/G80/G98/G99),
-    // G90/G91, G92/G92.1, M0/M1 (program stop), M3/M4/M5/M6 (T#)/M7/M8/M9/M2/M30, F and S words.
+    // G68 A B R [I] / G69 (Mach3 coordinate rotation), G90/G91, G92/G92.1, M0/M1 (program stop),
+    // M3/M4/M5/M6 (T#)/M7/M8/M9/M2/M30, F and S words.
     // Anything else that would change the toolpath (G41/G42, G93/G95, other cycles, expressions,
     // subprograms, invalid arcs, feed moves without F) is reported in ParseResult::errors.
     // G43 H<n> / G49 are recorded per segment (ToolpathSegment::tlo_tool); the controller applies them
