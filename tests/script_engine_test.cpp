@@ -291,6 +291,10 @@ public:
         std::lock_guard<std::mutex> l(m_);
         pending_.push_back(slice);
         max_in_flight_ = std::max(max_in_flight_, pending_.size());
+        // A real board runs each slice for 25 ms: track how far ahead of real time the sender gets
+        const auto now = std::chrono::steady_clock::now();
+        busy_until_ = std::max(now, busy_until_) + std::chrono::milliseconds(25);
+        max_lead_ = std::max(max_lead_, busy_until_ - now);
         ++seq_;
         if (out_seq) *out_seq = seq_;
         return true;
@@ -300,9 +304,19 @@ public:
     int32_t steps(size_t axis) const { std::lock_guard<std::mutex> l(m_); return steps_[axis]; }
     uint8_t lastOutputs() const { std::lock_guard<std::mutex> l(m_); return outputs_; }
     size_t maxInFlight() const { std::lock_guard<std::mutex> l(m_); return max_in_flight_; }
+    double maxLeadMs() const { std::lock_guard<std::mutex> l(m_); return std::chrono::duration<double, std::milli>(max_lead_).count(); }
+    // Commands in the order received, consecutive slices merged into one "slices" entry
+    std::vector<std::string> events() const { std::lock_guard<std::mutex> l(m_); return events_; }
+    void clearEvents() { std::lock_guard<std::mutex> l(m_); events_.clear(); }
 
 private:
-    void log(const std::string& what) { std::lock_guard<std::mutex> l(m_); ++calls_[what]; }
+    void log(const std::string& what) {
+        std::lock_guard<std::mutex> l(m_);
+        ++calls_[what];
+        const bool slice = what.rfind("slice_", 0) == 0;
+        if (!(slice && !events_.empty() && events_.back() == "slices")) events_.push_back(slice ? "slices" : what);
+    }
+    std::vector<std::string> events_;
 
     mutable std::mutex m_;
     bool open_ = false;
@@ -310,6 +324,8 @@ private:
     std::array<int32_t, 4> steps_{};
     std::vector<rnr::core::StepSlice> pending_;
     size_t max_in_flight_ = 0;
+    std::chrono::steady_clock::time_point busy_until_{};
+    std::chrono::steady_clock::duration max_lead_{};
     uint8_t outputs_ = 0;
     std::map<std::string, int> calls_;
 };
@@ -2665,6 +2681,13 @@ int main() {
 
             assert(waitUntil([&] { return mc.resetFromEStop(); })); // After the first board report
             assert(fb->count("clear_estop") == 1);
+            // The reset puts the board on its default timing: the configuration is sent again after the clear
+            assert(fb->count("configure") == 2);
+            {
+                const auto ev = fb->events();
+                const auto clr = std::find(ev.begin(), ev.end(), "clear_estop");
+                assert(clr != ev.end() && std::find(clr, ev.end(), "configure") != ev.end());
+            }
 
             // Jog: internal slices only, the board ends exactly at the commanded position
             mc.jogStep(rnr::core::Axis::X, 5.0, 600.0);
@@ -2706,14 +2729,56 @@ int main() {
                 assert((fb->lastOutputs() & 0x0F) == 0x00 && mc.getTelemetry().outputs_bitmask == 0);
             }
 
-            // A G-code job streams program slices
-            assert(mc.loadGCodeString("G90 G21\nG1 X10 Y-4 F900\nG0 X0 Y0\n"));
+            // A G-code job streams internal slices (the board holds G-code slices back for seconds), armed
+            // like an MDI move, with outputs also set by explicit commands when they change (M8 / M9)
+            // Each run goes like an MDI move: outputs set at rest, Start Continuous Jog, slices, End of Motion.
+            const int internal0 = fb->count("slice_internal");
+            fb->clearEvents();
+            assert(mc.loadGCodeString("G90 G21\nG1 X10 Y-4 F900\nM8\nG0 X0 Y0\nM9\nG1 X1 F900\nG0 X0\n"));
             mc.startJob();
             std::this_thread::sleep_for(std::chrono::milliseconds(60));
             assert(waitIdle(mc));
-            assert(fb->count("slice_program") > 0);
+            assert(fb->count("slice_program") == 0 && fb->count("slice_internal") > internal0);
+            assert((fb->lastOutputs() & rnr::core::OutputBit::OUT3_FloodCoolant) == 0);
+            {
+                const auto ev = fb->events();
+                int runs = 0;
+                for (size_t k = 0; k < ev.size(); ++k) {
+                    if (ev[k] != "begin_jog") continue;
+                    ++runs;
+                    // Slices follow the Start Continuous Jog, never an outputs command in between
+                    assert(k + 1 < ev.size() && ev[k + 1] == "slices");
+                    // Before it: outputs set (at rest), or the previous run closed by End of Motion
+                    assert(k > 0 && (ev[k - 1] == "outputs" || ev[k - 1] == "outputs_after"));
+                }
+                assert(runs >= 3); // Start, after M8, after M9
+                for (size_t k = 1; k < ev.size(); ++k) {
+                    // Outputs never change in the middle of a run: a run is closed first
+                    if (ev[k] == "outputs" && ev[k - 1] == "slices") assert(false);
+                }
+                assert(ev.back() == "outputs_after"); // The job ends with End of Motion
+            }
             assert(fb->steps(0) == 0 && fb->steps(1) == 0);
             assert(fb->maxInFlight() <= 2); // Never more than the board's buffer (capabilities: 2)
+            // The board acknowledges slices at once here: the sender must still pace them in real time, at most
+            // about max_slices_in_flight (2) slices ahead of the board, or motion runs behind the app
+            std::cout << "  max lead of the slice stream: " << fb->maxLeadMs() << " ms\n";
+            assert(fb->maxLeadMs() <= 2 * 25.0 + 25.0 + 1.0);
+
+            // M30 switches the coolant off at the end of the job (as in Mach3); without M2 / M30 it stays on
+            assert(mc.loadGCodeString("G90 G21\nM8\nG1 X2 F900\nG0 X0\nM30\n"));
+            mc.startJob();
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            assert(waitIdle(mc));
+            assert((fb->lastOutputs() & rnr::core::OutputBit::OUT3_FloodCoolant) == 0);
+            assert((mc.getTelemetry().outputs_bitmask & rnr::core::OutputBit::OUT3_FloodCoolant) == 0);
+            assert(mc.loadGCodeString("G90 G21\nM8\nG1 X2 F900\nG0 X0\n"));
+            mc.startJob();
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            assert(waitIdle(mc));
+            assert((fb->lastOutputs() & rnr::core::OutputBit::OUT3_FloodCoolant) != 0);
+            assert(mc.executeMdiCommand("M9"));
+            assert(waitUntil([&] { return (fb->lastOutputs() & rnr::core::OutputBit::OUT3_FloodCoolant) == 0; }));
 
             // E-Stop reaches the board
             const int estops = fb->count("estop");
@@ -2721,7 +2786,7 @@ int main() {
             assert(fb->count("estop") > estops);
         }
         assert(closed->load()); // The core closes the board on shutdown
-        std::cout << "  -> PASSED: connect, reset, jog, outputs, job streaming, slice budget and E-Stop all go through the driver.\n";
+        std::cout << "  -> PASSED: connect, reset, jog, outputs, job streaming (internal slices, armed, outputs synced), slice budget and E-Stop all go through the driver.\n";
     }
 
     {
@@ -3410,8 +3475,11 @@ int main() {
         assert(run("G21 G90\nG0 X10 Y10\nG1 X20 F500\nM30\n", &base, in).issues.empty());
         assert(run("G21 G90\nG0 X10 Y10\nG1 X20 F500\n", &base, in).issues.empty());
         assert(run("G21 G90\nM3\nG1 X20 F500\nM5\nM30\n", &base, in).issues.empty());
+        // M2 / M30 switch the spindle off as well
+        assert(run("G21 G90\nM3\nG1 X20 F500\nM5\nM4\nG1 X0\nM30\n", &base, in).issues.empty());
+        assert(run("G21 G90\nM3\nG1 X20 F500\nM2\n", &base, in).issues.empty());
         {
-            const auto r = run("G21 G90\nM3\nG1 X20 F500\nM5\nM4\nG1 X0\nM30\n", &base, in); // M30 does not count
+            const auto r = run("G21 G90\nM3\nG1 X20 F500\nM5\nM4\nG1 X0\n", &base, in);
             assert(r.warning_count == 1 && r.issues.size() == 1);
             const auto* w = find(r, ProgramIssueKind::Warning, "M3 / M4 is not followed by M5");
             assert(w && w->line == 4 && w->text.find("torch") != std::string::npos);
@@ -3501,9 +3569,19 @@ int main() {
             assert(find(r, ProgramIssueKind::Warning, "S1000 is below the VFD's minimum speed (6000 RPM)"));
 
             cfg.vfd.enabled = false;
-            const auto r2 = run("G21 G90\nG1 X10 F500\nM3 S10000\nG1 X20\nM5\nM30\n", &cfg, in);
-            const auto* w = find(r2, ProgramIssueKind::Warning, "spindle is off");
-            assert(r2.warning_count == 1 && w && w->line == 1);
+            // Feed moves at or above work Z0 with the spindle off (clearance height, positioning) are fine
+            const auto r2 = run("G21 G90\nG1 Z5 F2400\nG1 X10 Z0\nM3 S10000\nG1 Z-1\nG1 X20\nM5\nM30\n", &cfg, in);
+            assert(!find(r2, ProgramIssueKind::Warning, "spindle is off"));
+
+            // A plunge below Z0 before M3 warns once, on the plunge
+            const auto r3 = run("G21 G90\nG1 Z5 F500\nG1 Z-1\nG1 X10\nM3 S10000\nG1 X20\nM5\nM30\n", &cfg, in);
+            const auto* w = find(r3, ProgramIssueKind::Warning, "spindle is off");
+            assert(r3.warning_count == 1 && w && w->line == 2);
+
+            // A sideways feed that starts below Z0 (after a rapid down) warns too
+            const auto r4 = run("G21 G90\nG0 Z-1\nG1 X10 F500\nM3 S10000\nM5\nM30\n", &cfg, in);
+            const auto* w4 = find(r4, ProgramIssueKind::Warning, "spindle is off");
+            assert(w4 && w4->line == 2);
         }
 
         // A slaved A motor: programmed A moves are not made

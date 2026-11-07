@@ -153,8 +153,8 @@ Keyboard:
     a tool without a length in tool table mode. They update by themselves: after homing, a new work zero or measuring
     the tool, the message goes away.
   - **Warnings** (yellow): the program runs, but not exactly as written, for example a feed above what the motors are
-    set to (the move runs slower), a spindle speed outside the VFD's range, a cut while the spindle is off, A moves
-    while A follows another axis, or an M3 / M4 that no M5 switches off later (M2 / M30 do not count).
+    set to (the move runs slower), a spindle speed outside the VFD's range, a cut below Z0 while the spindle is off, A moves
+    while A follows another axis, or an M3 / M4 that no M5, M2 or M30 switches off later.
 
   When there are only warnings, the **×** in the top-right corner of the card clears them (the card and the dots go
   away) until the program is loaded again. Errors and Cycle Start problems cannot be cleared.
@@ -521,8 +521,8 @@ stream it (`http://<pc>:8080/stream` by default) together with the job state and
 | Slow on an older PC | Raise **Detail** in the toolpath toolbar; press F12 to see where the time goes. |
 
 **Reporting a problem:** tick **Diagnostics** in the bottom-right corner. The report window shows the version, OS,
-graphics, board state and a few key settings (no file paths or serial numbers); press **Copy to clipboard** and paste
-it into a [new issue](https://github.com/rolanddd-hu/BreakoutCNC/issues/new/choose).
+graphics, window size and position, board state and a few key settings (no file paths or serial numbers); press
+**Copy to clipboard** and paste it into a [new issue](https://github.com/rolanddd-hu/BreakoutCNC/issues/new/choose).
 
 ![Diagnostics report](images/guide/diagnostics.png)
 

@@ -50,6 +50,12 @@ acknowledgements by the sequence number `sendSlice()` returns.
 | `armHomeSwitchStop` / `armProbe` | Next slices stop on the home switch / probe and latch positions | 0x0D / 0x0C |
 | `sendSlice(Program or Internal)` | Queue one slice | 0x04 / 0x05 |
 
+The core currently sends every slice as `Internal`, program motion included, in MDI-style runs: `setOutputs` while
+the board is at rest, `beginJog`, slices, `setOutputsAfterMotion` when the board has run out of slices. The RNR
+board acknowledges a slice once it is buffered, so the core also paces slices in real time: never more than
+`max_slices_in_flight` slices (75 ms) of motion ahead of what the board can have run. `configure` is sent again
+after `clearEmergencyStop`.
+
 Rules a driver must follow:
 
 - **Safety first.** `emergencyStop()` must stop motion at once and must work even if the board is in an

@@ -248,15 +248,20 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
         }
     }
 
-    // BreakoutMill: cutting before the program starts the spindle
+    // BreakoutMill: cutting before the program starts the spindle. Only feed moves below work Z0 count (Z0 is
+    // normally the top of the stock): a feed to a clearance height or an XY move above the stock cuts nothing.
+    // With Z0 on the bed this never warns, which is a missed warning rather than a false one.
     if (cfg.is_mill) {
+        constexpr double kBelowZ0 = -1e-6;
         for (size_t i = in.start_segment; i < segs.size(); ++i) {
             const auto& s = segs[i];
             if (s.type == SegmentType::ToolChange) continue;
-            if (isFeedMove(s) && s.machine_axes_mask == 0 && !(s.outputs_mask & OutputBit::OUT1_TorchOrSpindle)) {
+            const bool below_z0 = std::min(s.start_xyza_mm[2], s.end_xyza_mm[2]) < kBelowZ0;
+            if (isFeedMove(s) && below_z0 && s.machine_axes_mask == 0 &&
+                !(s.outputs_mask & OutputBit::OUT1_TorchOrSpindle)) {
                 out.warnings.push_back({ProgramIssueKind::Warning, s.gcode_line,
-                                        "Feed move while the spindle is off (no M3 / M4 in effect). Start the "
-                                        "spindle by hand if the app does not control it."});
+                                        "Feed move below Z0 while the spindle is off (no M3 / M4 in effect). Start "
+                                        "the spindle by hand if the app does not control it."});
                 break;
             }
         }
@@ -277,13 +282,13 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
         }
     }
 
-    // M3 / M4 without a later M5: the program never switches the spindle (torch, laser) off itself
+    // M3 / M4 without a later M5, M2 or M30: the program never switches the spindle (torch, laser) off itself
     if (prog.spindle_on_without_m5_line < prog.lines.size()) {
         const char* what = cfg.is_mill ? "spindle"
                            : (cfg.operation_mode == OperationMode::Laser) ? "laser" : "torch";
         out.warnings.push_back({ProgramIssueKind::Warning, prog.spindle_on_without_m5_line,
-                                std::string("M3 / M4 is not followed by M5: the program does not switch the ") + what +
-                                    " off."});
+                                std::string("M3 / M4 is not followed by M5, M2 or M30: the program does not switch the ") +
+                                    what + " off (the app does when the program ends)."});
     }
     return out;
 }

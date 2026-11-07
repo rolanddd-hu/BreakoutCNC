@@ -199,6 +199,8 @@ bool MachineController::connect() {
     hw_estop_fault_       = false;
     hw_limit_fault_       = false;
     in_flight_seqs_.clear();
+    program_run_open_     = false;
+    program_outputs_sent_ = 0xFFFF;
 
     telemetry_.limit_switch_triggered = false;
     telemetry_.soft_limit_triggered   = false;
@@ -579,7 +581,15 @@ bool MachineController::resetFromEStop() {
 
     if (board_->isOpen() && hw) {
         board_->clearEmergencyStop();
+        // The Pre-Reset in clearEmergencyStop() puts the board back on its default timing: without a new
+        // configuration it ran our 25 ms slices jerkily until any setting (such as the pulse rate) was changed.
+        // The Mach3 plugin also re-sends its configuration after the clear. The step counters survive a reset,
+        // and after an E-stop mid-move the board's counters are more accurate than our commanded position, so
+        // they are not overwritten here.
+        board_->configure(config_, false);
     }
+    program_run_open_     = false;
+    program_outputs_sent_ = 0xFFFF;
     telemetry_.limit_switch_triggered = false;
     telemetry_.soft_limit_triggered   = false;
     telemetry_.active_fault_message.clear();
@@ -1227,7 +1237,51 @@ bool MachineController::sendBoardSliceLocked(board::SliceStream stream, const co
                                              bool limit_override, uint16_t* out_seq) {
     core::StepSlice phys = slice;
     phys.outputs_mask = io::physicalOutputs(config_.io, slice.outputs_mask);
-    return board_->sendSlice(stream, phys, limit_override, out_seq);
+    if (!board_->sendSlice(stream, phys, limit_override, out_seq)) return false;
+    const auto now = Clock::now();
+    board_busy_until_ = std::max(now, board_busy_until_) + kTickInterval;
+    return true;
+}
+
+bool MachineController::boardBufferFullLocked() const {
+    // Keep at most max_slices_in_flight_ slices (75 ms) of motion ahead of the board. An acknowledgement only
+    // means the board has buffered a slice: pacing by acknowledgements alone let the app run up to 3x real time
+    // ahead until the board's buffer was full, so programs and feed holds ran 3-4 s behind the app.
+    const auto lead = kTickInterval * static_cast<int>(max_slices_in_flight_);
+    return board_busy_until_ > Clock::now() + lead - kTickInterval / 2;
+}
+
+bool MachineController::prepareProgramRunLocked(uint8_t outputs_mask, bool arm) {
+    // The board is at rest: every slice acknowledged, and the board has had time to run every slice sent
+    // (plus 50 ms). The motion flag is not used: it may stay set while a run is open.
+    const bool at_rest = in_flight_seqs_.empty() && (Clock::now() > board_busy_until_ + 2 * kTickInterval);
+    // Ran out of slices (spindle wait, pause, tool change): end that run like a finished MDI move
+    if (program_run_open_ && at_rest) {
+        closeProgramRunLocked();
+    }
+    if (program_outputs_sent_ != outputs_mask) {
+        // The planner stops at every outputs change, so this only waits for the last slices to run
+        if (!at_rest) return false;
+        setBoardOutputsLocked(outputs_mask, config_.limit_override);
+        program_outputs_sent_ = outputs_mask;
+    }
+    if (!arm) return false;
+    if (!program_run_open_) {
+        if (!at_rest) return false;
+        board_->beginJog(Axis::X, config_.limit_override);
+        program_run_open_ = true;
+    }
+    return true;
+}
+
+void MachineController::closeProgramRunLocked() {
+    if (!program_run_open_) return;
+    program_run_open_ = false;
+    if (board_->isOpen() && !telemetry_.simulator_mode) {
+        const uint8_t mask = (program_outputs_sent_ <= 0xFF) ? static_cast<uint8_t>(program_outputs_sent_)
+                                                            : telemetry_.outputs_bitmask;
+        setBoardOutputsAfterMotionLocked(mask, config_.limit_override);
+    }
 }
 
 void MachineController::setSpindlePwm(uint16_t duty) {
@@ -3138,6 +3192,8 @@ void MachineController::stopJobLocked(bool is_estop) {
     if (hw) {
         board_->cancelMotion();
     }
+    program_run_open_     = false; // Cancel ends any open run
+    program_outputs_sent_ = 0xFFFF;
 
     if (is_estop) {
         // Immediate hard cut-off of every output on E-Stop
@@ -3827,9 +3883,13 @@ bool MachineController::sendQueuedSliceLocked() {
         return true;
     }
     uint16_t assigned_seq = 0;
-    // A feed-hold deceleration of a job stays on the G-code stream
+    // A feed-hold deceleration of a job counts as program motion
     const bool gcode_stream = is_job || (next_slice.is_hold_decel && telemetry_.state == ControllerState::PausedHold);
-    const auto stream = gcode_stream ? board::SliceStream::Program : board::SliceStream::Internal;
+    // Program slices are sent as internal motion slices, like MDI moves and jogs (runMotionTickLocked prepares
+    // the run with prepareProgramRunLocked). The board holds the G-code slice stream (Opcode 0x04) back until
+    // several seconds of it are queued: the motors ran 3-4 s behind the app, and a feed hold or override took
+    // that long to act. Internal slices run as they arrive, within max_slices_in_flight_ (75 ms) of the app.
+    const auto stream = board::SliceStream::Internal;
     if (!sendBoardSliceLocked(stream, next_slice.slice, config_.limit_override, &assigned_seq)) {
         faultLocked("USB WRITE FAILED WHILE STREAMING MOTION");
         return false;
@@ -3880,6 +3940,11 @@ void MachineController::finishQueueLocked() {
         telemetry_.spindle_ramping_down = true;
     }
     if (telemetry_.state == ControllerState::RunningGCode || telemetry_.state == ControllerState::DwellPierce) {
+        if (program_->ends_with_program_end) {
+            // M2 / M30: coolant and spindle direction off as well (the spindle is switched off above)
+            telemetry_.outputs_bitmask &= ~(core::OutputBit::OUT2_SpindleDir | core::OutputBit::OUT3_FloodCoolant |
+                                            core::OutputBit::OUT4_MistCoolant);
+        }
         telemetry_.active_segment_index    = program_->segments.size();
         telemetry_.segment_progress_0_to_1 = 1.0f;
         last_sent_program_segment_valid_   = false;
@@ -3895,6 +3960,8 @@ void MachineController::finishQueueLocked() {
     if (hw) {
         setBoardOutputsAfterMotionLocked(telemetry_.outputs_bitmask, config_.limit_override);
     }
+    program_run_open_     = false; // The End of Motion above closes a program run as well
+    program_outputs_sent_ = 0xFFFF;
     telemetry_.state = (telemetry_.pending_tool_number > 0) ? ControllerState::ToolChangeHold : ControllerState::Idle;
 }
 
@@ -3931,12 +3998,14 @@ void MachineController::runMotionTickLocked(bool gcode_running) {
         const auto& front = slice_queue_.front();
         const bool front_requires_spindle = (front.slice.outputs_mask & core::OutputBit::OUT1_TorchOrSpindle) != 0;
         const bool job_now = (telemetry_.state == ControllerState::RunningGCode || telemetry_.state == ControllerState::DwellPierce);
+        const bool program_slice = job_now || (front.is_hold_decel && telemetry_.state == ControllerState::PausedHold);
 
         // Plasma: wait for Arc OK before moving once the torch is lit
         if (job_now && !config_.is_mill && config_.operation_mode == OperationMode::Plasma &&
             config_.thc.enabled && config_.thc.wait_for_arc_ok &&
             telemetry_.torch_or_spindle_on && front_requires_spindle && !telemetry_.thc_arc_ok_active) {
             telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
+            if (hw) prepareProgramRunLocked(front.slice.outputs_mask, false); // Light the torch
             break;
         }
         // Mill: do not cut until the spindle is at speed (or has spun down before M5/M6)
@@ -3945,8 +4014,13 @@ void MachineController::runMotionTickLocked(bool gcode_running) {
             telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
             telemetry_.active_segment_index    = front.segment_index;
             telemetry_.active_gcode_line_index = front.gcode_line;
+            if (hw) prepareProgramRunLocked(front.slice.outputs_mask, false); // Spindle on while it spins up
             break;
         }
+        if (hw && program_slice && !prepareProgramRunLocked(front.slice.outputs_mask, true)) {
+            break; // Waiting for the board to come to rest before switching outputs or starting a run
+        }
+        if (hw && boardBufferFullLocked()) break; // Real time: the board has enough motion queued
         const auto state_before = telemetry_.state;
         if (!sendQueuedSliceLocked()) break;
         sent_any = true;

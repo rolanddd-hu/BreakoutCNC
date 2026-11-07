@@ -497,14 +497,17 @@ ParseResult GCodeParser::parse(
                         break;
                     case 5:  // M5 Spindle / Torch OFF
                         torch_on = false;
-                        spindle_on_line = SIZE_MAX; // Only M5 clears it: M2 / M30 still get the warning
+                        spindle_on_line = SIZE_MAX;
                         out_mask &= ~(core::OutputBit::OUT1_TorchOrSpindle | core::OutputBit::OUT2_SpindleDir);
                         break;
                     case 2:  // M2 Program End
                     case 30: // M30 Program End & Rewind
+                        // Spindle and coolant off, as in Mach3 (the controller clears the outputs at the end)
                         torch_on = false;
+                        spindle_on_line = SIZE_MAX;
                         out_mask = 0;
                         ends_program = true;
+                        result.ends_with_program_end = true;
                         break;
                     case 6: // M6 / M06 Tool Change
                         is_tool_change = true;

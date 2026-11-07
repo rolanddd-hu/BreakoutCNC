@@ -21,10 +21,63 @@
 #define GL_SILENCE_DEPRECATION
 #endif
 #include <GLFW/glfw3.h> // Pulls in the system GL header for glGetString()
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#include <dwmapi.h>
+#endif
 
 namespace rnr::ui {
 
 namespace {
+#ifdef _WIN32
+std::string rectText(const RECT& r) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%ld,%ld - %ld,%ld", r.left, r.top, r.right, r.bottom);
+    return buf;
+}
+
+// Window placement as Windows sees it, and the mouse as each layer reports it: tells an app-side mismatch from a
+// graphics driver that shows the picture shifted (seen with an old Intel HD 4400 driver)
+std::string windowGeometry() {
+    GLFWwindow* win = glfwGetCurrentContext();
+    HWND hwnd = win ? glfwGetWin32Window(win) : nullptr;
+    if (!hwnd) return "Window geometry: (no window)\n";
+    RECT wr{}, cr{}, er{};
+    GetWindowRect(hwnd, &wr);
+    GetClientRect(hwnd, &cr);
+    const bool have_ext = SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &er, sizeof(er)));
+    POINT origin{0, 0};
+    ClientToScreen(hwnd, &origin);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    POINT cursor_client = cursor;
+    ScreenToClient(hwnd, &cursor_client);
+    int fb_w = 0, fb_h = 0, ww = 0, wh = 0;
+    glfwGetFramebufferSize(win, &fb_w, &fb_h);
+    glfwGetWindowSize(win, &ww, &wh);
+    double gx = 0.0, gy = 0.0;
+    glfwGetCursorPos(win, &gx, &gy);
+    const ImGuiIO& io = ImGui::GetIO();
+
+    std::ostringstream r;
+    r << "Window geometry: " << (IsZoomed(hwnd) ? "maximized" : "not maximized") << ", dpi " << GetDpiForWindow(hwnd)
+      << ", system dpi " << GetDpiForSystem() << ", frame metrics " << GetSystemMetrics(SM_CXSIZEFRAME) << "+"
+      << GetSystemMetrics(SM_CXPADDEDBORDER) << "\n"
+      << "  monitor " << rectText(mi.rcMonitor) << ", work area " << rectText(mi.rcWork) << "\n"
+      << "  window " << rectText(wr) << ", visible frame " << (have_ext ? rectText(er) : std::string("?")) << "\n"
+      << "  client origin " << origin.x << "," << origin.y << " size " << cr.right << "x" << cr.bottom
+      << ", GLFW window " << ww << "x" << wh << ", framebuffer " << fb_w << "x" << fb_h << "\n"
+      << "  mouse: screen " << cursor.x << "," << cursor.y << ", client " << cursor_client.x << "," << cursor_client.y
+      << ", GLFW " << static_cast<int>(gx) << "," << static_cast<int>(gy) << ", ImGui "
+      << static_cast<int>(io.MousePos.x) << "," << static_cast<int>(io.MousePos.y) << "\n";
+    return r.str();
+}
+#endif
+
 std::string osDescription() {
 #ifdef _WIN32
     // GetVersionEx reports Windows 8 for unmanifested apps; RtlGetVersion gives the real build
@@ -112,6 +165,9 @@ std::string buildDiagnosticsReport(const core::MachineConfig& cfg,
       << "OpenGL: " << glString(GL_RENDERER) << " | " << glString(GL_VENDOR) << " | " << glString(GL_VERSION) << "\n"
       << "Window: " << static_cast<int>(io.DisplaySize.x) << " x " << static_cast<int>(io.DisplaySize.y)
       << " (framebuffer scale " << io.DisplayFramebufferScale.x << "), " << static_cast<int>(io.Framerate + 0.5f) << " FPS\n";
+#ifdef _WIN32
+    r << windowGeometry();
+#endif
 
     r << "Board: ";
     if (t.simulator_mode)      r << "simulator";

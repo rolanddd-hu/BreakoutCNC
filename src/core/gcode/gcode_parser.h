@@ -27,7 +27,8 @@ struct ParseResult {
     std::vector<ParseMessage>          warnings;
     // Axes moved in machine coordinates (G53 / G28 / G30): these axes must be homed before running.
     uint8_t                            machine_axes_used     = 0;
-    size_t                             spindle_on_without_m5_line = SIZE_MAX; // Last M3 / M4 with no M5 after it
+    size_t                             spindle_on_without_m5_line = SIZE_MAX; // Last M3 / M4 with no M5 / M2 / M30 after it
+    bool                               ends_with_program_end = false; // M2 / M30: all outputs off when the job ends
 
     bool hasErrors() const noexcept { return !errors.empty(); }
     std::string firstErrorText() const {

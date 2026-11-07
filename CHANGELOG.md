@@ -3,7 +3,7 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
-## Unreleased
+## 0.4
 
 ### Added
 - Program panel: **Go to line** selects and shows a line by its line number or N number.
@@ -19,10 +19,29 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   table mode) now show right after loading and update when you home, set a work zero or measure a tool. Cycle Start
   used to report only the first problem.
 - New warnings: a feed above what the motor settings allow (the move runs slower), a spindle speed outside the VFD's
-  range, a cut while the spindle is off (BreakoutMill), A moves while A follows another axis, and an M3 / M4 with no
-  M5 after it.
+  range, a cut below work Z0 while the spindle is off (BreakoutMill), A moves while A follows another axis, and an
+  M3 / M4 with no M5, M2 or M30 after it.
+- Diagnostics report (Windows): the window's position and size as Windows sees it, and the mouse position as each
+  layer reports it, to help with display problems.
+
+### Changed
+- Jog pad joysticks: a held knob can now travel over its whole pad instead of only its small socket, so the jog speed
+  is easier to set. The X/Y cross turns into a circle in 0.1 s while its knob is held (and back on release), and the
+  knob reaches full speed at the circle's edge. The Z and A knobs move along the full length of their pads.
 
 ### Fixed
+- M2 / M30 now switch the coolant off as well, as in Mach3. The spindle already stopped at the end of every program,
+  but coolant switched on with M7 / M8 stayed on without an M9.
+- Programs ran 3-4 s behind the app on the RNR board: the motors started that much after the toolpath view, kept
+  moving after the app showed the end, and Feed Hold and the feed override acted that late. The board confirms motion
+  as soon as it has stored it, so the app sent motion up to three times faster than it ran until the board's
+  buffer was full. Motion is now sent in real time, never more than 75 ms ahead of the board, and programs are sent
+  the way MDI moves are. Spindle, torch and coolant outputs are
+  switched with their own command where the program changes them (the machine is stopped there), and the spindle
+  output now comes on while the app waits for it to spin up.
+- RNR board: motion was jerky after Reset E-Stop until any setting, such as the pulse rate, was changed. The reset
+  put the board back on its default timing; the board configuration is now sent again after every reset.
+- Windows: a maximized window had an empty 8 px band around it. It now fills the screen's work area exactly.
 - Program panel: the scrollbar can be dragged on long programs. Its grab was so small that a press next to it paged
   through the program instead of dragging. It is larger now, and a press anywhere on the bar follows the mouse.
 - Program panel: while a job runs, the listing no longer jumps back to the active line during a scrollbar drag.

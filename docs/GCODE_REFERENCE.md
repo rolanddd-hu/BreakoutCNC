@@ -71,7 +71,7 @@ that program.
 | Code | Function | Notes |
 |---|---|---|
 | M0 / M1 | Program stop | M1 always stops; there's no optional-stop switch |
-| M2 / M30 | Program end | Later blocks are ignored, with a warning |
+| M2 / M30 | Program end | Spindle and coolant go off when the program ends. Later blocks are ignored, with a warning |
 | M3 / M4 | Spindle or torch on, CW / CCW | M4 gives dynamic power on a laser |
 | M5 | Spindle or torch off | |
 | M6 | Tool change | Uses the T word; behaviour depends on the M6 mode setting |

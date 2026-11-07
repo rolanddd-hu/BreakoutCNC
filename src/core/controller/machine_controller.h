@@ -148,6 +148,13 @@ private:
     void processBoardReportLocked(bool got_report, const board::BoardStatus& rep, bool usb_open_now);
     void runMotionTickLocked(bool gcode_running);
     bool sendQueuedSliceLocked();
+    // Program motion runs on the board like an MDI move: outputs set while the board is at rest, Start
+    // Continuous Jog, slices, and End of Motion when the board runs out of slices. Returns true when a program
+    // slice with these outputs may be sent now; false = wait (the board must come to rest first). With
+    // arm = false it only sets the outputs if possible (spindle spin-up wait).
+    bool prepareProgramRunLocked(uint8_t outputs_mask, bool arm);
+    bool boardBufferFullLocked() const;
+    void closeProgramRunLocked();
     void finishQueueLocked();
     void updateSpindleLocked(bool gcode_running);
     void updateContinuousJogLocked();
@@ -263,6 +270,12 @@ private:
         Clock::time_point sent_at{};
     };
     std::unordered_map<uint16_t, SeqProgressInfo> in_flight_seqs_{};
+    // Program slices go to the board as internal motion slices in MDI-style runs (prepareProgramRunLocked)
+    bool     program_run_open_     = false;  // Start Continuous Jog sent, End of Motion not yet
+    uint16_t program_outputs_sent_ = 0xFFFF; // Logical outputs last set for the program, 0xFFFF = unknown
+    // When the board will have run every slice sent so far (each slice is 25 ms of motion). Slices are paced by
+    // this, not only by acknowledgements: the board acknowledges a slice when it is buffered, not when it has run.
+    Clock::time_point board_busy_until_{};
 
     // Board feedback & watchdogs
     bool                   board_report_seen_   = false;

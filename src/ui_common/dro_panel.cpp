@@ -60,6 +60,27 @@ void buildCrossPolygon(std::vector<ImVec2>& pts, ImVec2 center, float cross_sz, 
     addArcPoints(pts, ImVec2(cx - hw - rf, cy - hw - rf), rf, 1.57079633f, 0.0f, arc_steps);
 }
 
+// Builds the circle the cross turns into: each cross point is pushed out (or in) along its direction from
+// the centre onto the circle. The cross is star-shaped about its centre, so the order stays the same and
+// the two polygons can be blended point by point.
+void buildCircleMatchingCross(std::vector<ImVec2>& pts, const std::vector<ImVec2>& cross_pts, ImVec2 center, float radius) {
+    pts.resize(cross_pts.size());
+    for (size_t i = 0; i < cross_pts.size(); ++i) {
+        const float dx  = cross_pts[i].x - center.x;
+        const float dy  = cross_pts[i].y - center.y;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        pts[i] = (len > 0.0001f) ? ImVec2(center.x + dx / len * radius, center.y + dy / len * radius) : center;
+    }
+}
+
+// Blends polygon `a` towards `b` (same point count) by t in 0..1, in place
+void blendPolygon(std::vector<ImVec2>& a, const std::vector<ImVec2>& b, float t) {
+    if (a.size() != b.size()) return;
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = ImVec2(a[i].x + (b[i].x - a[i].x) * t, a[i].y + (b[i].y - a[i].y) * t);
+    }
+}
+
 // Builds a closed polygon for the vertical Stadium / Pill shape
 void buildPillPolygon(std::vector<ImVec2>& pts, ImVec2 center, float width, float height, int arc_steps = 16) {
     pts.clear();
@@ -566,6 +587,24 @@ void DroAndJogPanel::render(
     buildCrossPolygon(pts_cross_inner, C_xy, cross_sz - bevel_w * 2.0f, arm_w - bevel_w * 2.0f,
                       std::max(2.0f, arm_rounding - bevel_w), fillet_r + bevel_w, 8);
 
+    // While the X/Y joystick is held, the cross grows into a circle in 100 ms, so the knob can travel over
+    // the whole pad; on release it shrinks back the same way
+    {
+        constexpr float kMorphSeconds = 0.1f;
+        const float step   = ImGui::GetIO().DeltaTime / kMorphSeconds;
+        const float target = js_xy_active_ ? 1.0f : 0.0f;
+        js_xy_morph_ = (js_xy_morph_ < target) ? std::min(target, js_xy_morph_ + step)
+                                               : std::max(target, js_xy_morph_ - step);
+    }
+    if (js_xy_morph_ > 0.0f) {
+        const float t = js_xy_morph_ * js_xy_morph_ * (3.0f - 2.0f * js_xy_morph_); // smoothstep
+        std::vector<ImVec2> circ_outer, circ_inner;
+        buildCircleMatchingCross(circ_outer, pts_cross_outer, C_xy, cross_sz * 0.5f);
+        buildCircleMatchingCross(circ_inner, pts_cross_inner, C_xy, cross_sz * 0.5f - bevel_w);
+        blendPolygon(pts_cross_outer, circ_outer, t);
+        blendPolygon(pts_cross_inner, circ_inner, t);
+    }
+
     // Build outer and inner polygons for Z Pill
     std::vector<ImVec2> pts_pill_outer, pts_pill_inner;
     buildPillPolygon(pts_pill_outer, C_z, z_w, z_h, 16);
@@ -594,9 +633,15 @@ void DroAndJogPanel::render(
         controller.jogStopAxis(core::Axis::A);
     }
 
-    const float max_deflect = hub_r * 0.85f;
+    // A held knob can travel over its whole pad (to the inner face edge), not just the hub socket: the X/Y
+    // knob over the circle, the Z / A knob along the full pill. A longer travel for the same
+    // speed range makes the speed easier to control.
+    const float knob_r_px   = hub_r * 0.78f;
+    const float xy_deflect  = std::max(hub_r * 0.85f, cross_sz * 0.5f - bevel_w - knob_r_px);
+    const float pill_deflect = std::max(hub_r * 0.85f, z_h * 0.5f - bevel_w - knob_r_px);
     const float deadzone    = 0.08f;
-    const float dz_px       = max_deflect * deadzone;
+    const float xy_dz_px    = xy_deflect * deadzone;
+    const float pill_dz_px  = pill_deflect * deadzone;
 
     // --- X/Y Center Hub Joystick Interaction ---
     ImGui::SetCursorScreenPos(ImVec2(C_xy.x - hub_r, C_xy.y - hub_r));
@@ -607,20 +652,16 @@ void DroAndJogPanel::render(
         if (ImGui::IsItemActive()) {
             js_xy_active_ = true;
             const ImVec2 mouse = ImGui::GetIO().MousePos;
-            const float raw_dx = mouse.x - C_xy.x;
-            const float raw_dy = mouse.y - C_xy.y;
+            // Round travel over the circle the pad turns into
+            const float raw_dx   = mouse.x - C_xy.x;
+            const float raw_dy   = mouse.y - C_xy.y;
             const float raw_dist = std::sqrt(raw_dx * raw_dx + raw_dy * raw_dy);
-
-            if (raw_dist > max_deflect && raw_dist > 0.0001f) {
-                const float scale = max_deflect / raw_dist;
-                js_xy_drag_ = ImVec2(raw_dx * scale, raw_dy * scale);
-            } else {
-                js_xy_drag_ = ImVec2(raw_dx, raw_dy);
-            }
+            const float k        = (raw_dist > xy_deflect) ? xy_deflect / raw_dist : 1.0f;
+            js_xy_drag_ = ImVec2(raw_dx * k, raw_dy * k);
 
             // Proportional speeds (-1.0 .. +1.0)
-            const float norm_x = js_xy_drag_.x / max_deflect;
-            const float norm_y = -js_xy_drag_.y / max_deflect; // Screen Y is inverted, so up is +Y
+            const float norm_x = js_xy_drag_.x / xy_deflect;
+            const float norm_y = -js_xy_drag_.y / xy_deflect; // Screen Y is inverted, so up is +Y
             const float max_spd = std::clamp(jog_speed_pct_ / 100.0f, 0.05f, 1.0f);
 
             // X axis proportional drive
@@ -691,9 +732,9 @@ void DroAndJogPanel::render(
             if (ImGui::IsItemActive()) {
                 active = true;
                 const float raw_dy = ImGui::GetIO().MousePos.y - hub.center.y;
-                drag = std::clamp(raw_dy, -max_deflect, max_deflect);
+                drag = std::clamp(raw_dy, -pill_deflect, pill_deflect);
 
-                const float norm    = -drag / max_deflect; // Up is positive
+                const float norm    = -drag / pill_deflect; // Up is positive
                 const float abs_n   = std::abs(norm);
                 const float max_spd = std::clamp(jog_speed_pct_ / 100.0f, 0.05f, 1.0f);
 
@@ -758,15 +799,15 @@ void DroAndJogPanel::render(
         bool js_active = false;
         if (js_xy_active_) {
             if (axis == core::Axis::X) {
-                js_active = pos_dir ? (js_xy_drag_.x > dz_px) : (js_xy_drag_.x < -dz_px);
+                js_active = pos_dir ? (js_xy_drag_.x > xy_dz_px) : (js_xy_drag_.x < -xy_dz_px);
             } else if (axis == core::Axis::Y) {
-                js_active = pos_dir ? (-js_xy_drag_.y > dz_px) : (-js_xy_drag_.y < -dz_px);
+                js_active = pos_dir ? (-js_xy_drag_.y > xy_dz_px) : (-js_xy_drag_.y < -xy_dz_px);
             }
         }
         const int pill = (axis == core::Axis::Z) ? 0 : (axis == core::Axis::A ? 1 : -1);
         if (pill >= 0 && js_pill_active_[pill]) {
             const float d = -js_pill_drag_[pill];
-            js_active = pos_dir ? (d > dz_px) : (d < -dz_px);
+            js_active = pos_dir ? (d > pill_dz_px) : (d < -pill_dz_px);
         }
 
         bool active = mouse_active || kb_active || js_active;
@@ -914,7 +955,7 @@ void DroAndJogPanel::render(
 
     // Draw Hub Sockets & Analog Thumbstick Knobs
     const float font_sz = std::max(11.0f, base_font_sz * scale);
-    const float knob_r  = hub_r * 0.78f;
+    const float knob_r  = knob_r_px;
 
     // Stem line connecting base center to displaced thumbstick knob
     if (js_xy_active_ && (js_xy_drag_.x * js_xy_drag_.x + js_xy_drag_.y * js_xy_drag_.y > 4.0f)) {

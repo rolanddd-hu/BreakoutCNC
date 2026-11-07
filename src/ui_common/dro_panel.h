@@ -58,6 +58,7 @@ private:
     // Virtual Analog Joystick state (X/Y cross, and the Z and A pills for continuous drag)
     bool   js_xy_active_ = false;
     ImVec2 js_xy_drag_{0.0f, 0.0f};
+    float  js_xy_morph_ = 0.0f; // 0 = cross, 1 = square (while the X/Y joystick is held), animated
     std::array<bool, 2>  js_pill_active_{false, false}; // [0] = Z, [1] = A
     std::array<float, 2> js_pill_drag_{0.0f, 0.0f};
 

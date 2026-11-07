@@ -26,6 +26,19 @@ No vendor code is part of this repository.
 - `0x03` (`buf[0]=0x02`): Set Outputs immediately (`buf[5]` = bitmask `OUT1..OUT4`)
 - `0x04` (`buf[0]=0x03`): G-Code Motion Slice (`buf[5..8]`=hdr, `buf[9..12]`=dX, `buf[13..16]`=dY, `buf[17..20]`=dZ, `buf[21..24]`=dA, `buf[25]`=Outputs)
 - `0x05` (`buf[0]=0x03`): Internal Jog/Home/Probe Motion Slice (same layout as `0x04`)
+
+  Observed on the bench: `ack_seq` advances when the board has *buffered* a slice, not when it has run it, and the
+  board buffers several seconds of slices. A host that sends whenever fewer than N slices are unacknowledged runs
+  ahead until that buffer is full: motion ran 3-4 s behind the app, and a feed hold sent as slices acted just as
+  late. BreakoutCNC paces slices in real time as well (at most `max_slices_in_flight` × 25 ms of motion ahead of
+  the board). Continuous jogging, one slice per 25 ms tick, never showed the delay. BreakoutCNC sends program
+  motion as `0x05` slices too, in runs
+  shaped like an MDI move: `0x03` outputs while at rest, `0x0A`, slices, and `0x06` when the board has run out of
+  slices (a run that starved is closed before the next `0x0A`). Sending `0x0A` again without `0x06`, with `0x03`
+  between `0x0A` and the slices, left the motors still.
+
+- After `0x07` + `0x02` (E-stop reset) the board runs on default timing: slices are jerky until `0x0F` is sent
+  again. The Mach3 plugin re-sends `0x09` and `0x0F` after the reset; BreakoutCNC re-sends `0x0F`.
 - `0x06` (`buf[0]=0x02`): End of Motion / Sync Outputs (`buf[5]` = bitmask `OUT1..OUT4`)
 - `0x07` (`buf[0]=0x02`): Pre-Reset / Clear State
 - `0x08` (`buf[0]=0x02`): Cancel / Stop Sequence

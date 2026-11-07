@@ -130,19 +130,10 @@ static void EnsureOverlayWindow(HWND parent_hwnd) {
 
 static LRESULT CALLBACK CustomWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_NCCALCSIZE && wParam == TRUE) {
-        if (IsZoomed(hwnd)) {
-            // When maximized, adjust the client rect so it doesn't spill over by the 8px resize frame
-            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
-            int frame_x = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-            int frame_y = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-            params->rgrc[0].left   += frame_x;
-            params->rgrc[0].top    += frame_y;
-            params->rgrc[0].right  -= frame_x;
-            params->rgrc[0].bottom -= frame_y;
-            return WVR_REDRAW;
-        }
-        // Returning 0 for un-maximized windows expands the client area over the entire window,
-        // completely eliminating the Windows 10/11 1px white non-client top border line!
+        // Returning 0 expands the client area over the entire window, which removes the Windows 10/11 1px white
+        // non-client top border line. Also when maximized: GLFW already limits a maximized undecorated window to the
+        // monitor's work area (WM_GETMINMAXINFO), so it does not spill over the screen edges. Insetting the client by
+        // the resize frame here left an empty 8 px band around the maximized window.
         return 0;
     }
 
