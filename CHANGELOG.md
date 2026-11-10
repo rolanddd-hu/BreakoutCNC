@@ -3,6 +3,76 @@
 All notable changes to BreakoutCNC are listed here. The version number is set once, in `project(VERSION ...)` in
 [CMakeLists.txt](CMakeLists.txt); the window titles and the `.exe` file properties pick it up from there.
 
+## 0.5 (in development)
+
+### Added
+- **Board selector** (*Connection* > **Board**): besides the RNR Eco Motion 2.0, BreakoutMill and BreakoutCut drive
+  **GRBL 1.1**, **grblHAL** and **FluidNC** boards over USB serial or the network (telnet port). The app identifies
+  the firmware when connecting and says so when a different flavour answers.
+- On these boards the app converts Mach3-style programs into G-code the firmware accepts: arcs are sent as G2 / G3,
+  drilling cycles, G68 rotation, tool lengths and G53 moves as plain moves, and tool changes (M6), program stops
+  (M0 / M1) and Huanyang VFD spindle changes stop the board and are handled by the app. Work offsets stay in the app.
+- Jogging (continuous and step), homing (the board's own cycle), probing (G38.3), MDI, feed hold, resume, stop,
+  E-stop, feed / rapid / spindle overrides, spindle and coolant, laser jobs (`M4`), framing and the laser test pulse
+  work on these boards. All probing routines, tool measuring and surface maps run on them as on the RNR board.
+- **Board Settings**: the firmware's settings with descriptions (GRBL 1.1 `$$`, the grblHAL settings it describes
+  itself, FluidNC's configuration), with write, backup and restore.
+- **Board Console**: the data exchanged with the board, and a command line.
+- **Plasma THC on grblHAL**: a grblHAL board with the plasma plugin runs torch height control itself. BreakoutCut
+  detects the plugin, allows plasma jobs with THC on that board, shows its Arc OK, torch, THC and anti-dive state and
+  the arc voltage under *Torch Height Control*, and lists the plugin's settings (`$350`-`$369`) in a *Plasma* group
+  of *Board Settings*. When the torch does not start, the board pauses the job and the app says why.
+- **4th axis (A)** on grblHAL and FluidNC boards that have one: DRO, jogging, homing, MDI and jobs. BreakoutMill shows A
+  only when the board reports four axes; a program that moves A cannot start on a 3-axis board. A Dual-Motor Gantry
+  setting from the RNR board does not apply to these boards (they gang motors in their firmware).
+- **Save board report** (*Board Console*): asks the board for its build info, settings, offsets and modes (`$I`,
+  `$$`, `$#`, `$G` and the like; nothing is changed) and saves them with the recent exchange to a text file next to
+  the application, to diagnose a new board.
+- Alarm and error texts from the board itself on grblHAL (`$EA` / `$EE`) and FluidNC (`$A` / `$E`) for codes beyond
+  GRBL 1.1's, read when connecting.
+- Program check on GRBL-family boards: moves beyond the board's travel (`$130`-`$133` and the homing direction, homed
+  axes only), feeds above the board's maximum rates (`$110`-`$113`) and custom outputs the board does not have are
+  warned about.
+- Lua: `cnc.board()` returns the selected board and what it can do.
+- **Test mode without a board:** start BreakoutMill or BreakoutCut with `--fake-board` to drive a built-in GRBL 1.1,
+  grblHAL and FluidNC emulator. Hardware access and the VFD link are off in this mode, and it uses its own settings
+  file (`*_settings_fakeboard.ini`).
+- Program check: warnings for G61 / G64 (no effect on these boards) and for THC programs on a board that cannot run
+  THC.
+
+### Fixed
+- GRBL-family boards: coolant is switched with one M7 / M8 / M9 per line. GRBL refuses two words of that modal group
+  in one line (error 21), which stopped jobs at their first coolant change and the manual Flood / Mist buttons.
+- GRBL-family boards, BreakoutCut plasma: the torch is switched on with `M3 S<$30>` instead of a bare `M3`; with S0 a
+  variable-spindle board (GRBL 1.1 on an Arduino) keeps its spindle output off, so the torch did not fire.
+- GRBL-family boards: EMERGENCY STOP also resets the board while it is being identified after connecting; the app then
+  identifies it again. A network connection that stalls is reported lost after 1 s instead of freezing the app (and
+  the E-stop behind it). A line longer than the board accepts stops the job with a message before it is sent; a long
+  line is first sent without its line number. FluidNC alarms 10 and above no longer clear the homed state when the
+  position is kept (FluidNC numbers them differently from grblHAL).
+- GRBL-family boards: during G2 / G3 arcs the highlighted line and the cut progress follow the torch around the arc.
+  Before, a whole arc was marked as cut as soon as it started, and a full circle could be shown as active again after
+  it was finished. A new job no longer briefly shows where the previous one ended.
+- Test mode (`--fake-board`): the emulated boards move along G2 / G3 arcs instead of straight to their end point.
+  BreakoutMill's emulated grblHAL and FluidNC boards have an A axis; the plasma plugin is only on BreakoutCut's
+  grblHAL board (BreakoutMill had it too).
+- GRBL-family boards reporting in inches (`$13 = 1`): the A position is no longer scaled as if it were inches.
+- BreakoutCut: Cycle Start in the middle of a program no longer asks "Spindle Not Running ... start it again with
+  12000 RPM?". That BreakoutMill question switched the torch or the laser on before the job moved; Cut now starts
+  the job and the program's own M3 / M4 switches the output on.
+- The MDI row no longer makes the program panel scroll sideways when the panel is narrow (shorter labels, input sized
+  to fit, status moved to the tooltip).
+- In step jog mode the status box under the jog pad is no longer cut off: the key hint is hidden when there is no room
+  (its text moves to the STOP JOG tooltip).
+
+### Changed
+- Settings that the selected board keeps itself (motor tuning, switch inputs, homing speeds, pin assignment, THC,
+  corner tolerance) are replaced by a short note pointing to *Board Settings*.
+- The applications connect to the board after loading their settings, so the saved board is the one that is opened.
+- The settings file has a `board = ...` key and one `[Board.<id>]` section per board. Files from 0.4 load unchanged and
+  select the RNR board.
+- The Huanyang VFD uses the new shared serial port code (same behaviour).
+
 ## 0.4
 
 ### Added

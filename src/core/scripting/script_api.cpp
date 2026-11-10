@@ -583,6 +583,29 @@ int l_cnc_get_pending_tool(lua_State* L) {
     return 1;
 }
 
+// cnc.board() -> table: id, name, family ("host" / "firmware"), connected, firmware, and capability flags
+int l_cnc_board(lua_State* L) {
+    ApiContext* ctx = getContext(L);
+    lua_newtable(L);
+    if (!ctx || !ctx->controller) return 1;
+    const auto caps = ctx->controller->getBoardCapabilities();
+    const auto t = ctx->controller->getTelemetry();
+    lua_pushstring(L, t.board_id.c_str());                     lua_setfield(L, -2, "id");
+    lua_pushstring(L, caps.display_name.c_str());              lua_setfield(L, -2, "name");
+    lua_pushstring(L, caps.family == board::Family::FirmwarePlanned ? "firmware" : "host");
+    lua_setfield(L, -2, "family");
+    lua_pushboolean(L, t.usb_connected && !t.simulator_mode);   lua_setfield(L, -2, "connected");
+    lua_pushstring(L, t.firmware_version.c_str());              lua_setfield(L, -2, "firmware");
+    lua_pushinteger(L, caps.axis_count);                        lua_setfield(L, -2, "axis_count");
+    lua_pushboolean(L, caps.home_single_axis);                  lua_setfield(L, -2, "home_single_axis");
+    lua_pushboolean(L, caps.realtime_process_control);          lua_setfield(L, -2, "realtime_process_control");
+    lua_pushboolean(L, caps.board_thc);                         lua_setfield(L, -2, "board_thc");
+    lua_pushboolean(L, caps.rapid_override);                    lua_setfield(L, -2, "rapid_override");
+    lua_pushboolean(L, caps.native_arcs);                       lua_setfield(L, -2, "native_arcs");
+    lua_pushnumber(L, caps.feed_override_max_pct);              lua_setfield(L, -2, "feed_override_max_pct");
+    return 1;
+}
+
 int l_cnc_get_feed_override(lua_State* L) {
     ApiContext* ctx = getContext(L);
     if (!ctx || !ctx->controller) {
@@ -814,6 +837,7 @@ void ScriptApi::registerApi(
     lua_pushcfunction(L, l_cnc_get_current_tool);lua_setfield(L, -2, "get_current_tool");
     lua_pushcfunction(L, l_cnc_get_pending_tool);lua_setfield(L, -2, "get_pending_tool");
     lua_pushcfunction(L, l_cnc_get_feed_override);lua_setfield(L, -2, "get_feed_override");
+    lua_pushcfunction(L, l_cnc_board);            lua_setfield(L, -2, "board");
     lua_pushcfunction(L, l_cnc_set_feed_override);lua_setfield(L, -2, "set_feed_override");
 
     // Safety & Prompts

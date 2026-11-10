@@ -94,6 +94,17 @@ add_library(rnr_core STATIC
     src/core/controller/machine_controller.cpp
     src/core/io/io_map.cpp
     src/core/board/rnr_board_driver.cpp
+    src/core/board/board_registry.cpp
+    src/core/board/grbl/grbl_messages.cpp
+    src/core/board/grbl/grbl_codes.cpp
+    src/core/board/grbl/firmware_profile.cpp
+    src/core/board/grbl/grbl_protocol.cpp
+    src/core/board/grbl/grbl_settings.cpp
+    src/core/motion/gcode_emitter.cpp
+    src/core/motion/firmware_planned_path.cpp
+    src/core/transport/byte_stream.cpp
+    src/core/transport/serial_port.cpp
+    src/core/transport/tcp_stream.cpp
     src/core/config/settings_manager.cpp
     src/core/config/mach3_xml_importer.cpp
     src/core/spindle/huanyang_vfd.cpp
@@ -156,6 +167,9 @@ add_library(rnr_ui_common STATIC
     src/ui_common/toolpath_viewport.cpp
     src/ui_common/dro_panel.cpp
     src/ui_common/io_status_bar.cpp
+    src/ui_common/board_panels.cpp
+    src/ui_common/fake_board_mode.cpp
+    src/ui_common/ui_remote.cpp
     src/ui_common/gcode_panel.cpp
     src/ui_common/scripting_panel.cpp
     src/ui_common/probe_panel.cpp
@@ -186,6 +200,10 @@ target_link_libraries(huanyang_vfd_test PRIVATE rnr_core)
 add_executable(script_engine_test tests/script_engine_test.cpp)
 target_link_libraries(script_engine_test PRIVATE rnr_core)
 target_include_directories(script_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src) # ui_common/lua_guide_examples.h (header only)
+
+# 6d. Board tests: GRBL-family protocol, G-code emitter, firmware path on the FakeGrbl emulator
+add_executable(board_tests tests/board_tests.cpp)
+target_link_libraries(board_tests PRIVATE rnr_core)
 
 # 7. Executable: BreakoutCut (Dual-Mode Plasma & Laser Cutter Controller)
 set(BREAKOUT_CUT_SRCS src/app_cut/main_cut.cpp)

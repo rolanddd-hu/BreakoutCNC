@@ -11,9 +11,19 @@ struct ParseMessage {
     std::string text;
 };
 
+// One G2 / G3 block. Its chords are segments[first_segment .. first_segment + segment_count).
+struct ArcInfo {
+    std::array<double, 3> center_mm{};   // Work coordinates (after G68); the axis normal to the plane is unused
+    uint8_t               plane = 17;    // 17 (XY), 18 (XZ), 19 (YZ)
+    bool                  clockwise = true; // G2
+    uint32_t              first_segment = 0;
+    uint32_t              segment_count = 0;
+};
+
 struct ParseResult {
     std::vector<std::string>           lines;
     std::vector<core::ToolpathSegment> segments;
+    std::vector<ArcInfo>               arcs;
     std::array<double, 3>              bbox_min_mm           = {0.0, 0.0, 0.0};
     std::array<double, 3>              bbox_max_mm           = {0.0, 0.0, 0.0};
     double                             total_cut_length_mm   = 0.0;

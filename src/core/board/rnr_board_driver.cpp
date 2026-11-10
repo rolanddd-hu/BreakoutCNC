@@ -1,21 +1,11 @@
 #include "core/board/rnr_board_driver.h"
+#include "core/board/board_registry.h"
 #include "core/controller/motion_controller.h"
 
 namespace rnr::board {
 
 BoardCapabilities RnrBoardDriver::capabilities() const {
-    BoardCapabilities caps;
-    caps.display_name         = "RNR Eco Motion 2.0";
-    caps.input_count          = 12;
-    caps.output_count         = 4;
-    caps.min_pulse_khz        = 10;
-    caps.max_pulse_khz        = 100;
-    caps.max_slices_in_flight = 3; // 75 ms ahead of the acknowledgement
-    caps.hardware_probe_latch = true;
-    caps.hardware_home_latch  = true;
-    caps.spindle_pwm          = true;
-    caps.accesses_real_hardware = true;
-    return caps;
+    return rnrEcoMotionCapabilities();
 }
 
 bool RnrBoardDriver::open() {

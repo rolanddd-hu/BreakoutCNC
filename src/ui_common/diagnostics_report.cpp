@@ -174,6 +174,13 @@ std::string buildDiagnosticsReport(const core::MachineConfig& cfg,
     else if (t.usb_connected)  r << (t.product_name.empty() ? "connected" : t.product_name);
     else                       r << "not connected";
     r << " | state: " << stateName(t.state) << " | last ack seq " << t.last_ack_seq << "\n";
+    r << "Board id: " << (t.board_id.empty() ? "?" : t.board_id);
+    if (t.board_firmware_planned) {
+        r << " | firmware: " << (t.firmware_version.empty() ? "unknown" : t.firmware_version)
+          << " | firmware state: " << (t.firmware_state.empty() ? "-" : t.firmware_state);
+        if (!t.board_status_text.empty()) r << " | " << t.board_status_text;
+    }
+    r << "\n";
 
     r << "Settings: " << (cfg.linear_units == core::LinearUnits::Imperial ? "inch" : "mm")
       << ", require homing " << (cfg.require_homing ? "on" : "off")

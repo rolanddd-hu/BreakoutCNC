@@ -963,6 +963,18 @@ ParseResult GCodeParser::parse(
                     steps = std::min(steps, 20000);
 
                     std::array<double, 4> prev_pt = cur_pos;
+                    ArcInfo arc_rec;
+                    arc_rec.center_mm[0] = cur_pos[0];
+                    arc_rec.center_mm[1] = cur_pos[1];
+                    arc_rec.center_mm[2] = cur_pos[2];
+                    arc_rec.center_mm[u_ax] = cu;
+                    arc_rec.center_mm[v_ax] = cv;
+                    arc_rec.plane = static_cast<uint8_t>(active_plane);
+                    arc_rec.clockwise = (active_g_motion == 2);
+                    arc_rec.first_segment = static_cast<uint32_t>(result.segments.size());
+                    arc_rec.segment_count = static_cast<uint32_t>(steps);
+                    const uint32_t arc_idx = static_cast<uint32_t>(result.arcs.size());
+                    result.arcs.push_back(arc_rec);
                     const double r_start = std::hypot(u0 - cu, v0 - cv);
                     const double r_end   = std::hypot(u1 - cu, v1 - cv);
                     for (int s = 1; s <= steps; ++s) {
@@ -982,6 +994,7 @@ ParseResult GCodeParser::parse(
                         seg.end_xyza_mm   = next_pt;
                         seg.length_mm     = calcDist4D(prev_pt, next_pt);
                         seg.exact_stop    = exact_stop && (s == steps); // G61: stop at the end of the arc, not at its chords
+                        seg.arc_index     = arc_idx;
 
                         result.total_cut_length_mm += seg.length_mm;
                         expandBBox(cut_bmin, cut_bmax, prev_pt, first_cut_pt);

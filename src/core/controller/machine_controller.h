@@ -4,6 +4,7 @@
 #include "core/gcode/gcode_parser.h"
 #include "core/planner/trajectory_planner.h"
 #include "core/controller/program_check.h"
+#include "core/motion/firmware_planned_path.h"
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -23,15 +24,17 @@ namespace rnr::core {
 // spindle / VFD, THC, laser rules and scripting. All hardware access goes through an IBoardDriver.
 class MachineController : public IMotionController {
 public:
-    // `board` = the motion controller board driver (nullptr = RNR Eco Motion 2.0)
-    explicit MachineController(std::unique_ptr<board::IBoardDriver> board = nullptr);
+    // `board` = the host-planned board driver (nullptr = RNR Eco Motion 2.0). Firmware-planned boards (GRBL family)
+    // are selected with MachineConfig::board_id and driven through motion::FirmwarePlannedPath.
+    // `connect_now` = false: the application connects itself once it has applied its settings.
+    explicit MachineController(std::unique_ptr<board::IBoardDriver> board = nullptr, bool connect_now = true);
     ~MachineController() override;
 
     MachineController(const MachineController&) = delete;
     MachineController& operator=(const MachineController&) = delete;
 
-    // Static description of the connected board type
-    board::BoardCapabilities boardCapabilities() const { return board_->capabilities(); }
+    // Description of the selected board (refined by a firmware board once it is connected)
+    board::BoardCapabilities boardCapabilities() const { return getBoardCapabilities(); }
 
     // IMotionController implementation
     bool connect() override;
@@ -134,6 +137,18 @@ public:
     void submitScriptPromptInput(const std::string& button, const std::string& input) override;
     void setScriptLogCallback(std::function<void(const std::string&, bool)> cb) override;
 
+    // Board selection, console and firmware settings
+    board::BoardCapabilities getBoardCapabilities() const override;
+    bool unlockBoard() override;
+    void setRapidOverride(float percent) override;
+    bool sendBoardConsoleLine(const std::string& line) override;
+    std::vector<transport::ProtocolLogEntry> getBoardLog(uint64_t after_seq) const override;
+    bool requestBoardReport() override;
+    BoardReport getBoardReport() const override;
+    board::grbl::SettingsSnapshot getFirmwareSettings() const override;
+    void requestFirmwareSettings() override;
+    bool writeFirmwareSettings(const std::vector<std::pair<std::string, std::string>>& id_values) override;
+
     static constexpr int kJogDeadmanMs = 500;
 
     // Process-wide switch: when disabled, connect() never opens a real board (unit tests must never
@@ -145,6 +160,31 @@ private:
     using Clock = std::chrono::steady_clock;
 
     void workerLoop();
+
+    // Firmware-planned boards (GRBL family)
+    bool connectLocked();
+    board::BoardCapabilities getBoardCapabilitiesLocked() const;
+    void fillBoardLimitsLocked(MachineCheckInput::BoardLimits& b) const;
+    bool firmwareBoardSelectedLocked() const;
+    bool fwActiveLocked() const noexcept { return fw_ && fw_->isOpen() && !telemetry_.simulator_mode; }
+    bool fwReadyLocked() const noexcept { return fwActiveLocked() && fw_->ready(); }
+    // Outputs go to a board: the RNR board or a connected firmware board (not in the simulator)
+    bool outputsLiveLocked() const noexcept { return !telemetry_.simulator_mode && (board_->isOpen() || fwActiveLocked()); }
+    void closeFirmwarePathLocked();
+    void fwTickLocked();
+    void fwHandleEventLocked(const motion::PathEvent& e);
+    // Manual moves (work coordinates, like the slice planner's input) on a firmware board
+    bool fwStartManualMovesLocked(const std::vector<ToolpathSegment>& moves, ControllerState state,
+                                  const motion::OutputRequest* during = nullptr);
+    void fwApplyOutputsLocked(uint8_t logical_mask);
+    void fwSpindleSpeedChangedLocked();
+    void fwToolChangeLocked(const ToolpathSegment& seg);
+    bool fwStartJobLocked(size_t start_seg, bool resume_in_place);
+    double fwAxisMaxVelocityLocked(size_t axis) const;
+    bool probeInputMissingLocked() const noexcept;
+    // Safe approach moves before a job starts (shared by the slice planner and firmware boards)
+    std::vector<ToolpathSegment> buildJobPrefixLocked(size_t start_from_segment, bool resume_in_place,
+                                                      size_t& program_first, std::array<double, 4>& plan_start);
     void processBoardReportLocked(bool got_report, const board::BoardStatus& rep, bool usb_open_now);
     void runMotionTickLocked(bool gcode_running);
     bool sendQueuedSliceLocked();
@@ -247,6 +287,8 @@ private:
         planner::FrameContext frame{};
         std::array<bool, 4>   homed{};
         bool                  simulator = false;
+        bool                  board_thc = false;
+        MachineCheckInput::BoardLimits board{};
         uint64_t              config_revision = 0;
         uint64_t              tool_revision = 0;
         bool operator==(const ProgramCheckKey& o) const;
@@ -371,6 +413,26 @@ private:
     std::thread worker_thread_;
 
     std::unique_ptr<scripting::ScriptRunner> script_runner_;
+
+    // Firmware-planned board path (GRBL family); nullptr while an RNR board is selected
+    std::unique_ptr<motion::FirmwarePlannedPath> fw_;
+    std::mutex fw_ptr_mutex_;              // Guards fw_ replacement against triggerEStop() (taken after mutex_)
+    std::string board_id_ = board::kRnrBoardId;
+    uint64_t caps_revision_ = 1;
+    uint8_t  fw_outputs_applied_ = 0xFF;   // Logical outputs last applied to the firmware board
+    bool     fw_job_spindle_on_ = false, fw_job_spindle_ccw_ = false; // App-driven spindle during a firmware job
+    bool     fw_sync_wait_ = false;        // Waiting for the spindle before continuing the job
+    Clock::time_point fw_sync_continue_at_{};
+    size_t   fw_resume_segment_ = 0;       // After M0 / M1 on a firmware board
+    bool     fw_program_stop_ = false;
+    uint8_t  fw_homing_mask_ = 0;
+    uint32_t fw_arc_failed_seen_ = 0;      // PathFeedback::arc_failed_count already reported
+    uint64_t fw_thc_mode_rev_ = ~0ULL;     // Capabilities revision the board THC mode was read at
+    bool     fw_seen_held_ = false;        // The board reported its feed hold (resume from its own button)
+    bool     suppress_fw_estop_ = false;   // Fault from the board itself: no extra reset
+    Clock::time_point fw_state_grace_until_{};
+    std::array<double, 4> fw_vel_pos_{};    // Position at the last velocity sample (per-axis velocity readout)
+    Clock::time_point fw_vel_time_{};
 
     static inline std::atomic<bool> hardware_access_enabled_{true};
 };

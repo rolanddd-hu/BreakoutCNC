@@ -7,22 +7,6 @@
 #include <cstring>
 #include <iostream>
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <dirent.h>
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <cerrno>
-#endif
 
 namespace rnr {
 
@@ -194,34 +178,7 @@ uint16_t HuanyangVfdController::calculateCrc16(const uint8_t* buffer, size_t len
 // ============================================================================
 std::vector<std::string> HuanyangVfdController::enumeratePorts() {
     std::vector<std::string> ports;
-#ifdef _WIN32
-    char target_path[512];
-    for (int i = 1; i <= 64; ++i) {
-        std::string port_name = "COM" + std::to_string(i);
-        if (QueryDosDeviceA(port_name.c_str(), target_path, sizeof(target_path)) != 0) {
-            ports.push_back(port_name);
-        }
-    }
-#else
-    // USB RS-485 adapters: ttyUSB* / ttyACM* on Linux, cu.* on macOS (cu = call-out, no carrier wait)
-#ifdef __APPLE__
-    const char* prefixes[] = {"cu."};
-#else
-    const char* prefixes[] = {"ttyUSB", "ttyACM"};
-#endif
-    if (DIR* dir = opendir("/dev")) {
-        while (const dirent* entry = readdir(dir)) {
-            const std::string name = entry->d_name;
-            for (const char* prefix : prefixes) {
-                if (name.rfind(prefix, 0) == 0 && name != "cu.Bluetooth-Incoming-Port") {
-                    ports.push_back("/dev/" + name);
-                }
-            }
-        }
-        closedir(dir);
-    }
-    std::sort(ports.begin(), ports.end());
-#endif
+    for (const auto& p : transport::SerialPort::enumerate()) ports.push_back(p.name);
     return ports;
 }
 
@@ -500,196 +457,39 @@ bool HuanyangVfdController::sendPacketAndReceive(const uint8_t* tx, size_t tx_le
     return true;
 }
 
-#ifdef _WIN32
 // ============================================================================
-// Raw Port I/O (Win32 API)
+// Raw Port I/O (transport::SerialPort: Win32 / POSIX)
 // ============================================================================
 bool HuanyangVfdController::openPlatformPort(const std::string& port_name, uint32_t baud, std::string& error) {
-    const std::string full_name = "\\\\.\\" + port_name;
-    HANDLE hComm = CreateFileA(full_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hComm == INVALID_HANDLE_VALUE) {
-        error = "Cannot open " + port_name;
-        return false;
-    }
-
-    DCB dcb{};
-    dcb.DCBlength = sizeof(DCB);
-    if (!GetCommState(hComm, &dcb)) {
-        CloseHandle(hComm);
-        error = "Cannot read settings of " + port_name;
-        return false;
-    }
-    dcb.BaudRate = baud;
-    dcb.ByteSize = 8;
-    dcb.Parity = NOPARITY;
-    dcb.StopBits = ONESTOPBIT;
-    dcb.fBinary = TRUE;
-    dcb.fParity = FALSE;
-    dcb.fOutxCtsFlow = FALSE;
-    dcb.fOutxDsrFlow = FALSE;
-    dcb.fDtrControl = DTR_CONTROL_ENABLE;
-    dcb.fDsrSensitivity = FALSE;
-    dcb.fTXContinueOnXoff = TRUE;
-    dcb.fOutX = FALSE;
-    dcb.fInX = FALSE;
-    dcb.fRtsControl = RTS_CONTROL_ENABLE;
-    dcb.fAbortOnError = FALSE;
-    if (!SetCommState(hComm, &dcb)) {
-        CloseHandle(hComm);
-        error = "Cannot configure " + port_name + " (8N1, " + std::to_string(baud) + " baud)";
-        return false;
-    }
-
-    COMMTIMEOUTS timeouts{};
-    timeouts.ReadIntervalTimeout = 20;
-    timeouts.ReadTotalTimeoutMultiplier = 5;
-    timeouts.ReadTotalTimeoutConstant = 150;
-    timeouts.WriteTotalTimeoutMultiplier = 5;
-    timeouts.WriteTotalTimeoutConstant = 100;
-    if (!SetCommTimeouts(hComm, &timeouts)) {
-        CloseHandle(hComm);
-        error = "Cannot set timeouts on " + port_name;
-        return false;
-    }
-
-    PurgeComm(hComm, PURGE_RXCLEAR | PURGE_TXCLEAR);
-    serial_handle_ = static_cast<void*>(hComm);
-    return true;
+    transport::StreamOptions opts;
+    opts.baud = baud;
+    opts.dtr = true; // Some adapters power their RS-485 transceiver from DTR / RTS
+    opts.rts = true;
+    opts.read_timeout_ms = 20;
+    opts.drain_writes = true; // The reply timeout starts when the request has left the UART
+    return serial_.open(port_name, opts, &error);
 }
 
 void HuanyangVfdController::closePlatformPort() {
-    if (serial_handle_) CloseHandle(static_cast<HANDLE>(serial_handle_));
-    serial_handle_ = nullptr;
+    serial_.close();
 }
 
 bool HuanyangVfdController::platformPortOpen() const {
-    return serial_handle_ != nullptr;
+    return serial_.isOpen();
 }
 
 void HuanyangVfdController::flushPlatformPort() {
-    PurgeComm(static_cast<HANDLE>(serial_handle_), PURGE_RXCLEAR | PURGE_TXCLEAR);
+    serial_.flushInput();
 }
 
 bool HuanyangVfdController::writePlatformPort(const uint8_t* data, size_t len) {
-    DWORD bytes_written = 0;
-    return WriteFile(static_cast<HANDLE>(serial_handle_), data, static_cast<DWORD>(len), &bytes_written, NULL) &&
-           bytes_written == len;
+    return serial_.write(data, len);
 }
 
 size_t HuanyangVfdController::readPlatformPort(uint8_t* data, size_t max_len) {
-    DWORD bytes_read = 0;
-    if (!ReadFile(static_cast<HANDLE>(serial_handle_), data, static_cast<DWORD>(max_len), &bytes_read, NULL)) {
-        bytes_read = 0;
-    }
-    if (bytes_read == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    return bytes_read;
-}
-
-#else
-// ============================================================================
-// Raw Port I/O (POSIX termios: Linux, macOS)
-// ============================================================================
-namespace {
-bool toTermiosSpeed(uint32_t baud, speed_t& speed) {
-    switch (baud) {
-        case 1200:   speed = B1200;   return true;
-        case 2400:   speed = B2400;   return true;
-        case 4800:   speed = B4800;   return true;
-        case 9600:   speed = B9600;   return true;
-        case 19200:  speed = B19200;  return true;
-        case 38400:  speed = B38400;  return true;
-        case 57600:  speed = B57600;  return true;
-        case 115200: speed = B115200; return true;
-        default:     return false;
-    }
-}
-} // namespace
-
-bool HuanyangVfdController::openPlatformPort(const std::string& port_name, uint32_t baud, std::string& error) {
-    speed_t speed{};
-    if (!toTermiosSpeed(baud, speed)) {
-        error = "Unsupported baud rate " + std::to_string(baud);
-        return false;
-    }
-
-    // O_NONBLOCK so the open does not wait for a carrier signal; blocking mode is restored below
-    const int fd = ::open(port_name.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) {
-        const int err = errno;
-        error = "Cannot open " + port_name + ": " + std::strerror(err) +
-                (err == EACCES ? " (add your user to the 'dialout' or 'uucp' group)" : "");
-        return false;
-    }
-    // Exclusive access, like the Win32 share mode 0
-    ioctl(fd, TIOCEXCL);
-
-    termios tio{};
-    if (tcgetattr(fd, &tio) != 0) {
-        error = "Cannot read settings of " + port_name + ": " + std::strerror(errno);
-        ::close(fd);
-        return false;
-    }
-    // Raw 8N1, no flow control
-    cfmakeraw(&tio);
-    tio.c_cflag &= ~(PARENB | CSTOPB | CSIZE | CRTSCTS);
-    tio.c_cflag |= CS8 | CLOCAL | CREAD;
-    tio.c_iflag &= ~(IXON | IXOFF | IXANY);
-    // read() returns what has arrived, or 0 after 100 ms of silence
-    tio.c_cc[VMIN]  = 0;
-    tio.c_cc[VTIME] = 1;
-    cfsetispeed(&tio, speed);
-    cfsetospeed(&tio, speed);
-    if (tcsetattr(fd, TCSANOW, &tio) != 0) {
-        error = "Cannot configure " + port_name + " (8N1, " + std::to_string(baud) + " baud): " + std::strerror(errno);
-        ::close(fd);
-        return false;
-    }
-
-    const int flags = fcntl(fd, F_GETFL);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-
-    // DTR and RTS on, as on Windows (some adapters power their RS-485 transceiver from them)
-    int lines = TIOCM_DTR | TIOCM_RTS;
-    ioctl(fd, TIOCMBIS, &lines);
-
-    tcflush(fd, TCIOFLUSH);
-    serial_fd_ = fd;
-    return true;
-}
-
-void HuanyangVfdController::closePlatformPort() {
-    if (serial_fd_ >= 0) ::close(serial_fd_);
-    serial_fd_ = -1;
-}
-
-bool HuanyangVfdController::platformPortOpen() const {
-    return serial_fd_ >= 0;
-}
-
-void HuanyangVfdController::flushPlatformPort() {
-    tcflush(serial_fd_, TCIOFLUSH);
-}
-
-bool HuanyangVfdController::writePlatformPort(const uint8_t* data, size_t len) {
-    size_t written = 0;
-    while (written < len) {
-        const ssize_t n = ::write(serial_fd_, data + written, len - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        written += static_cast<size_t>(n);
-    }
-    // Wait until the frame has left the UART so the reply timeout starts at the end of the request
-    tcdrain(serial_fd_);
-    return true;
-}
-
-size_t HuanyangVfdController::readPlatformPort(uint8_t* data, size_t max_len) {
-    const ssize_t n = ::read(serial_fd_, data, max_len); // VTIME: returns 0 after 100 ms without data
+    const long n = serial_.read(data, max_len, 20);
     return n > 0 ? static_cast<size_t>(n) : 0;
 }
-#endif
 
 // ============================================================================
 // Worker Thread Loop

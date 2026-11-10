@@ -115,7 +115,7 @@ double dist3(const std::array<double, 4>& a, const std::array<double, 4>& b) {
 // ============================================================================
 // Construction / connection
 // ============================================================================
-MachineController::MachineController(std::unique_ptr<board::IBoardDriver> board)
+MachineController::MachineController(std::unique_ptr<board::IBoardDriver> board, bool connect_now)
     : board_(board ? std::move(board) : board::createBoardDriver(board::BoardType::RnrEcoMotion)) {
     max_slices_in_flight_ = std::max<size_t>(1, board_->capabilities().max_slices_in_flight);
     script_runner_ = std::make_unique<scripting::ScriptRunner>(this);
@@ -141,7 +141,7 @@ MachineController::MachineController(std::unique_ptr<board::IBoardDriver> board)
     program_          = std::make_shared<const gcode::ParseResult>();
     unwarped_program_ = program_;
 
-    if (!connect()) {
+    if (connect_now && !connect()) {
         setSimulatorMode(true);
     }
 
@@ -167,9 +167,82 @@ MachineController::~MachineController() {
 
 bool MachineController::connect() {
     std::lock_guard<std::mutex> lock(mutex_);
+    return connectLocked();
+}
+
+bool MachineController::firmwareBoardSelectedLocked() const {
+    const auto* d = board::BoardRegistry::instance().find(config_.board_id);
+    return d && d->family == board::Family::FirmwarePlanned;
+}
+
+void MachineController::closeFirmwarePathLocked() {
+    if (!fw_) return;
+    std::lock_guard<std::mutex> plock(fw_ptr_mutex_);
+    fw_->close();
+    fw_.reset();
+    ++caps_revision_;
+    // What the old board reported no longer applies
+    telemetry_.board_status_text.clear();
+    telemetry_.firmware_state.clear();
+    telemetry_.firmware_version.clear();
+    telemetry_.board_inputs_mask = 0;
+    telemetry_.thc_on_board = telemetry_.thc_board_active = telemetry_.thc_torch_on = false;
+    telemetry_.thc_arc_voltage = 0.0;
+    telemetry_.thc_board_mode.clear();
+    fw_arc_failed_seen_ = 0;
+}
+
+bool MachineController::connectLocked() {
     if (motionActiveLocked()) {
         stopJobLocked(true);
     }
+    board_id_ = config_.board_id;
+    telemetry_.board_id = board_id_;
+    if (firmwareBoardSelectedLocked()) {
+        // GRBL family: the board plans the motion; an RNR board left open is disarmed and released
+        if (board_->isOpen()) {
+            board_->emergencyStop();
+            setBoardOutputsLocked(0x00, false);
+            board_->close();
+        }
+        closeFirmwarePathLocked();
+        auto& profile = config_.board_profiles[board_id_];
+        board::completeProfile(board_id_, profile);
+        auto path = std::make_unique<motion::FirmwarePlannedPath>(board_id_, profile);
+        std::string err;
+        if (!path->open(hardware_access_enabled_.load(), &err)) {
+            telemetry_.usb_connected = false;
+            telemetry_.board_connecting = false;
+            telemetry_.board_status_text = err;
+            telemetry_.active_fault_message = "Cannot connect: " + err;
+            if (!telemetry_.simulator_mode) telemetry_.state = ControllerState::Disconnected;
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> plock(fw_ptr_mutex_);
+            fw_ = std::move(path);
+        }
+        ++caps_revision_;
+        const auto* desc = board::BoardRegistry::instance().find(board_id_);
+        telemetry_.usb_connected   = true;
+        telemetry_.board_connecting = true;
+        telemetry_.simulator_mode  = false;
+        telemetry_.product_name    = desc ? desc->display_name : board_id_;
+        telemetry_.serial_number   = fw_->connectionLabel();
+        telemetry_.firmware_version.clear();
+        telemetry_.board_status_text = fw_->feedback().status_text;
+        fw_outputs_applied_ = 0xFF;
+        telemetry_.outputs_bitmask     = 0;
+        telemetry_.torch_or_spindle_on = false;
+        telemetry_.limit_switch_triggered = false;
+        telemetry_.soft_limit_triggered   = false;
+        telemetry_.active_fault_message = "Connecting to " + telemetry_.product_name + " on " + fw_->connectionLabel() + "...";
+        telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
+        telemetry_.current_feed_mm_min = 0.0;
+        telemetry_.state = ControllerState::EStop;
+        return true;
+    }
+    closeFirmwarePathLocked();
     // Unit tests disable hardware access so a board that happens to be plugged in is never driven
     const bool blocked = board_->capabilities().accesses_real_hardware && !hardware_access_enabled_.load();
     if (blocked || !board_->open()) {
@@ -216,6 +289,10 @@ void MachineController::disconnect() {
     if (motionActiveLocked()) {
         stopJobLocked(true);
     }
+    if (fw_) {
+        closeFirmwarePathLocked();
+        telemetry_.board_connecting = false;
+    }
     if (board_->isOpen()) {
         board_->emergencyStop();
         setBoardOutputsLocked(0x00, false);
@@ -239,16 +316,26 @@ void MachineController::setSimulatorMode(bool enabled) {
     }
     telemetry_.simulator_mode = enabled;
     if (enabled) {
+        if (fw_) {
+            // The real board stays disarmed while the simulator drives the UI
+            fw_->emergencyStop();
+            closeFirmwarePathLocked();
+            telemetry_.board_connecting = false;
+        }
         if (board_->isOpen()) {
             // The real board must stay disarmed while the simulator drives the UI
             board_->emergencyStop();
             setBoardOutputsLocked(0x00, false);
         }
-        telemetry_.product_name  = "Virtual " + board_->capabilities().display_name + " (Simulator)";
+        telemetry_.product_name  = "Virtual " + getBoardCapabilitiesLocked().display_name + " (Simulator)";
         telemetry_.serial_number = "SIM-200HZ";
         if (telemetry_.state == ControllerState::Disconnected) {
             telemetry_.state = ControllerState::EStop;
         }
+    } else if (firmwareBoardSelectedLocked()) {
+        // Leaving the simulator with a firmware board selected: connect to it
+        telemetry_.axis_homed = {false, false, false, false};
+        if (!connectLocked()) telemetry_.state = ControllerState::Disconnected;
     } else if (board_->isOpen()) {
         const auto info = board_->info();
         telemetry_.product_name  = info.product_name;
@@ -272,7 +359,7 @@ void MachineController::setDryRunMode(bool enabled) {
         telemetry_.torch_or_spindle_on = false;
         telemetry_.outputs_bitmask &= ~core::OutputBit::OUT1_TorchOrSpindle;
         manual_spindle_requested_ = false;
-        if (board_->isOpen() && !telemetry_.simulator_mode) {
+        if (outputsLiveLocked()) {
             setBoardOutputsLocked(telemetry_.outputs_bitmask, false);
         }
     }
@@ -401,6 +488,7 @@ void MachineController::applyConfigLocked(const MachineConfig& cfg_in) {
     for (size_t a = 0; a < 4; ++a) {
         if (cfg.axes[a].steps_per_mm != config_.axes[a].steps_per_mm) steps_changed = true;
     }
+
     // Program diagnostics depend on the tool length mode (G43 warning): re-parse the loaded program
     if (cfg.tool_table.mode != config_.tool_table.mode || cfg.dwell_p_milliseconds != config_.dwell_p_milliseconds) {
         program_reparse_needed_ = true;
@@ -408,8 +496,33 @@ void MachineController::applyConfigLocked(const MachineConfig& cfg_in) {
 
     // A new output pin assignment: switch everything off once, so no output stays on under its old meaning
     const bool outputs_remapped = cfg.io.output_pin != config_.io.output_pin;
+    if (!board::BoardRegistry::instance().find(cfg.board_id)) cfg.board_id = board::kRnrBoardId;
+    const bool board_changed = cfg.board_id != config_.board_id;
+    if (board_changed) {
+        // Another board: release the connected one; the operator connects to the new board
+        const bool was_connected = (board_->isOpen() || fw_) && !telemetry_.simulator_mode;
+        if (board_->isOpen()) {
+            board_->emergencyStop();
+            setBoardOutputsLocked(0x00, false);
+            board_->close();
+        }
+        if (fw_) {
+            fw_->emergencyStop();
+            closeFirmwarePathLocked();
+        }
+        telemetry_.usb_connected = false;
+        telemetry_.board_connecting = false;
+        telemetry_.axis_homed = {false, false, false, false};
+        if (was_connected) {
+            telemetry_.state = ControllerState::Disconnected;
+            telemetry_.active_fault_message = "Board changed: press Connect";
+        }
+        ++caps_revision_;
+    }
 
     config_ = cfg;
+    board_id_ = cfg.board_id;
+    telemetry_.board_id = board_id_;
     config_.workspace_revision  = revision;
     config_.tool_table_revision = tt_revision;
     ++config_revision_;
@@ -435,7 +548,7 @@ void MachineController::applyConfigLocked(const MachineConfig& cfg_in) {
         }
     }
 
-    if (cfg.vfd.enabled && !vfd_controller_.isRunning()) {
+    if (cfg.vfd.enabled && !vfd_controller_.isRunning() && hardware_access_enabled_.load()) {
         vfd_controller_.start(cfg.vfd);
     } else if (!cfg.vfd.enabled && vfd_controller_.isRunning()) {
         vfd_controller_.stop();
@@ -456,7 +569,7 @@ void MachineController::setHuanyangVfdConfig(const HuanyangVfdConfig& config) {
     config_.vfd = config;
     if (config_.vfd.min_rpm > config_.vfd.max_rpm) config_.vfd.min_rpm = config_.vfd.max_rpm;
     ++config_revision_;
-    if (config.enabled && !vfd_controller_.isRunning()) {
+    if (config.enabled && !vfd_controller_.isRunning() && hardware_access_enabled_.load()) {
         vfd_controller_.start(config_.vfd);
     } else if (!config.enabled && vfd_controller_.isRunning()) {
         vfd_controller_.stop();
@@ -490,6 +603,10 @@ TelemetrySnapshot MachineController::getTelemetry() const {
         diag::controllerReadWait().add(Clock::now() - wait_start);
         telem = telemetry_;
         telem.physical_outputs_bitmask = io::physicalOutputs(config_.io, telem.outputs_bitmask);
+        telem.board_id = config_.board_id;
+        telem.board_firmware_planned = firmwareBoardSelectedLocked();
+        telem.board_busy = fwActiveLocked() && (fw_->busy() || !fw_->ready());
+        telem.capabilities_revision = caps_revision_ + (fw_ ? fw_->capabilitiesRevision() * 1000003ULL : 0);
     }
     // Script state is queried without holding the controller lock (the script thread calls back into us)
     if (script_runner_) {
@@ -519,6 +636,11 @@ void MachineController::triggerEStop() {
     if (board_->isOpen()) {
         board_->emergencyStop();
     }
+    {
+        // Firmware board: soft reset at once (written straight to the port, safe from any thread)
+        std::lock_guard<std::mutex> plock(fw_ptr_mutex_);
+        if (fw_ && fw_->isOpen()) fw_->emergencyStop();
+    }
     if (script_runner_) {
         script_runner_->cancel();
     }
@@ -542,6 +664,49 @@ void MachineController::faultLocked(const std::string& message, ControllerState 
 
 bool MachineController::resetFromEStop() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!telemetry_.simulator_mode && firmwareBoardSelectedLocked()) {
+        if (!fwActiveLocked()) {
+            telemetry_.active_fault_message = "Cannot reset: the board is not connected";
+            return false;
+        }
+        if (!fw_->ready()) {
+            telemetry_.active_fault_message = "Cannot reset: the board is still connecting";
+            return false;
+        }
+        evaluateInputsAndEndStopsLocked();
+        if (fw_->feedback().estop_active) {
+            telemetry_.active_fault_message = "Cannot reset: the board's E-stop input is still active";
+            return false;
+        }
+        if (config_.vfd.enabled) {
+            const auto vt = vfd_controller_.getTelemetry();
+            if (vt.anyAlarm()) {
+                telemetry_.active_fault_message = "Cannot reset: clear the VFD alarm first (" + vt.last_error_msg + ")";
+                return false;
+            }
+        }
+        if (fw_->inAlarm()) {
+            std::string err;
+            if (!fw_->unlock(&err)) {
+                telemetry_.active_fault_message = "Cannot reset: " + err;
+                return false;
+            }
+        }
+        fw_outputs_applied_ = 0xFF;
+        telemetry_.limit_switch_triggered = false;
+        telemetry_.soft_limit_triggered   = false;
+        telemetry_.active_fault_message.clear();
+        if (config_.require_homing) {
+            for (size_t a = 0; a < 3; ++a) {
+                if (!telemetry_.axis_homed[a]) {
+                    telemetry_.active_fault_message = "Machine not homed: home it before running programs in machine coordinates";
+                    break;
+                }
+            }
+        }
+        telemetry_.state = ControllerState::Idle;
+        return true;
+    }
     const bool hw = !telemetry_.simulator_mode;
     if (hw && !board_->isOpen()) {
         telemetry_.active_fault_message = "Cannot reset: motion board is not connected";
@@ -611,6 +776,10 @@ bool MachineController::readyForCommandLocked(bool allow_tool_change_hold, const
     const bool ok_state = (s == ControllerState::Idle) ||
                           (allow_tool_change_hold && s == ControllerState::ToolChangeHold);
     if (!ok_state || cont_jog_active_ || hold_decel_active_) {
+        return false;
+    }
+    if (fwActiveLocked() && (fw_->busyWithMotion() || !fw_->ready())) {
+        telemetry_.active_fault_message = std::string(what) + " rejected: the board is busy";
         return false;
     }
     if (telemetry_.surface_probing_active) {
@@ -750,6 +919,10 @@ void MachineController::goToWorkZeroXY() {
     if (!checkLinearMoveLocked(cur, up) || !checkLinearMoveLocked(up, xy)) return;
     if (safe_z - cur[2] > 1e-3) addRapid(cur, up);
     addRapid(up, xy);
+    if (fwActiveLocked()) {
+        fwStartManualMovesLocked(moves, ControllerState::Jogging);
+        return;
+    }
     MachineConfig manual_cfg = config_;
     manual_cfg.is_mill = true; // Manual moves: no laser Z lock / output rules
     slice_queue_ = planner::TrajectoryPlanner::sliceProgram(moves, manual_cfg);
@@ -895,6 +1068,8 @@ void MachineController::measureToolLength(uint16_t tool) {
 // Soft limits
 // ============================================================================
 bool MachineController::withinSoftLimitsLocked(const std::array<double, 4>& machine_pt, std::string* err) const {
+    // Firmware boards enforce their own soft limits ($20); the app's limits belong to its own motor settings
+    if (fwActiveLocked()) return true;
     for (size_t a = 0; a < 4; ++a) {
         const auto& ax = config_.axes[a];
         // Soft limits are only meaningful relative to a homed machine coordinate system
@@ -927,6 +1102,15 @@ bool MachineController::queueLinearMoveLocked(const std::array<double, 4>& end_w
 {
     const std::array<double, 4> start_w = telemetry_.work_pos_mm;
     if (!checkLinearMoveLocked(start_w, end_work)) return false;
+    if (fwActiveLocked()) {
+        ToolpathSegment s{};
+        s.type          = rapid ? SegmentType::RapidMove : SegmentType::CutLinear;
+        s.start_xyza_mm = start_w;
+        s.end_xyza_mm   = end_work;
+        s.feed_mm_min   = feed_mm_min;
+        s.length_mm     = dist3(start_w, end_work);
+        return fwStartManualMovesLocked({s}, state);
+    }
     if (rapid) {
         ToolpathSegment s{};
         s.type          = SegmentType::RapidMove;
@@ -950,11 +1134,29 @@ void MachineController::jogStartContinuous(core::Axis axis, bool positive_dir, d
     const size_t idx = static_cast<size_t>(axis);
     if (idx >= 4) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (idx == 3 && config_.gantryMasterAxis() >= 0) return; // A slaved motor only moves with its master
+    // A slaved motor only moves with its master (RNR; firmware boards gang motors in the firmware)
+    if (idx == 3 && config_.gantryMasterAxis() >= 0 && config_.board_id == board::kRnrBoardId) return;
     const auto s = telemetry_.state;
     const bool state_ok = (s == ControllerState::Idle || s == ControllerState::ToolChangeHold ||
                            (s == ControllerState::Jogging && cont_jog_active_));
     if (!state_ok || hold_decel_active_ || telemetry_.surface_probing_active) {
+        return;
+    }
+
+    if (fwActiveLocked()) {
+        // Firmware board: the core keeps the dead-man and the target velocity, the jog feeder streams $J= lines
+        if (!fw_->ready()) return;
+        if (!cont_jog_active_) {
+            if (fw_->busyWithMotion()) return;
+            cont_jog_held_ = {false, false, false, false};
+            cont_jog_target_vel_mm_s_ = {0.0, 0.0, 0.0, 0.0};
+        }
+        const double max_vel = fwAxisMaxVelocityLocked(idx);
+        cont_jog_held_[idx]            = true;
+        cont_jog_refresh_[idx]         = Clock::now();
+        cont_jog_active_               = true;
+        cont_jog_target_vel_mm_s_[idx] = std::clamp(speed_ratio, 0.05, 1.0) * max_vel * (positive_dir ? 1.0 : -1.0);
+        telemetry_.state               = ControllerState::Jogging;
         return;
     }
 
@@ -997,8 +1199,20 @@ void MachineController::jogStep(core::Axis axis, double delta_mm, double feed_mm
     const size_t idx = static_cast<size_t>(axis);
     if (idx >= 4) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (idx == 3 && config_.gantryMasterAxis() >= 0) return; // A slaved motor only moves with its master
+    // A slaved motor only moves with its master (RNR; firmware boards gang motors in the firmware)
+    if (idx == 3 && config_.gantryMasterAxis() >= 0 && config_.board_id == board::kRnrBoardId) return;
     if (!readyForCommandLocked(true, "Jog")) return;
+
+    if (fwActiveLocked()) {
+        const double feed = std::clamp(feed_mm_min, 1.0, fwAxisMaxVelocityLocked(idx) * 60.0);
+        std::string err;
+        if (!fw_->jogStep(idx, delta_mm, feed, &err)) {
+            telemetry_.active_fault_message = "Jog rejected: " + err;
+            return;
+        }
+        telemetry_.state = ControllerState::Jogging;
+        return;
+    }
 
     std::array<double, 4> start_work = telemetry_.work_pos_mm;
     std::array<double, 4> end_work   = start_work;
@@ -1032,11 +1246,38 @@ void MachineController::jogStop() {
         // Step jog / MDI move: decelerate along the path instead of cutting the pulse stream
         beginHoldDecelLocked(true);
     }
+    if (fwActiveLocked() && !cont_jog_active_ && telemetry_.state == ControllerState::Jogging && fw_->busy()) {
+        fw_->stop(); // Jog cancel / controlled stop of the move
+    }
 }
 
 void MachineController::updateContinuousJogLocked() {
     if (!cont_jog_active_) return;
     const auto now = Clock::now();
+    if (fwActiveLocked()) {
+        std::array<double, 4> vel{};
+        bool any_held = false;
+        for (size_t a = 0; a < 4; ++a) {
+            if (cont_jog_held_[a] && now - cont_jog_refresh_[a] > std::chrono::milliseconds(kJogDeadmanMs)) {
+                cont_jog_held_[a] = false; // Dead-man: no refresh = released
+                cont_jog_target_vel_mm_s_[a] = 0.0;
+            }
+            if (cont_jog_held_[a]) {
+                vel[a] = cont_jog_target_vel_mm_s_[a];
+                any_held = true;
+            }
+        }
+        fw_->setJogVelocity(vel);
+        if (!any_held && !fw_->jogActive()) {
+            cont_jog_active_ = false;
+            telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
+            if (telemetry_.state == ControllerState::Jogging) {
+                telemetry_.state = (telemetry_.pending_tool_number > 0) ? ControllerState::ToolChangeHold
+                                                                          : ControllerState::Idle;
+            }
+        }
+        return;
+    }
     bool any_axis_moving = false;
     StepSlice ms{};
     ms.outputs_mask = telemetry_.outputs_bitmask;
@@ -1118,7 +1359,7 @@ void MachineController::updateContinuousJogLocked() {
                                    ? ControllerState::ToolChangeHold
                                    : ControllerState::Idle;
         }
-        if (board_->isOpen() && !telemetry_.simulator_mode) {
+        if (outputsLiveLocked()) {
             setBoardOutputsAfterMotionLocked(telemetry_.outputs_bitmask, config_.limit_override);
         }
     }
@@ -1164,7 +1405,7 @@ void MachineController::setTorchOrSpindle(bool enabled) {
             telemetry_.spindle_ramping_down = true;
         }
     }
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
+    if (outputsLiveLocked()) {
         setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
     }
     // The VFD run/stop command follows within one worker tick (see updateSpindleLocked)
@@ -1193,7 +1434,7 @@ void MachineController::setAuxOutput(uint8_t out_index_1_to_4, bool enabled) {
     if (out_index_1_to_4 == 1) {
         manual_spindle_requested_ = enabled;
     }
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
+    if (outputsLiveLocked()) {
         setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
     }
 }
@@ -1216,7 +1457,7 @@ void MachineController::setPhysicalOutput(uint8_t out_1_to_4, bool enabled) {
             } else {
                 telemetry_.outputs_bitmask &= ~bit;
             }
-            if (board_->isOpen() && !telemetry_.simulator_mode) {
+            if (outputsLiveLocked()) {
                 setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
             }
             return;
@@ -1226,10 +1467,18 @@ void MachineController::setPhysicalOutput(uint8_t out_1_to_4, bool enabled) {
 }
 
 void MachineController::setBoardOutputsLocked(uint8_t logical_mask, bool limit_override) {
+    if (fwActiveLocked()) {
+        fwApplyOutputsLocked(logical_mask);
+        return;
+    }
     board_->setOutputs(io::physicalOutputs(config_.io, logical_mask), limit_override);
 }
 
 void MachineController::setBoardOutputsAfterMotionLocked(uint8_t logical_mask, bool limit_override) {
+    if (fwActiveLocked()) {
+        fwApplyOutputsLocked(logical_mask);
+        return;
+    }
     board_->setOutputsAfterMotion(io::physicalOutputs(config_.io, logical_mask), limit_override);
 }
 
@@ -1295,6 +1544,8 @@ void MachineController::setSpindlePwm(uint16_t duty) {
 
     if (board_->isOpen() && !telemetry_.simulator_mode) {
         board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+    } else if (fwActiveLocked()) {
+        fwSpindleSpeedChangedLocked();
     }
     if (config_.vfd.enabled) {
         vfd_controller_.setRpm(telemetry_.commanded_spindle_rpm);
@@ -1318,6 +1569,8 @@ void MachineController::setSpindleSpeedRpm(uint32_t rpm) {
         telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
         if (board_->isOpen() && !telemetry_.simulator_mode) {
             board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+        } else if (fwActiveLocked()) {
+            fwSpindleSpeedChangedLocked();
         }
     }
     if (config_.vfd.enabled) {
@@ -1337,6 +1590,8 @@ void MachineController::resetSpindleSpeedOverride() {
         telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
         if (board_->isOpen() && !telemetry_.simulator_mode) {
             board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+        } else if (fwActiveLocked()) {
+            fwSpindleSpeedChangedLocked();
         }
     }
     if (config_.vfd.enabled) {
@@ -1377,7 +1632,7 @@ void MachineController::setAirAssist(bool enabled) {
         telemetry_.outputs_bitmask &= ~core::OutputBit::OUT3_FloodCoolant;
     }
     telemetry_.laser_air_assist_active = enabled;
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
+    if (outputsLiveLocked()) {
         setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
     }
 }
@@ -1399,7 +1654,7 @@ void MachineController::setRedPointer(bool enabled) {
         telemetry_.outputs_bitmask &= ~core::OutputBit::OUT2_SpindleDir;
     }
     telemetry_.laser_red_pointer_active = enabled;
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
+    if (outputsLiveLocked()) {
         setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
     }
 }
@@ -1419,6 +1674,18 @@ void MachineController::testFireLaserPulse(float duration_ms, float power_pct) {
         (config_.laser.laser_fault_pin >= 1 && telemetry_.laser_fault_active))
     {
         telemetry_.active_fault_message = "Laser test pulse blocked: safety interlock not satisfied (door / chiller / PSU)";
+        return;
+    }
+    if (fwActiveLocked()) {
+        // Firmware board: constant power (M3) for the pulse time, at standstill
+        const double secs = std::clamp(static_cast<double>(duration_ms) / 1000.0, 0.01, 2.0);
+        const float pct = std::clamp(power_pct, 1.0f, 100.0f);
+        const double duty = config_.laser.min_duty_pct + (pct / 100.0) * (config_.laser.max_duty_pct - config_.laser.min_duty_pct);
+        const double s_val = std::clamp(duty, 0.0, 100.0) / 100.0 * fw_->firmware().max_spindle_rpm;
+        std::string err;
+        if (!fw_->runLines({"M3S" + motion::GcodeEmitter::num(s_val, 0), "G4P" + motion::GcodeEmitter::num(secs, 3), "M5"}, &err)) {
+            telemetry_.active_fault_message = "Laser test pulse rejected: " + err;
+        }
         return;
     }
     pulse_active_ = true;
@@ -1497,6 +1764,28 @@ void MachineController::frameBoundingBox() {
         if (!checkLinearMoveLocked(telemetry_.work_pos_mm, p)) return;
     }
 
+    if (fwActiveLocked()) {
+        std::vector<ToolpathSegment> moves;
+        std::array<double, 4> from = telemetry_.work_pos_mm;
+        for (const auto& p : pts) {
+            ToolpathSegment seg{};
+            seg.type = SegmentType::CutLinear;
+            seg.start_xyza_mm = from;
+            seg.end_xyza_mm = p;
+            seg.feed_mm_min = speed;
+            moves.push_back(seg);
+            from = p;
+        }
+        motion::OutputRequest beam;
+        if ((out_mask & core::OutputBit::OUT1_TorchOrSpindle) != 0 && framing_duty > 0) {
+            beam.spindle_on = true;
+            beam.laser = true;
+            beam.laser_dynamic = false;
+            beam.s_value = framing_duty / 1000.0 * fw_->firmware().max_spindle_rpm;
+        }
+        fwStartManualMovesLocked(moves, ControllerState::Jogging, beam.spindle_on ? &beam : nullptr);
+        return;
+    }
     MachineConfig manual_cfg = config_;
     manual_cfg.is_mill = true; // Framing moves: no laser Z lock / output rewriting
     slice_queue_.clear();
@@ -1691,6 +1980,18 @@ void MachineController::homeAxis(core::Axis axis) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!readyForCommandLocked(false, "Homing")) return;
     if (static_cast<size_t>(axis) >= 4) return;
+    if (fwActiveLocked()) {
+        // The board runs its own homing cycle with its own settings ($22..$27)
+        const uint8_t mask = static_cast<uint8_t>(1U << static_cast<size_t>(axis));
+        std::string err;
+        if (!fw_->startHoming(mask, &err)) {
+            telemetry_.active_fault_message = "Homing rejected: " + err;
+            return;
+        }
+        fw_homing_mask_ = mask;
+        telemetry_.state = ControllerState::Homing;
+        return;
+    }
 
     if (config_.scripting.enabled && config_.scripting.home_script_enabled && script_runner_) {
         std::string resolved = scripting::resolveScriptPath(config_.scripting.home_script_path);
@@ -1708,6 +2009,16 @@ void MachineController::homeAxis(core::Axis axis) {
 void MachineController::homeAllAxes() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!readyForCommandLocked(false, "Homing")) return;
+    if (fwActiveLocked()) {
+        std::string err;
+        if (!fw_->startHoming(0, &err)) {
+            telemetry_.active_fault_message = "Homing rejected: " + err;
+            return;
+        }
+        fw_homing_mask_ = 0;
+        telemetry_.state = ControllerState::Homing;
+        return;
+    }
 
     if (config_.scripting.enabled && config_.scripting.home_script_enabled && script_runner_) {
         std::string resolved = scripting::resolveScriptPath(config_.scripting.home_script_path);
@@ -1733,7 +2044,7 @@ bool MachineController::beginProbeMoveLocked(core::Axis axis, double signed_trav
 {
     const size_t idx = static_cast<size_t>(axis);
     if (idx >= 4 || std::abs(signed_travel_mm) < 1e-6) return false;
-    if (!telemetry_.simulator_mode && config_.probe.probe_pin == 0) {
+    if (probeInputMissingLocked()) {
         telemetry_.active_fault_message = "Probing rejected: no probe input is configured";
         return false;
     }
@@ -1751,6 +2062,24 @@ bool MachineController::beginProbeMoveLocked(core::Axis axis, double signed_trav
         end_w[idx] += signed_travel_mm;
     }
     if (!checkLinearMoveLocked(start_w, end_w)) return false;
+
+    if (fwActiveLocked()) {
+        motion::ProbeRequest req;
+        req.target_mm = workToMachineLocked(end_w);
+        req.feed_mm_min = std::max(5.0, feed_mm_min);
+        std::string err;
+        if (!fw_->startProbe(req, &err)) {
+            telemetry_.active_fault_message = "Probing rejected: " + err;
+            return false;
+        }
+        probe_contact_captured_ = false;
+        probe_move_is_search_   = true;
+        active_probe_axis_      = axis;
+        active_probe_pos_dir_   = (signed_travel_mm >= 0.0);
+        telemetry_.last_probe_hit = false;
+        telemetry_.state = ControllerState::Probing;
+        return true;
+    }
 
     if (board_->isOpen() && !telemetry_.simulator_mode) {
         board_->armProbe(static_cast<Axis>(idx));
@@ -1988,7 +2317,7 @@ void MachineController::probeWorkAxisEdge(core::Axis axis, bool positive_dir) {
 void MachineController::probeHoleCenterXY(double approx_diameter_mm) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!readyForCommandLocked(false, "Probing")) return;
-    if (!telemetry_.simulator_mode && config_.probe.probe_pin == 0) {
+    if (probeInputMissingLocked()) {
         telemetry_.active_fault_message = "Probing rejected: no probe input is configured";
         return;
     }
@@ -2023,7 +2352,7 @@ void MachineController::startSurfaceProbing(double min_x, double max_x, double m
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!readyForCommandLocked(true, "Surface probing")) return;
-        if (!telemetry_.simulator_mode && config_.probe.probe_pin == 0) {
+        if (probeInputMissingLocked()) {
             telemetry_.active_fault_message = "Surface probing rejected: no probe input is configured";
             return;
         }
@@ -2530,6 +2859,8 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
             telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
             if (board_->isOpen() && !telemetry_.simulator_mode) {
                 board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
+            } else if (fwActiveLocked()) {
+                fwSpindleSpeedChangedLocked();
             }
         }
         if (config_.vfd.enabled) {
@@ -2569,7 +2900,7 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
         telemetry_.outputs_bitmask &= ~(core::OutputBit::OUT3_FloodCoolant | core::OutputBit::OUT4_MistCoolant);
         outputs_changed = true;
     }
-    if (outputs_changed && board_->isOpen() && !telemetry_.simulator_mode) {
+    if (outputs_changed && outputsLiveLocked()) {
         setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
     }
 
@@ -2581,6 +2912,9 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
         seg.outputs_mask    = telemetry_.outputs_bitmask;
         seg.workspace_index = telemetry_.active_workspace;
         moves.push_back(seg);
+    }
+    if (!moves.empty() && fwActiveLocked()) {
+        return fwStartManualMovesLocked(moves, ControllerState::Jogging);
     }
     if (!moves.empty()) {
         MachineConfig mdi_cfg = config_;
@@ -2675,6 +3009,8 @@ bool MachineController::validateProgramForRunLocked(size_t start_seg) {
     in.simulator        = telemetry_.simulator_mode;
     in.start_segment    = start_seg;
     in.include_warnings = false;
+    in.board_thc        = fwActiveLocked() && fw_->boardRunsThc();
+    fillBoardLimitsLocked(in.board);
     const auto check = checkProgramAgainstMachine(prog, config_, in);
     if (!check.start_refusal.empty()) {
         telemetry_.active_fault_message = check.start_refusal;
@@ -2696,7 +3032,11 @@ std::shared_ptr<const ProgramCheckResult> MachineController::getProgramCheck() c
         in.frame     = jobFrameLocked();
         in.homed     = telemetry_.axis_homed;
         in.simulator = telemetry_.simulator_mode;
+        in.board_thc = fw_ && fw_->isOpen() && fw_->boardRunsThc();
+        fillBoardLimitsLocked(in.board);
         key.program          = prog.get();
+        key.board_thc        = in.board_thc;
+        key.board            = in.board;
         key.frame            = in.frame;
         key.homed            = in.homed;
         key.simulator        = in.simulator;
@@ -2717,7 +3057,8 @@ std::shared_ptr<const ProgramCheckResult> MachineController::getProgramCheck() c
 }
 
 bool MachineController::ProgramCheckKey::operator==(const ProgramCheckKey& o) const {
-    return program == o.program && homed == o.homed && simulator == o.simulator &&
+    return program == o.program && homed == o.homed && simulator == o.simulator && board_thc == o.board_thc &&
+           board == o.board &&
            config_revision == o.config_revision && tool_revision == o.tool_revision &&
            frame.enabled == o.frame.enabled && frame.workspace_offsets == o.frame.workspace_offsets &&
            frame.plan_workspace == o.frame.plan_workspace && frame.apply_tool_lengths == o.frame.apply_tool_lengths &&
@@ -2733,6 +3074,28 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
     }
 
     job_frame_ = jobFrameLocked();
+    size_t program_first = start_from_segment;
+    std::array<double, 4> plan_start{};
+    std::vector<ToolpathSegment> prefix = buildJobPrefixLocked(start_from_segment, resume_in_place, program_first, plan_start);
+
+    planner::PlannerOptions opts;
+    opts.feed_override_pct       = telemetry_.feed_override_pct;
+    opts.pierce_delay_override_s = telemetry_.pierce_delay_override_s;
+    opts.dry_run_no_torch        = telemetry_.dry_run_mode;
+    opts.slice_dt_sec            = kDtSec;
+    job_planner_ = std::make_unique<planner::StreamingPlanner>(config_, plan_start, opts, job_frame_);
+    job_planner_->setSource(std::move(prefix),
+                            std::shared_ptr<const std::vector<ToolpathSegment>>(program_, &program_->segments),
+                            program_first);
+    job_planner_->plan(slice_queue_, kRefillAmount * 2);
+}
+
+
+// Approach moves before a job (start lift to safe Z, Run From Line, resume in place), in the planning frame of
+// job_frame_ (set by the caller). Shared by the slice planner and firmware-planned boards.
+std::vector<ToolpathSegment> MachineController::buildJobPrefixLocked(size_t start_from_segment, bool resume_in_place,
+                                                                     size_t& program_first, std::array<double, 4>& plan_start) {
+    const auto& segs = program_->segments;
     const uint8_t plan_ws = job_frame_.plan_workspace;
     const auto& offsets = job_frame_.workspace_offsets;
     auto toPlan = [&](const std::array<double, 4>& p, uint8_t ws) {
@@ -2748,7 +3111,7 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
     std::vector<ToolpathSegment> prefix;
     // Planning frame = spindle frame of the active WCS (tool length offsets come from the segments)
     std::array<double, 4> cur = planFramePosLocked();
-    const std::array<double, 4> plan_start = cur;
+    plan_start = cur;
 
     // Safe retract height (configured for the tool tip): never above the Z soft limit of a homed machine
     double safe_z = std::max(cur[2], config_.start_safe_z_mm + activeTloLocked());
@@ -2836,7 +3199,7 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
         return d;
     };
 
-    size_t program_first = start_from_segment;
+    program_first = start_from_segment;
 
     if (resume_in_place) {
         // Resuming from Feed Hold: the tool sits on the path; continue the interrupted segment from here
@@ -2932,16 +3295,7 @@ void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bo
         p.length_mm = dist3(p.start_xyza_mm, p.end_xyza_mm);
     }
 
-    planner::PlannerOptions opts;
-    opts.feed_override_pct       = telemetry_.feed_override_pct;
-    opts.pierce_delay_override_s = telemetry_.pierce_delay_override_s;
-    opts.dry_run_no_torch        = telemetry_.dry_run_mode;
-    opts.slice_dt_sec            = kDtSec;
-    job_planner_ = std::make_unique<planner::StreamingPlanner>(config_, plan_start, opts, job_frame_);
-    job_planner_->setSource(std::move(prefix),
-                            std::shared_ptr<const std::vector<ToolpathSegment>>(program_, &program_->segments),
-                            program_first);
-    job_planner_->plan(slice_queue_, kRefillAmount * 2);
+    return prefix;
 }
 
 void MachineController::refillJobQueueLocked() {
@@ -3028,6 +3382,19 @@ void MachineController::startJob() {
         }
     }
 
+    bool fw_m0_resume = false;
+    if (fwActiveLocked() && telemetry_.state == ControllerState::PausedHold) {
+        if (fw_->jobActive()) {
+            // Feed hold on the board: cycle start continues the buffered motion
+            fw_->resume();
+            telemetry_.state = ControllerState::RunningGCode;
+            telemetry_.active_fault_message.clear();
+            fw_state_grace_until_ = Clock::now() + std::chrono::milliseconds(400);
+            return;
+        }
+        fw_m0_resume = fw_program_stop_;
+    }
+
     if (telemetry_.state != ControllerState::Idle &&
         telemetry_.state != ControllerState::PausedHold &&
         telemetry_.state != ControllerState::ToolChangeHold)
@@ -3037,14 +3404,27 @@ void MachineController::startJob() {
     if (cont_jog_active_ || (!slice_queue_.empty() && telemetry_.state == ControllerState::Idle)) {
         return;
     }
+    if (fwActiveLocked() && (!fw_->ready() || fw_->busyWithMotion())) {
+        telemetry_.active_fault_message = "Cycle Start rejected: the board is busy";
+        return;
+    }
+    if (fwActiveLocked() && !config_.is_mill && config_.operation_mode == OperationMode::Plasma &&
+        (config_.thc.enabled || config_.thc.wait_for_arc_ok) && !fw_->boardRunsThc()) {
+        telemetry_.active_fault_message = "Cycle Start rejected: torch height control and Wait for Arc OK need a board "
+                                          "with real-time control; switch THC off for this board";
+        return;
+    }
 
-    const bool resume_in_place = (telemetry_.state == ControllerState::PausedHold) && last_sent_from_program_;
+    const bool resume_in_place = fw_m0_resume ||
+        ((telemetry_.state == ControllerState::PausedHold) && last_sent_from_program_ && !fwActiveLocked());
 
     // If resuming from Manual Tool Change Hold (M6), confirm the new tool is installed
     const bool was_tool_hold = (telemetry_.state == ControllerState::ToolChangeHold || telemetry_.pending_tool_number > 0);
 
     size_t start_seg = telemetry_.active_segment_index;
-    if (telemetry_.state == ControllerState::PausedHold && last_sent_program_segment_valid_) {
+    if (fw_m0_resume) {
+        start_seg = fw_resume_segment_;
+    } else if (telemetry_.state == ControllerState::PausedHold && last_sent_program_segment_valid_ && !fwActiveLocked()) {
         // Resume from the segment that was actually sent last (acknowledgements may lag behind)
         start_seg = last_sent_program_segment_;
     }
@@ -3086,6 +3466,13 @@ void MachineController::startJob() {
     hold_needs_replan_ = false;
     resume_after_hold_ = false;
     stop_after_hold_   = false;
+    if (fwActiveLocked()) {
+        fw_program_stop_ = false;
+        if (fwStartJobLocked(start_seg, resume_in_place)) {
+            telemetry_.state = ControllerState::RunningGCode;
+        }
+        return;
+    }
     rebuildPlannedSlicesLocked(start_seg, resume_in_place);
     telemetry_.state = slice_queue_.empty() ? ControllerState::Idle : ControllerState::RunningGCode;
 }
@@ -3099,6 +3486,15 @@ void MachineController::pauseJobLocked() {
     if (telemetry_.state != ControllerState::RunningGCode && telemetry_.state != ControllerState::DwellPierce) {
         return;
     }
+    if (fwActiveLocked()) {
+        // Feed hold on the board: it decelerates on the path; spindle and coolant stay on
+        telemetry_.state = ControllerState::PausedHold;
+        telemetry_.current_feed_mm_min = 0.0;
+        fw_->hold();
+        fw_seen_held_ = false;
+        fw_state_grace_until_ = Clock::now() + std::chrono::milliseconds(400);
+        return;
+    }
     telemetry_.state = ControllerState::PausedHold;
     telemetry_.current_feed_mm_min = 0.0;
     manual_spindle_requested_ = false;
@@ -3109,7 +3505,7 @@ void MachineController::pauseJobLocked() {
         telemetry_.spindle_ramping_down = false;
         telemetry_.torch_or_spindle_on = false;
         telemetry_.outputs_bitmask &= ~core::OutputBit::OUT1_TorchOrSpindle;
-        if (board_->isOpen() && !telemetry_.simulator_mode) {
+        if (outputsLiveLocked()) {
             setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
         }
     }
@@ -3153,6 +3549,16 @@ void MachineController::stopJobLocked(bool is_estop) {
         script_runner_->cancel();
     }
 
+    if (fwActiveLocked()) {
+        if (is_estop && !suppress_fw_estop_) {
+            fw_->emergencyStop();
+        } else if (!is_estop && fw_->busy()) {
+            fw_->stop();
+        }
+        fw_program_stop_ = false;
+        fw_sync_wait_ = false;
+        fw_outputs_applied_ = 0xFF;
+    }
     const bool hw = board_->isOpen() && !telemetry_.simulator_mode;
     if (hw && is_estop) {
         // Halt the board first, then the outputs, then drop anything still buffered
@@ -3242,6 +3648,14 @@ void MachineController::stopJobLocked(bool is_estop) {
 
 void MachineController::stopJob() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (fwActiveLocked() && fw_->busy() && !fw_->stopping()) {
+        // Controlled stop on the board: hold, wait, reset (position kept); JobFinished / MoveDone follow
+        fw_->stop();
+        if (fw_->busy()) {
+            telemetry_.active_fault_message = "Stopping...";
+            return;
+        }
+    }
     const auto s = telemetry_.state;
     const bool path_motion = (s == ControllerState::RunningGCode || s == ControllerState::DwellPierce ||
                               (s == ControllerState::Jogging && !cont_jog_active_) ||
@@ -3257,7 +3671,9 @@ void MachineController::stopJob() {
 void MachineController::setFeedOverride(float percent) {
     std::lock_guard<std::mutex> lock(mutex_);
     float old_pct = telemetry_.feed_override_pct;
-    telemetry_.feed_override_pct = std::clamp(percent, 10.0f, 250.0f);
+    const float max_pct = firmwareBoardSelectedLocked() ? 200.0f : 250.0f;
+    telemetry_.feed_override_pct = std::clamp(percent, 10.0f, max_pct);
+    if (fwActiveLocked()) fw_->setFeedOverride(telemetry_.feed_override_pct);
     if (std::abs(old_pct - telemetry_.feed_override_pct) < 0.5f) {
         return;
     }
@@ -3325,6 +3741,44 @@ bool MachineController::anyLimitActiveLocked(std::string* desc) const {
 }
 
 void MachineController::evaluateInputsAndEndStopsLocked() {
+    if (fwActiveLocked()) {
+        // Firmware board: inputs are the board's fixed terminals (Pn:); limits and the door are handled by the board
+        const auto& fb = fw_->feedback();
+        telemetry_.inputs_bitmask       = 0;
+        telemetry_.board_inputs_mask    = fb.inputs_mask;
+        telemetry_.probe_contact_active = fb.probe_active;
+        telemetry_.thc_on_board         = fw_->boardRunsThc();
+        telemetry_.thc_arc_ok_active    = fb.arc_ok;
+        telemetry_.thc_up_active        = fb.thc_up;
+        telemetry_.thc_down_active      = fb.thc_down;
+        telemetry_.thc_anti_dive_locked = fb.thc_velocity_lock || fb.thc_void_lock;
+        telemetry_.thc_board_active     = fb.thc_active;
+        telemetry_.thc_torch_on         = fb.torch_on;
+        telemetry_.thc_arc_voltage      = fb.arc_voltage;
+        if (!telemetry_.thc_on_board) {
+            telemetry_.thc_board_mode.clear();
+        } else if (fw_thc_mode_rev_ != fw_->capabilitiesRevision() || telemetry_.thc_board_mode.empty()) {
+            fw_thc_mode_rev_ = fw_->capabilitiesRevision();
+            telemetry_.thc_board_mode = fw_->capabilities().board_thc_mode;
+        }
+        if (fb.arc_failed_count != fw_arc_failed_seen_) {
+            fw_arc_failed_seen_ = fb.arc_failed_count;
+            telemetry_.active_fault_message = "The torch did not start (no Arc OK): the board paused the job. "
+                                              "Check the torch and press Cycle Start, or Stop.";
+        }
+        telemetry_.limit_switch_triggered = fb.limit_active && telemetry_.state == ControllerState::EStop;
+        if (config_.operation_mode == OperationMode::Laser && !config_.is_mill) {
+            telemetry_.laser_door_closed     = !fb.door_open;
+            telemetry_.laser_chiller_flow_ok = true;
+            telemetry_.laser_fault_active    = false;
+        }
+        telemetry_.estop_input_active = fb.estop_active;
+        if (fb.estop_active && telemetry_.state != ControllerState::EStop &&
+            telemetry_.state != ControllerState::Disconnected) {
+            faultLocked("E-STOP INPUT ON THE BOARD TRIGGERED");
+        }
+        return;
+    }
     telemetry_.inputs_bitmask = hw_inputs_bitmask_ |
         (telemetry_.simulator_mode ? telemetry_.simulated_inputs_bitmask : static_cast<uint16_t>(0));
 
@@ -3406,7 +3860,7 @@ void MachineController::evaluateInputsAndEndStopsLocked() {
             telemetry_.outputs_bitmask &= ~core::OutputBit::OUT1_TorchOrSpindle;
             telemetry_.torch_or_spindle_on = false;
             for (auto& q : slice_queue_) q.slice.outputs_mask &= ~core::OutputBit::OUT1_TorchOrSpindle;
-            if (board_->isOpen() && !telemetry_.simulator_mode) {
+            if (outputsLiveLocked()) {
                 setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
             }
             telemetry_.active_fault_message = msg;
@@ -3513,9 +3967,19 @@ void MachineController::processBoardReportLocked(bool got_report, const board::B
 void MachineController::updateSpindleLocked(bool gcode_running) {
     bool want_spindle_on = false;
     uint8_t source_mask = telemetry_.outputs_bitmask;
+    // Firmware board running a job: the display follows the board (or the app's VFD state at the sync points)
+    const bool fw_job = (gcode_running || telemetry_.state == ControllerState::PausedHold) && fwActiveLocked() &&
+                        fw_->jobActive();
     if (telemetry_.state != ControllerState::EStop && telemetry_.state != ControllerState::Disconnected &&
         !telemetry_.dry_run_mode) {
-        if (gcode_running && !slice_queue_.empty()) {
+        if (fw_job) {
+            // The board switches its own spindle in the program (and keeps it on in a feed hold); an app-driven VFD
+            // follows the sync points
+            const bool on = config_.vfd.enabled ? fw_job_spindle_on_ : fw_->feedback().spindle_on;
+            const bool ccw = config_.vfd.enabled ? fw_job_spindle_ccw_ : fw_->feedback().spindle_ccw;
+            want_spindle_on = on;
+            source_mask = (on ? core::OutputBit::OUT1_TorchOrSpindle : 0) | (ccw ? core::OutputBit::OUT2_SpindleDir : 0);
+        } else if (gcode_running && !slice_queue_.empty()) {
             const auto& front = slice_queue_.front();
             source_mask = front.slice.outputs_mask;
             want_spindle_on = ((front.slice.outputs_mask & core::OutputBit::OUT1_TorchOrSpindle) != 0) &&
@@ -3525,11 +3989,13 @@ void MachineController::updateSpindleLocked(bool gcode_running) {
         }
     }
 
+    // A board-driven spindle on a firmware board: the board waits for spin-up itself (G4 after M3), no app ramp
+    const bool board_spindle = fwActiveLocked() && !config_.vfd.enabled;
     if (want_spindle_on) {
         telemetry_.torch_or_spindle_on = true;
         telemetry_.outputs_bitmask |= core::OutputBit::OUT1_TorchOrSpindle;
         telemetry_.spindle_ramping_down = false;
-        if (config_.spindle_ramp_up_s <= 0.01) {
+        if (config_.spindle_ramp_up_s <= 0.01 || board_spindle) {
             spindle_ramp_pct_ = 100.0;
             telemetry_.spindle_ramping_up = false;
         } else if (spindle_ramp_pct_ < 100.0) {
@@ -3543,12 +4009,11 @@ void MachineController::updateSpindleLocked(bool gcode_running) {
         }
     } else {
         telemetry_.spindle_ramping_up = false;
-        if (config_.spindle_ramp_down_s <= 0.01 || telemetry_.state == ControllerState::EStop) {
+        if (config_.spindle_ramp_down_s <= 0.01 || telemetry_.state == ControllerState::EStop || board_spindle) {
             spindle_ramp_pct_ = 0.0;
             telemetry_.spindle_ramping_down = false;
-            if (!gcode_running && !pulse_active_ && telemetry_.state != ControllerState::Jogging) {
-                if ((telemetry_.outputs_bitmask & core::OutputBit::OUT1_TorchOrSpindle) != 0 &&
-                    board_->isOpen() && !telemetry_.simulator_mode) {
+            if ((!gcode_running || fw_job) && !pulse_active_ && telemetry_.state != ControllerState::Jogging) {
+                if ((telemetry_.outputs_bitmask & core::OutputBit::OUT1_TorchOrSpindle) != 0 && outputsLiveLocked()) {
                     telemetry_.outputs_bitmask &= ~core::OutputBit::OUT1_TorchOrSpindle;
                     setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
                 }
@@ -3562,7 +4027,7 @@ void MachineController::updateSpindleLocked(bool gcode_running) {
                 spindle_ramp_pct_ = 0.0;
                 telemetry_.torch_or_spindle_on = false;
                 telemetry_.outputs_bitmask &= ~core::OutputBit::OUT1_TorchOrSpindle;
-                if (board_->isOpen() && !telemetry_.simulator_mode) {
+                if (outputsLiveLocked()) {
                     setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
                 }
             } else {
@@ -4061,7 +4526,11 @@ void MachineController::workerLoop() {
                 ~HoldTimer() { diag::workerTickLockHold().add(Clock::now() - start); }
             } hold_timer{lock_start};
 
-            processBoardReportLocked(got_any, rep, usb_open_now);
+            if (fw_ && !telemetry_.simulator_mode) {
+                fwTickLocked();
+            } else {
+                processBoardReportLocked(got_any, rep, usb_open_now);
+            }
             evaluateInputsAndEndStopsLocked();
 
             if (has_pending_config_ && !motionActiveLocked() && telemetry_.state != ControllerState::PausedHold) {
@@ -4076,11 +4545,17 @@ void MachineController::workerLoop() {
                                         telemetry_.state == ControllerState::DwellPierce);
             updateSpindleLocked(gcode_running);
             updateContinuousJogLocked();
-            runMotionTickLocked(gcode_running);
+            if (fwActiveLocked()) {
+                if (gcode_running) telemetry_.job_elapsed_seconds += kDtSec;
+            } else {
+                runMotionTickLocked(gcode_running);
+            }
 
             // Live 3D feed rate & commanded feed rate for the DRO feed box
             const bool is_motion_state = motionActiveLocked();
-            if (!is_motion_state) {
+            if (fwActiveLocked()) {
+                telemetry_.current_feed_mm_min = fw_->feedback().feed_mm_min;
+            } else if (!is_motion_state) {
                 telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
                 telemetry_.current_feed_mm_min = 0.0;
             } else {
@@ -4140,7 +4615,10 @@ void MachineController::cancelScript() {
     // Also stop the motion the script started (MDI moves, probing, homing)
     std::lock_guard<std::mutex> lock(mutex_);
     const auto s = telemetry_.state;
-    if (s == ControllerState::Jogging && !cont_jog_active_ && !slice_queue_.empty()) {
+    if (fwActiveLocked() && (s == ControllerState::Jogging || s == ControllerState::Probing ||
+                             s == ControllerState::Homing)) {
+        fw_->stop();
+    } else if (s == ControllerState::Jogging && !cont_jog_active_ && !slice_queue_.empty()) {
         beginHoldDecelLocked(true);
     } else if (s == ControllerState::Probing || s == ControllerState::Homing) {
         stopJobLocked(false);
@@ -4161,6 +4639,582 @@ void MachineController::submitScriptPromptInput(const std::string& button, const
 
 void MachineController::setScriptLogCallback(std::function<void(const std::string&, bool)> cb) {
     if (script_runner_) script_runner_->setLogCallback(std::move(cb));
+}
+
+// ============================================================================
+// Board selection, console & firmware settings
+// ============================================================================
+void MachineController::fillBoardLimitsLocked(MachineCheckInput::BoardLimits& b) const {
+    b = {};
+    if (!fw_ || !fw_->isOpen() || !fw_->ready() || telemetry_.simulator_mode) return;
+    const auto& p = fw_->firmware();
+    b.known = true;
+    b.name = board::grbl::flavourName(p.flavour);
+    b.axis_count = p.axis_count;
+    b.aux_outputs = (p.flavour == board::grbl::Flavour::Grbl11 || p.flavour == board::grbl::Flavour::GenericGrbl)
+                        ? 0 : static_cast<uint8_t>(std::min<int>(4, p.aux_outputs));
+    if (p.flavour == board::grbl::Flavour::FluidNC) b.aux_outputs = 4; // user_outputs: not reported, not checked
+    b.rates_known = p.settings_read && p.flavour != board::grbl::Flavour::FluidNC;
+    for (size_t a = 0; a < 4; ++a) {
+        b.max_rate_mm_min[a] = (a < p.axis_count) ? p.max_rate_mm_min[a] : 0.0;
+        double lo = 0.0, hi = 0.0;
+        b.travel_known[a] = fw_->travelEnvelope(a, lo, hi);
+        b.travel_min[a] = lo;
+        b.travel_max[a] = hi;
+    }
+    b.soft_limits = p.soft_limits;
+}
+
+board::BoardCapabilities MachineController::getBoardCapabilitiesLocked() const {
+    if (fw_ && fw_->isOpen()) return fw_->capabilities();
+    if (config_.board_id == board::kRnrBoardId) return board_->capabilities();
+    return board::BoardRegistry::instance().capabilitiesFor(config_.board_id);
+}
+
+board::BoardCapabilities MachineController::getBoardCapabilities() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return getBoardCapabilitiesLocked();
+}
+
+bool MachineController::unlockBoard() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!fwReadyLocked()) return false;
+    std::string err;
+    if (!fw_->unlock(&err)) {
+        telemetry_.active_fault_message = "Unlock rejected: " + err;
+        return false;
+    }
+    telemetry_.board_status_text.clear();
+    return true;
+}
+
+void MachineController::setRapidOverride(float percent) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    telemetry_.rapid_override_pct = percent >= 75.0f ? 100.0f : (percent >= 37.5f ? 50.0f : 25.0f);
+    if (fwActiveLocked()) fw_->setRapidOverride(telemetry_.rapid_override_pct);
+}
+
+bool MachineController::sendBoardConsoleLine(const std::string& line) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!fwActiveLocked()) {
+        telemetry_.active_fault_message = "The console needs a connected GRBL-family board";
+        return false;
+    }
+    const auto s = telemetry_.state;
+    const bool realtime = line == "?" || line == "!" || line == "~";
+    if (!realtime && s != ControllerState::Idle && s != ControllerState::EStop && s != ControllerState::ToolChangeHold) {
+        telemetry_.active_fault_message = "Console commands are accepted only while the machine is idle";
+        return false;
+    }
+    std::string err;
+    if (!fw_->sendConsoleLine(line, &err)) {
+        telemetry_.active_fault_message = "Console: " + err;
+        return false;
+    }
+    return true;
+}
+
+std::vector<transport::ProtocolLogEntry> MachineController::getBoardLog(uint64_t after_seq) const {
+    std::shared_ptr<transport::ProtocolLog> log;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (fw_) log = fw_->log();
+    }
+    return log ? log->since(after_seq) : std::vector<transport::ProtocolLogEntry>{};
+}
+
+bool MachineController::requestBoardReport() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!fwActiveLocked() || !fw_->ready()) {
+        telemetry_.active_fault_message = "The board report needs a connected GRBL-family board";
+        return false;
+    }
+    const auto s = telemetry_.state;
+    if (s != ControllerState::Idle && s != ControllerState::EStop && s != ControllerState::ToolChangeHold) {
+        telemetry_.active_fault_message = "The board report is made only while the machine is idle";
+        return false;
+    }
+    std::string err;
+    if (!fw_->startBoardReport(&err)) {
+        telemetry_.active_fault_message = "Board report: " + err;
+        return false;
+    }
+    return true;
+}
+
+BoardReport MachineController::getBoardReport() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    BoardReport r;
+    if (!fw_) return r;
+    r.revision = fw_->boardReportRevision();
+    r.running = fw_->boardReportRunning();
+    if (!r.running && r.revision > 0) r.text = fw_->boardReportText();
+    return r;
+}
+
+board::grbl::SettingsSnapshot MachineController::getFirmwareSettings() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fw_ ? fw_->settings() : board::grbl::SettingsSnapshot{};
+}
+
+void MachineController::requestFirmwareSettings() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (fwReadyLocked() && !motionActiveLocked()) fw_->requestSettings();
+}
+
+bool MachineController::writeFirmwareSettings(const std::vector<std::pair<std::string, std::string>>& id_values) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!fwReadyLocked() || motionActiveLocked()) {
+        telemetry_.active_fault_message = "Board settings can only be changed while the machine is idle";
+        return false;
+    }
+    std::string err;
+    if (!fw_->writeSettings(id_values, &err)) {
+        telemetry_.active_fault_message = "Board settings: " + err;
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Firmware-planned boards (GRBL family)
+// ============================================================================
+bool MachineController::probeInputMissingLocked() const noexcept {
+    // Firmware boards have a fixed probe terminal
+    return !telemetry_.simulator_mode && !firmwareBoardSelectedLocked() && config_.probe.probe_pin == 0;
+}
+
+double MachineController::fwAxisMaxVelocityLocked(size_t axis) const {
+    if (fw_ && axis < 4) {
+        const double r = fw_->firmware().max_rate_mm_min[axis];
+        if (r > 0.0) return r / 60.0;
+    }
+    return planner::TrajectoryPlanner::axisVelocityLimit(config_, std::min<size_t>(axis, 3));
+}
+
+bool MachineController::fwStartManualMovesLocked(const std::vector<ToolpathSegment>& moves, ControllerState state,
+                                                 const motion::OutputRequest* during) {
+    if (!fwReadyLocked()) {
+        telemetry_.active_fault_message = "Move rejected: the board is not ready";
+        return false;
+    }
+    std::vector<motion::MoveRequest> reqs;
+    for (const auto& seg : moves) {
+        motion::MoveRequest r;
+        if (seg.type == SegmentType::Dwell) {
+            if (seg.dwell_seconds <= 0.0) continue;
+            r.dwell_s = seg.dwell_seconds;
+            reqs.push_back(r);
+            continue;
+        }
+        if (seg.type != SegmentType::RapidMove && seg.type != SegmentType::CutLinear &&
+            seg.type != SegmentType::CutArcCW && seg.type != SegmentType::CutArcCCW) {
+            continue;
+        }
+        // Work coordinates of the current frame (G53 previews included) -> machine
+        r.target_mm = workToMachineLocked(seg.end_xyza_mm);
+        r.rapid = seg.type == SegmentType::RapidMove;
+        r.feed_mm_min = seg.feed_mm_min > 0.0 ? seg.feed_mm_min : 600.0;
+        reqs.push_back(r);
+    }
+    if (reqs.empty()) return true;
+    std::string err;
+    if (!fw_->startMoves(reqs, during, &err)) {
+        telemetry_.active_fault_message = "Move rejected: " + err;
+        return false;
+    }
+    telemetry_.state = state;
+    return true;
+}
+
+void MachineController::fwApplyOutputsLocked(uint8_t mask) {
+    if (!fwReadyLocked() || mask == fw_outputs_applied_) return;
+    const uint8_t main_bits = 0x0F;
+    const bool main_changed = fw_outputs_applied_ == 0xFF || ((mask ^ fw_outputs_applied_) & main_bits) != 0;
+    std::string err;
+    if (main_changed) {
+        motion::OutputRequest o;
+        const bool laser = !config_.is_mill && config_.operation_mode == OperationMode::Laser;
+        const bool app_spindle = config_.vfd.enabled && config_.is_mill;
+        o.spindle_on = (mask & core::OutputBit::OUT1_TorchOrSpindle) != 0 && !app_spindle;
+        o.spindle_ccw = config_.is_mill && (mask & core::OutputBit::OUT2_SpindleDir) != 0;
+        if (laser) {
+            o.laser = true;
+            o.laser_dynamic = config_.laser.dynamic_power_m4;
+            o.s_value = telemetry_.spindle_pwm_duty / 1000.0 * fw_->firmware().max_spindle_rpm;
+        } else if (!config_.is_mill) {
+            o.s_value = fw_->firmware().max_spindle_rpm; // Plasma torch on the spindle output: S0 may leave it off
+        } else {
+            o.s_value = telemetry_.commanded_spindle_rpm;
+        }
+        o.flood = (mask & core::OutputBit::OUT3_FloodCoolant) != 0;
+        o.mist = (mask & core::OutputBit::OUT4_MistCoolant) != 0;
+        if (!fw_->setOutputs(o, &err)) {
+            telemetry_.active_fault_message = "Outputs: " + err;
+            return;
+        }
+        fw_outputs_applied_ = static_cast<uint8_t>(((fw_outputs_applied_ == 0xFF ? 0 : fw_outputs_applied_) & ~main_bits) |
+                                                   (mask & main_bits));
+        return;
+    }
+    // Custom outputs: the board's aux outputs (grblHAL / FluidNC M64 / M65), one per tick
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t bit = static_cast<uint8_t>(1U << (kCustomOutputShift + i));
+        if ((mask & bit) == (fw_outputs_applied_ & bit)) continue;
+        if (!fw_->setAuxOutput(i, (mask & bit) != 0, &err)) {
+            telemetry_.active_fault_message = "Custom output: " + err;
+            fw_outputs_applied_ = static_cast<uint8_t>((fw_outputs_applied_ & ~bit) | (mask & bit)); // Do not retry
+            return;
+        }
+        fw_outputs_applied_ = static_cast<uint8_t>((fw_outputs_applied_ & ~bit) | (mask & bit));
+        return;
+    }
+}
+
+void MachineController::fwSpindleSpeedChangedLocked() {
+    if (!fwReadyLocked()) return;
+    if (fw_->jobActive()) {
+        // During a job the program's S words run on the board: a manual speed change is a spindle override
+        if (telemetry_.program_spindle_rpm > 0) {
+            fw_->setSpindleOverride(100.0f * telemetry_.commanded_spindle_rpm / telemetry_.program_spindle_rpm);
+        }
+        return;
+    }
+    if ((telemetry_.outputs_bitmask & core::OutputBit::OUT1_TorchOrSpindle) != 0) {
+        fw_outputs_applied_ = 0xFF; // Send the spindle line again with the new S
+        fwApplyOutputsLocked(telemetry_.outputs_bitmask);
+    }
+}
+
+bool MachineController::fwStartJobLocked(size_t start_seg, bool resume_in_place) {
+    job_frame_ = jobFrameLocked();
+    size_t program_first = start_seg;
+    std::array<double, 4> plan_start{};
+    std::vector<ToolpathSegment> prefix = buildJobPrefixLocked(start_seg, resume_in_place, program_first, plan_start);
+
+    motion::JobRequest jr;
+    jr.program = program_;
+    jr.prefix = std::move(prefix);
+    jr.first_index = program_first;
+    jr.frame = job_frame_;
+    jr.arcs_allowed = !telemetry_.surface_compensation_active;
+    jr.mill = config_.is_mill;
+    jr.laser = !config_.is_mill && config_.operation_mode == OperationMode::Laser;
+    jr.plasma = !config_.is_mill && config_.operation_mode == OperationMode::Plasma;
+    jr.laser_lock_z = config_.laser.ignore_z_motion;
+    jr.laser_z_plan = plan_start[2];
+    jr.laser_dynamic = config_.laser.dynamic_power_m4;
+    jr.laser_air_assist = config_.laser.auto_air_assist;
+    jr.laser_min_duty_pct = config_.laser.min_duty_pct;
+    jr.laser_max_duty_pct = config_.laser.max_duty_pct;
+    jr.laser_power_override_pct = laser_power_override_pct_;
+    jr.dry_run = telemetry_.dry_run_mode;
+    jr.app_drives_spindle = config_.vfd.enabled && config_.is_mill;
+    jr.spinup_dwell_s = config_.is_mill ? config_.spindle_ramp_up_s : 0.0;
+    jr.pierce_delay_override_s = telemetry_.pierce_delay_override_s;
+    jr.ends_with_program_end = program_->ends_with_program_end;
+    jr.spindle_on_at_start = telemetry_.torch_or_spindle_on;
+    jr.spindle_ccw_at_start = (telemetry_.outputs_bitmask & core::OutputBit::OUT2_SpindleDir) != 0;
+    jr.rpm_at_start = telemetry_.commanded_spindle_rpm;
+    fw_->setFeedOverride(telemetry_.feed_override_pct);
+    std::string err;
+    if (!fw_->startJob(std::move(jr), &err)) {
+        telemetry_.active_fault_message = "Cycle Start rejected: " + err;
+        return false;
+    }
+    fw_job_spindle_on_ = telemetry_.torch_or_spindle_on;
+    fw_job_spindle_ccw_ = (telemetry_.outputs_bitmask & core::OutputBit::OUT2_SpindleDir) != 0;
+    fw_seen_held_ = false;
+    return true;
+}
+
+void MachineController::fwToolChangeLocked(const ToolpathSegment& seg) {
+    // Same as the slice path (sendQueuedSliceLocked): spindle off, then m6.lua or retract and wait for the operator
+    manual_spindle_requested_      = false;
+    fw_job_spindle_on_             = false;
+    telemetry_.torch_or_spindle_on = false;
+    telemetry_.outputs_bitmask    &= ~(core::OutputBit::OUT1_TorchOrSpindle | core::OutputBit::OUT2_SpindleDir);
+    telemetry_.axis_vel_mm_min     = {0.0, 0.0, 0.0, 0.0};
+    telemetry_.pending_tool_number      = (seg.tool_number > 0) ? seg.tool_number : 1;
+    telemetry_.pending_tool_description = seg.tool_description;
+    telemetry_.active_segment_index     = seg.segment_index + 1;
+    telemetry_.active_gcode_line_index  = seg.gcode_line;
+    telemetry_.segment_progress_0_to_1  = 0.0f;
+    telemetry_.state = ControllerState::ToolChangeHold;
+    fw_outputs_applied_ = 0xFF;
+    fwApplyOutputsLocked(telemetry_.outputs_bitmask);
+
+    std::string resolved_m6;
+    if (config_.scripting.enabled && config_.scripting.m6_script_enabled && script_runner_) {
+        resolved_m6 = scripting::resolveScriptPath(config_.scripting.m6_script_path);
+    }
+    if (!resolved_m6.empty()) {
+        script_runner_->runFileAsync(resolved_m6, [this](bool ok, const std::string&) {
+            if (ok) this->startJob();
+        });
+        return;
+    }
+    std::array<double, 4> cur_w = telemetry_.work_pos_mm;
+    const double target_z = std::max(cur_w[2], config_.tool_change.safe_z_mm);
+    std::vector<ToolpathSegment> moves;
+    auto addRapid = [&](const std::array<double, 4>& a, const std::array<double, 4>& b) {
+        ToolpathSegment s{};
+        s.type = SegmentType::RapidMove;
+        s.start_xyza_mm = a;
+        s.end_xyza_mm = b;
+        moves.push_back(s);
+    };
+    const std::array<double, 4> z_up = {cur_w[0], cur_w[1], target_z, cur_w[3]};
+    if (target_z - cur_w[2] > 0.05) {
+        addRapid(cur_w, z_up);
+        cur_w = z_up;
+    }
+    if (config_.tool_change.move_to_park_xy) {
+        const std::array<double, 4> park = {config_.tool_change.park_x_mm, config_.tool_change.park_y_mm, cur_w[2], cur_w[3]};
+        if (std::hypot(park[0] - cur_w[0], park[1] - cur_w[1]) > 0.05) addRapid(cur_w, park);
+    }
+    if (!moves.empty() && fwStartManualMovesLocked(moves, ControllerState::Jogging)) {
+        // MoveDone returns to ToolChangeHold (pending tool)
+    }
+}
+
+void MachineController::fwHandleEventLocked(const motion::PathEvent& e) {
+    using K = motion::PathEvent::Kind;
+    const auto s = telemetry_.state;
+    switch (e.kind) {
+        case K::Connected: {
+            telemetry_.board_connecting = false;
+            telemetry_.firmware_version = e.text;
+            telemetry_.product_name = fw_->capabilities().display_name;
+            ++caps_revision_;
+            // Machines without home switches keep the machine position saved at the last exit (machine shift)
+            const auto& fb = fw_->feedback();
+            bool any_homed = false;
+            for (bool h : fb.homed) any_homed = any_homed || h;
+            std::array<double, 4> shift{};
+            if (!config_.require_homing && !any_homed) {
+                const auto fwpos = fw_->firmwareMachinePos();
+                for (size_t a = 0; a < 4; ++a) shift[a] = telemetry_.machine_pos_mm[a] - fwpos[a];
+            }
+            fw_->setMachineShift(shift);
+            telemetry_.axis_homed = fb.homed_reported ? fb.homed : std::array<bool, 4>{false, false, false, false};
+            fw_->setFeedOverride(telemetry_.feed_override_pct);
+            fw_outputs_applied_ = 0xFF;
+            telemetry_.active_fault_message = "Connected to " + e.text + ". Press RESET E-STOP to enable the machine.";
+            if (telemetry_.state != ControllerState::Disconnected) telemetry_.state = ControllerState::EStop;
+            break;
+        }
+        case K::ConnectFailed:
+            telemetry_.usb_connected = false;
+            telemetry_.board_connecting = false;
+            telemetry_.active_fault_message = e.text;
+            telemetry_.board_status_text = e.text;
+            if (!telemetry_.simulator_mode) telemetry_.state = ControllerState::Disconnected;
+            break;
+        case K::Fault: {
+            if (e.position_lost) telemetry_.axis_homed = {false, false, false, false};
+            const bool link_down = !fw_->isOpen();
+            suppress_fw_estop_ = true; // The board has already stopped
+            faultLocked(e.text, link_down ? ControllerState::Disconnected : ControllerState::EStop);
+            suppress_fw_estop_ = false;
+            if (link_down) {
+                telemetry_.usb_connected = false;
+                telemetry_.board_connecting = false;
+            }
+            break;
+        }
+        case K::Message:
+            if (!e.text.empty()) telemetry_.active_fault_message = e.text;
+            break;
+        case K::MoveDone:
+            if (s == ControllerState::Probing && !probe_move_is_search_ && active_probe_mode_ == ProbeMode::HoleCenterXY) {
+                if (e.ok) {
+                    continueHoleCenterLocked();
+                } else {
+                    active_probe_mode_ = ProbeMode::None;
+                    telemetry_.state = ControllerState::Idle;
+                }
+            } else if (s == ControllerState::Jogging || s == ControllerState::Probing) {
+                telemetry_.state = (telemetry_.pending_tool_number > 0) ? ControllerState::ToolChangeHold
+                                                                          : ControllerState::Idle;
+                if (!e.ok && !e.text.empty()) telemetry_.active_fault_message = e.text;
+            }
+            telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
+            break;
+        case K::ProbeDone:
+            if (s == ControllerState::Probing) {
+                probe_contact_captured_ = e.ok;
+                if (e.ok) probe_contact_machine_ = e.position_mm;
+                const auto& fb = fw_->feedback();
+                telemetry_.machine_pos_mm = fb.machine_pos_mm;
+                for (size_t a = 0; a < 4; ++a) telemetry_.work_pos_mm[a] = fb.machine_pos_mm[a] - telemetry_.work_offset_mm[a];
+                onProbeMoveFinishedLocked(e.ok);
+            }
+            break;
+        case K::HomingDone:
+            if (s == ControllerState::Homing) {
+                telemetry_.state = ControllerState::Idle;
+                if (e.ok) {
+                    const uint8_t n = fw_->capabilities().axis_count;
+                    for (size_t a = 0; a < 4; ++a) {
+                        if (a < n && (fw_homing_mask_ == 0 || ((fw_homing_mask_ >> a) & 1U))) telemetry_.axis_homed[a] = true;
+                    }
+                    if (fw_homing_mask_ == 0 || (fw_homing_mask_ & 0x04)) {
+                        tool_ref_contact_valid_ = false;
+                        telemetry_.tool_reference_measured = false;
+                    }
+                    const auto& fb = fw_->feedback();
+                    telemetry_.machine_pos_mm = fb.machine_pos_mm;
+                    refreshWorkFrameLocked();
+                    telemetry_.active_fault_message.clear();
+                } else if (telemetry_.active_fault_message.empty()) {
+                    telemetry_.active_fault_message = "Homing failed";
+                }
+            }
+            break;
+        case K::JogStopped:
+            break; // updateContinuousJogLocked() ends the jog once the board is idle
+        case K::JobSyncPoint: {
+            const auto kind = static_cast<motion::SyncKind>(e.code);
+            if (kind == motion::SyncKind::ToolChange) {
+                if (e.segment_index < program_->segments.size()) {
+                    fwToolChangeLocked(program_->segments[e.segment_index]);
+                } else {
+                    telemetry_.state = ControllerState::Idle;
+                }
+            } else if (kind == motion::SyncKind::ProgramStop) {
+                telemetry_.state = ControllerState::PausedHold;
+                manual_spindle_requested_ = false;
+                fw_program_stop_ = true;
+                fw_resume_segment_ = e.segment_index + 1;
+                telemetry_.active_segment_index = e.segment_index;
+                if (e.segment_index < program_->segments.size()) {
+                    telemetry_.active_gcode_line_index = program_->segments[e.segment_index].gcode_line;
+                }
+                telemetry_.active_fault_message = "Program stop (M0/M1) - press Cycle Start to continue";
+            } else {
+                // App-driven spindle (Huanyang VFD): switch it with the machine at rest, wait for the speed
+                const bool turning_on = e.spindle_on && !fw_job_spindle_on_;
+                fw_job_spindle_on_ = e.spindle_on;
+                fw_job_spindle_ccw_ = e.spindle_ccw;
+                if (e.spindle_rpm > 0) {
+                    telemetry_.program_spindle_rpm = e.spindle_rpm;
+                    if (!telemetry_.spindle_override_active) {
+                        telemetry_.commanded_spindle_rpm = e.spindle_rpm;
+                        vfd_controller_.setRpm(e.spindle_rpm);
+                    }
+                }
+                const double wait = e.spindle_on ? (turning_on ? config_.spindle_ramp_up_s : 0.5) : config_.spindle_ramp_down_s;
+                fw_sync_wait_ = true;
+                fw_sync_continue_at_ = Clock::now() + std::chrono::milliseconds(static_cast<int>(std::max(0.0, wait) * 1000.0));
+            }
+            break;
+        }
+        case K::JobFinished:
+            if (s == ControllerState::RunningGCode || s == ControllerState::DwellPierce || s == ControllerState::PausedHold) {
+                manual_spindle_requested_ = false;
+                fw_job_spindle_on_ = false;
+                telemetry_.torch_or_spindle_on = false;
+                telemetry_.outputs_bitmask &= ~(core::OutputBit::OUT1_TorchOrSpindle | core::OutputBit::OUT2_SpindleDir);
+                if (e.ok) {
+                    if (program_->ends_with_program_end) {
+                        telemetry_.outputs_bitmask &= ~(core::OutputBit::OUT3_FloodCoolant | core::OutputBit::OUT4_MistCoolant);
+                    }
+                    telemetry_.active_segment_index = program_->segments.size();
+                    telemetry_.segment_progress_0_to_1 = 1.0f;
+                } else {
+                    // The stop sequence resets the board, which switches spindle and coolant off
+                    telemetry_.outputs_bitmask &= ~(core::OutputBit::OUT3_FloodCoolant | core::OutputBit::OUT4_MistCoolant);
+                    telemetry_.laser_air_assist_active = false;
+                    if (telemetry_.active_fault_message.empty() || telemetry_.active_fault_message == "Stopping...") {
+                        telemetry_.active_fault_message = "Job stopped";
+                    }
+                }
+                fw_outputs_applied_ = 0xFF;
+                telemetry_.state = (telemetry_.pending_tool_number > 0) ? ControllerState::ToolChangeHold : ControllerState::Idle;
+            }
+            break;
+        case K::SettingsChanged:
+            ++caps_revision_;
+            break;
+    }
+}
+
+void MachineController::fwTickLocked() {
+    if (!fw_) return;
+    const auto now = Clock::now();
+    fw_->tick(now);
+    motion::PathEvent e;
+    while (fw_ && fw_->pollEvent(e)) fwHandleEventLocked(e);
+    if (!fw_) return;
+    if (!fw_->isOpen()) {
+        if (telemetry_.usb_connected) {
+            telemetry_.usb_connected = false;
+            telemetry_.board_connecting = false;
+            if (!telemetry_.simulator_mode && telemetry_.state != ControllerState::Disconnected) {
+                telemetry_.state = ControllerState::Disconnected;
+            }
+        }
+        return;
+    }
+    const auto& fb = fw_->feedback();
+    telemetry_.board_status_text = fb.status_text;
+    telemetry_.firmware_state = fb.firmware_state;
+    telemetry_.rapid_override_pct = static_cast<float>(fb.ov_rapid);
+    if (!fw_->ready() || !fb.position_valid) return;
+
+    telemetry_.machine_pos_mm = fb.machine_pos_mm;
+    for (size_t a = 0; a < 4; ++a) telemetry_.work_pos_mm[a] = fb.machine_pos_mm[a] - telemetry_.work_offset_mm[a];
+    // The board reports only the path feed: per-axis velocities from the position change (every ~100 ms)
+    const double vel_dt = std::chrono::duration<double>(now - fw_vel_time_).count();
+    if (vel_dt >= 0.09) {
+        const bool moving = fb.feed_mm_min > 0.5 && vel_dt < 1.0;
+        // Direction from the position change, speed from the board's reported feed
+        double len = 0.0;
+        for (size_t a = 0; a < 4; ++a) len += (fb.machine_pos_mm[a] - fw_vel_pos_[a]) * (fb.machine_pos_mm[a] - fw_vel_pos_[a]);
+        len = std::sqrt(len);
+        for (size_t a = 0; a < 4; ++a) {
+            telemetry_.axis_vel_mm_min[a] = (moving && len > 1e-6)
+                ? std::abs(fb.machine_pos_mm[a] - fw_vel_pos_[a]) / len * fb.feed_mm_min : 0.0;
+        }
+        fw_vel_pos_ = fb.machine_pos_mm;
+        fw_vel_time_ = now;
+    }
+    if (fb.homed_reported) {
+        const uint8_t n = fw_->capabilities().axis_count;
+        for (size_t a = 0; a < 4; ++a) telemetry_.axis_homed[a] = a < n && fb.homed[a];
+    }
+    const auto s = telemetry_.state;
+    const bool job = s == ControllerState::RunningGCode || s == ControllerState::DwellPierce || s == ControllerState::PausedHold;
+    if (job && fb.job_active) {
+        telemetry_.active_segment_index    = fb.active_segment;
+        telemetry_.active_gcode_line_index = fb.active_line;
+        telemetry_.segment_progress_0_to_1 = fb.segment_progress;
+        telemetry_.progress_is_estimate    = fb.progress_is_estimate;
+        telemetry_.outputs_bitmask = static_cast<uint8_t>(
+            (telemetry_.outputs_bitmask & ~(core::OutputBit::OUT3_FloodCoolant | core::OutputBit::OUT4_MistCoolant)) |
+            (fb.flood_on ? core::OutputBit::OUT3_FloodCoolant : 0) | (fb.mist_on ? core::OutputBit::OUT4_MistCoolant : 0));
+        fw_outputs_applied_ = telemetry_.outputs_bitmask;
+    }
+    // State changes the board made itself (its own hold / start buttons, the door)
+    if (now < fw_state_grace_until_) {
+        // Just paused / resumed by the app: the board's next report may still show the old state
+    } else if (s == ControllerState::RunningGCode && (fb.state == motion::PathState::Held || fb.state == motion::PathState::Holding)) {
+        telemetry_.state = ControllerState::PausedHold;
+        fw_seen_held_ = true;
+        if (fb.door_open) telemetry_.active_fault_message = "Door open: close it and press Cycle Start";
+    } else if (s == ControllerState::PausedHold && fw_->jobActive()) {
+        if (fb.state == motion::PathState::Held || fb.state == motion::PathState::Holding) {
+            fw_seen_held_ = true;
+        } else if (fb.state == motion::PathState::Moving && fw_seen_held_) {
+            telemetry_.state = ControllerState::RunningGCode; // Resumed from the board's cycle start button
+            fw_seen_held_ = false;
+        }
+    }
+    if (fw_sync_wait_ && now >= fw_sync_continue_at_) {
+        fw_sync_wait_ = false;
+        fw_->continueJob();
+    }
 }
 
 } // namespace rnr::core

@@ -8,11 +8,15 @@
 struct GLFWwindow;
 struct ImFont;
 
+#include <memory>
+
 namespace rnr::core {
 enum class OperationMode : uint8_t;
 }
 
 namespace rnr::ui {
+
+class UiRemote;
 
 class AppWindow {
 public:
@@ -23,6 +27,9 @@ public:
     AppWindow& operator=(const AppWindow&) = delete;
 
     bool isValid() const noexcept { return window_ != nullptr; }
+
+    // Test-only: operate the UI from a command file (see ui_remote.h). Call before runLoop().
+    void enableUiRemote(const std::string& dir);
 
     // Runs the 60Hz main UI render loop until the window is closed
     int runLoop(const std::function<void()>& render_callback);
@@ -79,6 +86,7 @@ private:
     core::diag::Counter::Snapshot perf_read_wait_{}, perf_tick_hold_{}, perf_usb_write_{}; // last completed second
 
     GLFWwindow* window_ = nullptr;
+    std::shared_ptr<UiRemote> ui_remote_;
     std::string title_;
     std::function<bool()> can_close_predicate_;
     std::function<void()> on_close_blocked_;

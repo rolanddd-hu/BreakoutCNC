@@ -20,6 +20,8 @@
 #include "ui_common/file_dialog.h"
 #include "ui_common/mach3_migration_dialog.h"
 #include "ui_common/camera_panel.h"
+#include "ui_common/board_panels.h"
+#include "ui_common/fake_board_mode.h"
 #include "imgui.h"
 
 #include <fstream>
@@ -38,27 +40,34 @@ int main(int argc, char** argv) {
     // --smoke-test (CI): never touch USB devices (simulator), run the demo job briefly, exit without saving
     const bool smoke_test = ui::hasCommandLineFlag(argc, argv, "--smoke-test");
     if (smoke_test) core::RnRController::setHardwareAccessEnabled(false);
-    const std::string settings_file = "breakout_mill_settings.ini";
+    // --fake-board: drive the built-in GRBL-family emulator; no hardware, separate settings file
+    const bool fake_board = ui::hasCommandLineFlag(argc, argv, ui::kFakeBoardFlag);
+    if (fake_board) core::RnRController::setHardwareAccessEnabled(false);
+    const std::string settings_file = fake_board ? ui::fakeBoardSettingsFile("breakout_mill_settings.ini") : std::string("breakout_mill_settings.ini");
     config::PersistentSettings saved_settings{};
 
-    core::RnRController controller;
+    core::RnRController controller(false); // Connects below, once the settings (and the board) are applied
     saved_settings.machine = controller.getConfig();
     saved_settings.machine.spindle_ramp_up_s   = 2.5; // Default 2.5s spindle spin-up before cutting starts
     saved_settings.machine.spindle_ramp_down_s = 2.0; // Default 2.0s spindle spin-down
     saved_settings.ui.isometric_3d = true;            // Default 3D Isometric view for Mill
     bool had_saved_settings = config::SettingsManager::loadFromFile(settings_file, saved_settings);
-    if (!had_saved_settings) {
+    if (!had_saved_settings && !fake_board) {
         // Fallback to legacy settings file if present
         had_saved_settings = config::SettingsManager::loadFromFile("rnr_mill_settings.ini", saved_settings);
     }
 
+    if (fake_board) ui::enterFakeBoardMode(saved_settings, true);
+
     ui::AppWindow window(
-        "BreakoutMill " BREAKOUTCNC_VERSION_STRING,
+        fake_board ? "BreakoutMill " BREAKOUTCNC_VERSION_STRING " [fake GRBL board]" : "BreakoutMill " BREAKOUTCNC_VERSION_STRING,
         saved_settings.ui.window_width,
         saved_settings.ui.window_height);
     if (!window.isValid()) {
         return 1;
     }
+    // Test mode only: operate the UI from ui_remote_commands.txt (never with real hardware)
+    if (fake_board && ui::hasCommandLineFlag(argc, argv, "--ui-remote")) window.enableUiRemote(".");
 
     if (had_saved_settings) {
         window.setWindowGeometry(
@@ -188,7 +197,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Always engage E-Stop by default on program start so machine is disarmed until operator clicks RESET E-STOP
+    // Connect to the selected board (the simulator when none answers), then start disarmed: the operator clicks RESET E-STOP
+    if (!(had_saved_settings && saved_settings.ui.simulator_mode) && !controller.connect()) {
+        controller.setSimulatorMode(true);
+    }
     controller.triggerEStop();
 
     // Load Mach3 ATC multi-tool demo program by default for Mill (or user's last loaded file)
@@ -360,6 +372,8 @@ int main(int argc, char** argv) {
         }
 
         const auto telemetry    = controller.getTelemetry();
+        const board::BoardCapabilities& board_caps = ui::boardCaps(controller, telemetry);
+        const bool host_board = board_caps.family == board::Family::HostPlanned;
         const auto program_snapshot = controller.getProgram(); // Held for the whole frame
         const auto& parse_res   = *program_snapshot;
         const auto& segments    = program_snapshot->segments;
@@ -389,7 +403,8 @@ int main(int argc, char** argv) {
             // DRO and Manual Jog Control Panel (top of left panel)
             ImGui::BeginChild("##MillDroJogFixed", ImVec2(0.0f, dro_h), true,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            dro_panel.render(controller, telemetry, true, dro_h); // Show 4th Axis (A) for Mill
+            // 4th axis (A) for Mill, when the board has one (a GRBL-family board reports its axes)
+            dro_panel.render(controller, telemetry, board_caps.axis_count >= 4, dro_h);
             ImGui::EndChild();
 
             // Pin Controller State Badge, Cycle Control, and Emergency Stop / Reset Card to the bottom
@@ -531,7 +546,9 @@ int main(int argc, char** argv) {
                                     ImGui::TextColored(ui::theme::pal().text_danger, "VFD offline");
                                 }
                             } else {
-                                ImGui::TextColored(ui::theme::pal().text_muted, "0-10 V output");
+                                ImGui::TextColored(ui::theme::pal().text_muted, "%s",
+                                                   board_caps.family == board::Family::FirmwarePlanned
+                                                       ? "board's spindle output (M3 S)" : "0-10 V output");
                             }
                             ImGui::Spacing();
 
@@ -930,6 +947,23 @@ int main(int argc, char** argv) {
                                 ImGui::PopStyleColor(4);
                             }
                         }
+                        if (board_caps.rapid_override) {
+                            // Firmware boards: rapid override in three steps
+                            ImGui::Spacing();
+                            ImGui::AlignTextToFramePadding();
+                            ImGui::TextUnformatted("Rapids");
+                            const float rapid_vals[3] = {25.0f, 50.0f, 100.0f};
+                            const char* rapid_lbls[3] = {"25%##Rapid", "50%##Rapid", "100%##Rapid"};
+                            for (int i = 0; i < 3; ++i) {
+                                ImGui::SameLine();
+                                const bool active = std::abs(telemetry.rapid_override_pct - rapid_vals[i]) < 1.0f;
+                                if (active) ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_primary);
+                                if (ImGui::Button(rapid_lbls[i], ImVec2(ImGui::CalcTextSize("100%").x + 32.0f, 28.0f))) {
+                                    controller.setRapidOverride(rapid_vals[i]);
+                                }
+                                if (active) ImGui::PopStyleColor();
+                            }
+                        }
                         ImGui::EndChild();
                         ImGui::PopStyleVar(3);
                         ImGui::PopStyleColor(2);
@@ -949,6 +983,20 @@ int main(int argc, char** argv) {
                 ui::IoStatusBar::renderUsbConnectionSection(controller, telemetry, [&]() {
                     markSettingsDirty();
                 });
+            }
+
+            // -----------------------------------------------------------------
+            // BOARD SETTINGS & CONSOLE (firmware-planned boards: GRBL, grblHAL, FluidNC)
+            // -----------------------------------------------------------------
+            if (board_caps.family == board::Family::FirmwarePlanned) {
+                static bool board_settings_open = false;
+                ImGui::SetNextItemOpen(board_settings_open, ImGuiCond_Once);
+                board_settings_open = ImGui::CollapsingHeader("Board Settings");
+                if (board_settings_open) ui::renderFirmwareSettings(controller, telemetry);
+                static bool board_console_open = false;
+                ImGui::SetNextItemOpen(board_console_open, ImGuiCond_Once);
+                board_console_open = ImGui::CollapsingHeader("Board Console");
+                if (board_console_open) ui::renderBoardConsole(controller, telemetry);
             }
 
             // -----------------------------------------------------------------
@@ -1649,7 +1697,9 @@ int main(int argc, char** argv) {
                 saved_settings.ui.header_io_open = io_hdr_open;
                 markSettingsDirty();
             }
-            if (io_hdr_open) {
+            if (io_hdr_open && !host_board) {
+                ui::renderNotUsedByBoardNote("The functions and polarity of the inputs and outputs", board_caps);
+            } else if (io_hdr_open) {
                 core::MachineConfig cfg = controller.getConfig();
                 if (ui::renderIoSettings(controller, telemetry, cfg)) {
                     controller.applyConfig(cfg);
@@ -1677,6 +1727,7 @@ int main(int argc, char** argv) {
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
 
+                if (host_board) {
                 // HARDWARE E-STOP INPUT PIN
                 ImGui::BeginChild("##EStopLimitCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                 {
@@ -1699,6 +1750,7 @@ int main(int argc, char** argv) {
 
                 ImGui::Spacing();
 
+                }
                 // HOMING REQUIREMENT
                 ImGui::BeginChild("##HomingRequiredCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                 {
@@ -1732,6 +1784,7 @@ int main(int argc, char** argv) {
 
                 ImGui::Spacing();
 
+                if (host_board) {
                 // Constant velocity: corner tolerance and curve speed limit
                 ImGui::BeginChild("##CornersCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                 {
@@ -1743,6 +1796,10 @@ int main(int argc, char** argv) {
 
                 ImGui::Spacing();
 
+                }
+                if (!host_board) {
+                    ui::renderNotUsedByBoardNote("Limit switches, homing speeds, pull-off and soft limits", board_caps);
+                } else {
                 const char* ax_names[4] = {"X AXIS LIMITS & HOMING", "Y AXIS LIMITS & HOMING", "Z AXIS LIMITS & HOMING", "A AXIS LIMITS & HOMING"};
                 const char* card_ids[4] = {"##LimitsXCard", "##LimitsYCard", "##LimitsZCard", "##LimitsACard"};
                 for (int a = 0; a < 4; ++a) {
@@ -1841,6 +1898,7 @@ int main(int argc, char** argv) {
                     ImGui::Spacing();
                 }
 
+                }
                 ImGui::PopStyleVar(4);
                 ImGui::PopStyleColor(2);
 
@@ -1859,7 +1917,9 @@ int main(int argc, char** argv) {
                 saved_settings.ui.header_motor_open = motor_hdr_open;
                 markSettingsDirty();
             }
-            if (motor_hdr_open) {
+            if (motor_hdr_open && !board_caps.app_owns_motor_tuning) {
+                ui::renderNotUsedByBoardNote("Steps per mm, speeds and accelerations", board_caps);
+            } else if (motor_hdr_open) {
                 core::MachineConfig cfg = controller.getConfig();
                 bool changed = false;
 

@@ -172,7 +172,11 @@ void ProbePanel::render(core::IMotionController& controller,
         ImGui::SameLine();
         ImGui::TextColored(hit ? theme::pal().text_ok : theme::pal().text_info,
                            hit ? "CONTACT (G31 hit)" : "READY (open circuit)");
-        ImGui::TextDisabled("Input IN%d, %s", cfg.probe.probe_pin, cfg.probe.probe_invert ? "active low" : "active high");
+        if (telemetry.board_firmware_planned) {
+            ImGui::TextDisabled("The board's probe input (polarity in its settings, $6 on GRBL)");
+        } else {
+            ImGui::TextDisabled("Input IN%d, %s", cfg.probe.probe_pin, cfg.probe.probe_invert ? "active low" : "active high");
+        }
         ImGui::PopTextWrapPos();
         ImGui::EndGroup();
         const float text_h = ImGui::GetItemRectSize().y;

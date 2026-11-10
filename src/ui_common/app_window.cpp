@@ -1,5 +1,6 @@
 #include "breakout_version.h"
 #include "ui_common/app_window.h"
+#include "ui_common/ui_remote.h"
 #include "ui_common/frame_stats.h"
 #include "ui_common/theme.h"
 #include "core/controller/motion_controller.h"
@@ -486,6 +487,10 @@ void AppWindow::renderPerfOverlay() {
     ImGui::End();
 }
 
+void AppWindow::enableUiRemote(const std::string& dir) {
+    ui_remote_ = std::make_shared<UiRemote>(dir);
+}
+
 int AppWindow::runLoop(const std::function<void()>& render_callback) {
     if (!window_) return 1;
 
@@ -534,6 +539,11 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
+        if (ui_remote_) {
+            bool close = false;
+            ui_remote_->injectEvents(&close);
+            if (close) glfwSetWindowShouldClose(window_, GLFW_TRUE);
+        }
         ImGui::NewFrame();
 
         // F11 shortcut to toggle fullscreen
@@ -594,6 +604,7 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
         glClearColor(clear.x, clear.y, clear.z, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (ui_remote_) ui_remote_->afterRender(display_w, display_h);
         if (perf_reg.enabled) {
             glFinish(); // Only while measuring: separates the GPU's work from the vsync wait below
         }

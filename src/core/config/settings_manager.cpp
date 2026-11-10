@@ -174,7 +174,11 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "last_work_y") s.ui.last_work_pos_mm[1] = std::atof(val.c_str());
             if (key == "last_work_z") s.ui.last_work_pos_mm[2] = std::atof(val.c_str());
             if (key == "last_work_a") s.ui.last_work_pos_mm[3] = std::atof(val.c_str());
+        } else if (section.rfind("Board.", 0) == 0 && section.size() > 6) {
+            // [Board.<id>]: kept even for a board this build does not know
+            s.machine.board_profiles[section.substr(6)].set(key, val);
         } else if (section == "Machine") {
+            if (key == "board")               s.machine.board_id = val.empty() ? std::string(board::kRnrBoardId) : val;
             if (key == "linear_units")        s.machine.linear_units        = static_cast<core::LinearUnits>(std::clamp(std::atoi(val.c_str()), 0, 1));
             if (key == "pulse_rate_khz")      s.machine.pulse_rate_khz      = static_cast<uint8_t>(std::atoi(val.c_str()));
             // Older settings files only knew A-follows-X
@@ -513,6 +517,7 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "last_work_a = " << s.ui.last_work_pos_mm[3] << "\n\n";
 
     ofs << "[Machine]\n";
+    ofs << "board = " << s.machine.board_id << "\n";
     ofs << "linear_units = " << static_cast<int>(s.machine.linear_units) << "\n";
     ofs << "pulse_rate_khz = " << static_cast<int>(s.machine.pulse_rate_khz) << "\n";
     ofs << "gantry_slave = " << static_cast<int>(s.machine.gantry_slave) << "\n";
@@ -731,6 +736,13 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "stream_port = " << cam.stream_port << "\n";
     ofs << "stream_fps = " << cam.stream_fps << "\n";
     ofs << "stream_allow_upload = " << (cam.stream_allow_upload ? 1 : 0) << "\n";
+
+    // One section per board that has settings (connection, firmware board options)
+    for (const auto& [id, profile] : s.machine.board_profiles) {
+        if (profile.values.empty()) continue;
+        ofs << "\n[Board." << id << "]\n";
+        for (const auto& [k, v] : profile.values) ofs << k << " = " << v << "\n";
+    }
 
     // Integrity marker: a file without it was cut short (e.g. power loss while saving)
     ofs << "\n[Integrity]\ncomplete = 1\n";

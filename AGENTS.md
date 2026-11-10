@@ -97,4 +97,4 @@ ImGui::SliderInt("Y Points##Srf", &surface_points_y_, 2, 30);
 - **Never commit or push unless the user asks for it:** leave changes in the working tree and report them. Approval
   for one commit does not carry over to later changes.
 - **Never add to the repository:** vendor binaries (DLLs, installers), decompiled vendor code, personal machine profiles or settings files.
-- **Always build and run test suites:** Verify with `cmake --build build --config Release` and `script_engine_test.exe`. All unit tests must pass.
+- **Always build and run test suites:** Verify with `cmake --build build --config Release`, `script_engine_test.exe` and `board_tests.exe` (GRBL-family boards on the FakeGrbl emulator). All unit tests must pass.

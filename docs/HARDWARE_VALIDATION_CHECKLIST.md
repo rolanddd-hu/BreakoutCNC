@@ -166,3 +166,57 @@ Set all axis max velocities to ~25 % and accelerations to ~50 % for this phase.
 | 6 | `latched_steps` = probe trigger | | |
 | 7 | VFD retry / comm loss | | |
 | 8 | Motion quality with motors | | |
+
+---
+
+## GRBL-family boards (GRBL 1.1, grblHAL, FluidNC)
+
+Run once per flavour that is available. Facts the code assumes but could not be confirmed without hardware are listed
+in [GRBL_FAMILY_PLAN.md](architecture/GRBL_FAMILY_PLAN.md) section 18; note the results in the table at the end.
+
+**Connect (drivers off)**
+- [ ] Select the board, choose the port, **Connect**: *Firmware: ...* shows the right flavour and version.
+- [ ] Unplug the USB cable while idle: the app reports the lost connection within 3 s; plug in, **Connect** again.
+- [ ] An ESP32 (FluidNC) board connects with *Reset the board when connecting (DTR)* off and does not restart.
+- [ ] Board Console: `$$`, `$#`, `$G` answer; status reports appear with *Show status reports*.
+- [ ] **Save board report** on each board right after the first connection and keep the file: it answers most of
+  the open questions in GRBL_FAMILY_PLAN.md section 18 (`$I` vs `$I+`, buffer sizes, option letters, code texts).
+- [ ] grblHAL / FluidNC: trigger an alarm above 9 (E-stop on grblHAL): the message is the board's own text.
+- [ ] Board Settings: values match `$$`; change `$110` and back; a refused value shows its reason.
+
+**E-stop and alarms**
+- [ ] EMERGENCY STOP while idle: the board resets, the app is in E-stop; RESET E-STOP returns to Idle.
+- [ ] Trip a limit switch by hand (hard limits on): the app shows the alarm text and marks the axes not homed.
+- [ ] grblHAL with an E-stop input: pressing it puts the app in E-stop; reset refused while held.
+
+**Motion (low speed, hand on the hardwired E-stop)**
+- [ ] Step jog 1 mm and 0.1 mm on every axis; the DRO matches the movement.
+- [ ] Continuous jog at 10 %, 50 % and 100 %: smooth, and stops within a few mm on release.
+- [ ] Pull the USB cable while jogging: the machine stops by itself within the lead distance (well under 10 mm).
+- [ ] HOME ALL: the board homes; axes show homed; machine position 0 at the switches (or as the board defines it).
+- [ ] MDI `G0 X10 Y10` with a work offset set: the tool goes to the work position, not the board's G54.
+- [ ] Probe a plate (G38.3): contact position correct; probe miss reports "no contact" without an alarm.
+- [ ] Run a demo program with arcs, a tool change and M30: arcs smooth, M6 stops for the tool, outputs off at the end.
+- [ ] Feed hold mid-job, resume; Stop mid-job: the position is kept (no homing needed).
+- [ ] Feed override 50 % / 150 %, rapids 25 %: the board follows.
+- [ ] Laser (BreakoutCut, `$32 = 1`): test pulse at low power; framing; a short engraving with `M4`.
+- [ ] 4th axis (grblHAL / FluidNC with A wired): the A row appears; jog A both ways at low speed (direction and
+  distance match); **H** on A and HOME ALL home it; `G0 A90` in MDI turns 90; a short job with A moves.
+- [ ] Program check after homing: a program beyond the travel shows the travel warning with the board's limits; one
+  inside it does not (confirms the envelope rule for this board).
+- [ ] grblHAL with the plasma plugin (BreakoutCut): *Torch Height Control* shows "THC on the board" and the mode;
+  Arc OK and the arc voltage follow the torch; a cut with THC on runs and the highlighted line follows the torch;
+  with the torch air off, the board pauses with "no Arc OK" and CYCLE START retries. Confirm the plugin's
+  `[PLUGIN:...]` line and `|THC:` status field match what the app expects.
+
+| Item | GRBL 1.1 | grblHAL | FluidNC | Notes |
+|------|----------|---------|---------|-------|
+| Connect / identify | | | | |
+| `G4P0` answered only after motion ends | | | | |
+| Jog stop distance at 100 % | | | | |
+| Homing and machine position | | | | |
+| Probe contact position | | | | |
+| Laser test pulse at standstill | | | | |
+| Board report saved | | | | |
+| 4th axis (A) | n/a | | | |
+| Travel warning matches the real travel | | | | |

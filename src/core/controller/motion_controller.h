@@ -1,5 +1,10 @@
 #pragma once
 #include "core/board/board_types.h"
+#include "core/board/board_capabilities.h"
+#include "core/board/board_profile.h"
+#include "core/board/board_registry.h"
+#include "core/board/grbl/grbl_settings.h"
+#include "core/transport/protocol_log.h"
 #include <array>
 #include <string>
 #include <vector>
@@ -288,6 +293,9 @@ struct ToolTableConfig {
 // when the job starts stays in effect.
 constexpr uint16_t kTloInherit = 0xFFFF;
 
+// ToolpathSegment::arc_index of a segment that is not part of a G2 / G3
+constexpr uint32_t kNoArc = 0xFFFFFFFFu;
+
 struct ToolChangeConfig {
     ToolChangeMode mode              = ToolChangeMode::ManualPrompt;
     double         safe_z_mm         = 25.0;  // Z retract height for tool change
@@ -415,6 +423,10 @@ enum class GantrySlave : uint8_t {
 };
 
 struct MachineConfig {
+    // Selected motion board (BoardRegistry id) and the settings of every board used so far ([Board.<id>])
+    std::string      board_id = board::kRnrBoardId;
+    std::map<std::string, board::BoardProfile> board_profiles;
+
     LinearUnits     linear_units      = LinearUnits::Metric;
     std::array<AxisConfig, 4> axes{};
     uint8_t          pulse_rate_khz    = 100;   // 25, 50 or 100 kHz, the choices of the RNR Mach3 plugin
@@ -513,7 +525,19 @@ enum class ControllerState : uint8_t {
 };
 
 struct TelemetrySnapshot {
-    bool            usb_connected     = false;
+    bool            usb_connected     = false; // The selected board is connected (USB, serial or network)
+    // Board
+    std::string     board_id;                  // Selected board (BoardRegistry id)
+    bool            board_firmware_planned = false; // GRBL-family: the board plans the motion
+    bool            board_connecting  = false; // Port open, board being identified
+    bool            board_busy        = false; // Firmware board: a command is still being answered
+    std::string     firmware_version;          // "grblHAL 1.1f.20230610"
+    std::string     firmware_state;            // As the board reports it ("Idle", "Hold:0", "Alarm")
+    std::string     board_status_text;         // Board-level status: alarm text, "Door open", connection errors
+    uint64_t        capabilities_revision = 0; // Changes when getBoardCapabilities() may return something new
+    uint64_t        board_inputs_mask = 0;     // Firmware boards: bit n = BoardCapabilities::io[n] active
+    bool            progress_is_estimate = false; // The active line is estimated from the position
+    float           rapid_override_pct = 100.0f;
     bool            simulator_mode    = false;
     bool            dry_run_mode      = false;
     ControllerState state             = ControllerState::Disconnected;
@@ -569,6 +593,12 @@ struct TelemetrySnapshot {
     bool        thc_arc_ok_active       = false;
     bool        thc_up_active           = false;
     bool        thc_down_active         = false;
+    // Board-side THC (grblHAL plasma plugin): the board waits for Arc OK and corrects the torch height itself
+    bool        thc_on_board            = false;
+    bool        thc_board_active        = false; // Height control is correcting Z right now
+    bool        thc_torch_on            = false;
+    double      thc_arc_voltage         = 0.0;
+    std::string thc_board_mode;                  // "Voltage", "Up/down", "Arc ok"
 
     // Laser Live Telemetry & Process States
     OperationMode operation_mode           = OperationMode::Plasma;
@@ -657,6 +687,15 @@ struct ToolpathSegment {
     uint16_t              tlo_tool = kTloInherit;
     bool                  exact_stop = false;           // G61: full stop at the end of this move
     double                corner_tolerance_mm = 0.0;    // G64 P: 0 = use MachineConfig::corner_tolerance_mm
+    // G2 / G3 chords: index into ParseResult::arcs (firmware-planned boards send the arc as one G2 / G3)
+    uint32_t              arc_index = kNoArc;
+};
+
+// Board report (GRBL-family boards): what the board says about itself, for diagnosis
+struct BoardReport {
+    uint64_t    revision = 0;   // Increases when a report is finished
+    bool        running = false;
+    std::string text;
 };
 
 // ============================================================================
@@ -793,6 +832,24 @@ public:
         submitScriptPromptResponse(button);
     }
     virtual void setScriptLogCallback(std::function<void(const std::string&, bool)> cb) = 0;
+
+    // Board (MULTI_BOARD_PLAN.md): what the selected board can do, its console and its firmware settings
+    virtual board::BoardCapabilities getBoardCapabilities() const { return board::rnrEcoMotionCapabilities(); }
+    virtual bool unlockBoard() { return false; }                        // Firmware boards: clear an alarm ($X)
+    virtual void setRapidOverride(float percent) { (void)percent; }     // 100 / 50 / 25 %
+    virtual bool sendBoardConsoleLine(const std::string& line) { (void)line; return false; }
+    virtual std::vector<transport::ProtocolLogEntry> getBoardLog(uint64_t after_seq) const {
+        (void)after_seq;
+        return {};
+    }
+    virtual bool requestBoardReport() { return false; } // Runs read-only queries ($I, $$, $#, $G ...) on the board
+    virtual BoardReport getBoardReport() const { return {}; }
+    virtual board::grbl::SettingsSnapshot getFirmwareSettings() const { return {}; }
+    virtual void requestFirmwareSettings() {}
+    virtual bool writeFirmwareSettings(const std::vector<std::pair<std::string, std::string>>& id_values) {
+        (void)id_values;
+        return false;
+    }
 };
 
 } // namespace rnr::core

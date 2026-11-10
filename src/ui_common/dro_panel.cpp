@@ -2,6 +2,7 @@
 #include "ui_common/app_window.h"
 #include "ui_common/frame_stats.h"
 #include "ui_common/theme.h"
+#include "ui_common/board_panels.h"
 #include "ui_common/gcode_panel.h"
 #include "core/scripting/script_path_helper.h"
 #include "imgui.h"
@@ -247,7 +248,9 @@ void DroAndJogPanel::render(
     perf::ScopedTimer perf_timer("DRO + jog panel");
     float start_cursor_y = ImGui::GetCursorPosY();
     // A gets its own jog controls only when it is a rotary / independent axis, not a gantry slave
-    a_jog_enabled_ = show_fourth_axis_a && controller.getConfig().gantryMasterAxis() < 0;
+    // (a firmware board gangs motors itself: its A is always an axis of its own)
+    a_jog_enabled_ = show_fourth_axis_a &&
+                     (telemetry.board_firmware_planned || controller.getConfig().gantryMasterAxis() < 0);
     handleKeyboardJog(controller, telemetry);
 
     // Compact mode for narrow side panels (e.g. 325px Minimal layout): hide MPos/Vel column,
@@ -344,12 +347,16 @@ void DroAndJogPanel::render(
         ImGui::PushStyleColor(ImGuiCol_Button, telemetry.axis_homed[i]
             ? theme::pal().btn_ok
             : theme::pal().btn_neutral);
+        const bool single_home = boardCaps(controller, telemetry).home_single_axis;
+        ImGui::BeginDisabled(!single_home);
         if (ImGui::Button("H", ImVec2(28.0f, 36.0f))) {
             controller.homeAxis(static_cast<core::Axis>(i));
         }
+        ImGui::EndDisabled();
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Home %s Axis to Home/Limit Switch", axis_names[i]);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (single_home) ImGui::SetTooltip("Home %s Axis to Home/Limit Switch", axis_names[i]);
+            else ImGui::SetTooltip("This board homes all axes together: use HOME ALL");
         }
 
         ImGui::SameLine(ImGui::GetWindowWidth() - 70.0f);
@@ -988,12 +995,6 @@ void DroAndJogPanel::render(
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pal().btn_danger_hov);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::pal().btn_danger_act);
     ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_danger));
-    if (ImGui::Button("STOP JOG", ImVec2(target_w, 38.0f))) {
-        controller.jogStop();
-    }
-    ImGui::PopStyleColor(4);
-
-    ImGui::Spacing();
 #ifdef __APPLE__
     const char* one_step = ", Cmd: one step";
 #else
@@ -1002,14 +1003,25 @@ void DroAndJogPanel::render(
     char hint_text[128];
     std::snprintf(hint_text, sizeof(hint_text), "Keys: arrows X / Y, Page Up / Down Z%s%s",
                   a_jog_enabled_ ? ", Home / End A" : "", step_jog_mode_ ? "" : one_step);
-    const ImVec2 hint_sz  = ImGui::CalcTextSize(hint_text);
-    if (hint_sz.x <= pad_avail_w) {
-        ImGui::SetCursorPosX((pad_avail_w - hint_sz.x) * 0.5f);
-        ImGui::TextDisabled("%s", hint_text);
-    } else {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", hint_text);
-        ImGui::PopTextWrapPos();
+    if (ImGui::Button("STOP JOG", ImVec2(target_w, 38.0f))) {
+        controller.jogStop();
+    }
+    ImGui::PopStyleColor(4);
+    if (key_hint_hidden_ && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", hint_text);
+
+    if (!key_hint_hidden_) {
+        const float hint_y0 = ImGui::GetCursorPosY();
+        ImGui::Spacing();
+        const ImVec2 hint_sz  = ImGui::CalcTextSize(hint_text);
+        if (hint_sz.x <= pad_avail_w) {
+            ImGui::SetCursorPosX((pad_avail_w - hint_sz.x) * 0.5f);
+            ImGui::TextDisabled("%s", hint_text);
+        } else {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", hint_text);
+            ImGui::PopTextWrapPos();
+        }
+        key_hint_h_ = ImGui::GetCursorPosY() - hint_y0;
     }
 
     // Macro Buttons Pinned to Control Panel
@@ -1149,7 +1161,7 @@ void DroAndJogPanel::render(
         ImGui::PopTextWrapPos();
 
         // The Limit Override checkbox should ONLY appear if this is an ALARM / E-STOP condition
-        if (is_alarm_estop) {
+        if (is_alarm_estop && boardCaps(controller, telemetry).limit_override) {
             bool ov = telemetry.limit_override_active;
             const float banner_w = ImGui::GetWindowWidth();
             const char* cb_label = (banner_w < 430.0f) ? "Limit Override" : "Limit Override (Allow Jog Off Switch)";
@@ -1169,8 +1181,20 @@ void DroAndJogPanel::render(
     }
 
     rendered_height_ = ImGui::GetCursorPosY() - start_cursor_y + ImGui::GetStyle().WindowPadding.y * 2.0f;
-    max_height_      = rendered_height_ + (base_cross_sz - cross_sz);
+    max_height_      = rendered_height_ + (base_cross_sz - cross_sz) + (key_hint_hidden_ ? key_hint_h_ : 0.0f);
     min_height_      = max_height_ - (base_cross_sz - 70.0f);
+    // The jog pad is as small as it gets and the panel is still too short (step jog buttons plus a status message):
+    // drop the keyboard hint (its text stays in the STOP JOG tooltip) instead of cutting off the message at the bottom.
+    // It comes back once there is room for it again, with a margin so it does not flicker.
+    if (allocated_height_ > 0.0f) {
+        if (!key_hint_hidden_ && rendered_height_ > allocated_height_ + 0.5f && cross_sz <= 70.5f) {
+            key_hint_hidden_ = true;
+        } else if (key_hint_hidden_ && allocated_height_ - rendered_height_ >= key_hint_h_ - 1.0f) {
+            // While the hint is hidden the pad is sized as if it were shown, so its height is left free when it fits:
+            // showing it then changes nothing else (no flicker), and it stays hidden while the pad is at its minimum
+            key_hint_hidden_ = false;
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Interactive Probe Z Modal Dialog

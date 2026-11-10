@@ -17,6 +17,8 @@
 #include "ui_common/corner_settings.h"
 #include "ui_common/program_start_settings.h"
 #include "ui_common/camera_panel.h"
+#include "ui_common/board_panels.h"
+#include "ui_common/fake_board_mode.h"
 #include "imgui.h"
 
 #include <fstream>
@@ -35,26 +37,33 @@ int main(int argc, char** argv) {
     // --smoke-test (CI): never touch USB devices (simulator), run the demo job briefly, exit without saving
     const bool smoke_test = ui::hasCommandLineFlag(argc, argv, "--smoke-test");
     if (smoke_test) core::RnRController::setHardwareAccessEnabled(false);
-    const std::string settings_file = "breakout_cut_settings.ini";
+    // --fake-board: drive the built-in GRBL-family emulator; no hardware, separate settings file
+    const bool fake_board = ui::hasCommandLineFlag(argc, argv, ui::kFakeBoardFlag);
+    if (fake_board) core::RnRController::setHardwareAccessEnabled(false);
+    const std::string settings_file = fake_board ? ui::fakeBoardSettingsFile("breakout_cut_settings.ini") : std::string("breakout_cut_settings.ini");
     config::PersistentSettings saved_settings{};
 
-    core::RnRController controller;
+    core::RnRController controller(false); // Connects below, once the settings (and the board) are applied
     saved_settings.machine = controller.getConfig();
     // Off unless the settings file says otherwise: slowing down on curves changes the cut and locks the THC anti-dive
     saved_settings.machine.limit_curve_speed = false;
     bool had_saved_settings = config::SettingsManager::loadFromFile(settings_file, saved_settings);
-    if (!had_saved_settings) {
+    if (!had_saved_settings && !fake_board) {
         // Fallback to legacy settings file if present
         had_saved_settings = config::SettingsManager::loadFromFile("rnr_plasma_settings.ini", saved_settings);
     }
 
+    if (fake_board) ui::enterFakeBoardMode(saved_settings, false);
+
     ui::AppWindow window(
-        "BreakoutCut " BREAKOUTCNC_VERSION_STRING,
+        fake_board ? "BreakoutCut " BREAKOUTCNC_VERSION_STRING " [fake GRBL board]" : "BreakoutCut " BREAKOUTCNC_VERSION_STRING,
         saved_settings.ui.window_width,
         saved_settings.ui.window_height);
     if (!window.isValid()) {
         return 1;
     }
+    // Test mode only: operate the UI from ui_remote_commands.txt (never with real hardware)
+    if (fake_board && ui::hasCommandLineFlag(argc, argv, "--ui-remote")) window.enableUiRemote(".");
 
     if (had_saved_settings) {
         window.setWindowGeometry(
@@ -167,7 +176,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Always engage E-Stop by default on program start so machine is disarmed until operator clicks RESET E-STOP
+    // Connect to the selected board (the simulator when none answers), then start disarmed: the operator clicks RESET E-STOP
+    if (!(had_saved_settings && saved_settings.ui.simulator_mode) && !controller.connect()) {
+        controller.setSimulatorMode(true);
+    }
     controller.triggerEStop();
 
     // Load the built-in demo program for the current mode (or the user's last loaded file below)
@@ -264,11 +276,11 @@ int main(int argc, char** argv) {
     // Operation Mode (Plasma / Laser) selector for title bar
     auto updateWindowCaptionForMode = [&](core::OperationMode mode) {
         if (mode == core::OperationMode::Laser) {
-            window.setTitle("BreakoutCut " BREAKOUTCNC_VERSION_STRING " - Laser");
+            window.setTitle(std::string("BreakoutCut " BREAKOUTCNC_VERSION_STRING " - Laser") + (fake_board ? " [fake GRBL board]" : ""));
             viewport.setFollowToolLabel("Follow Laser");
             gcode_panel.setMachineType(gcode::MachineType::Laser);
         } else {
-            window.setTitle("BreakoutCut " BREAKOUTCNC_VERSION_STRING " - Plasma");
+            window.setTitle(std::string("BreakoutCut " BREAKOUTCNC_VERSION_STRING " - Plasma") + (fake_board ? " [fake GRBL board]" : ""));
             viewport.setFollowToolLabel("Follow Torch");
             gcode_panel.setMachineType(gcode::MachineType::Plasma);
         }
@@ -388,6 +400,8 @@ int main(int argc, char** argv) {
         }
 
         const auto telemetry   = controller.getTelemetry();
+        const board::BoardCapabilities& board_caps = ui::boardCaps(controller, telemetry);
+        const bool host_board = board_caps.family == board::Family::HostPlanned;
         const auto program_snapshot = controller.getProgram(); // Held for the whole frame
         const auto& parse_res  = *program_snapshot;
         const auto& segments   = program_snapshot->segments;
@@ -546,6 +560,20 @@ int main(int argc, char** argv) {
                         ui::IoStatusBar::renderUsbConnectionSection(controller, telemetry, [&]() {
                             markSettingsDirty();
                         });
+                    }
+
+                    // -----------------------------------------------------------------
+                    // BOARD SETTINGS & CONSOLE (firmware-planned boards: GRBL, grblHAL, FluidNC)
+                    // -----------------------------------------------------------------
+                    if (board_caps.family == board::Family::FirmwarePlanned) {
+                        static bool board_settings_open = false;
+                        ImGui::SetNextItemOpen(board_settings_open, ImGuiCond_Once);
+                        board_settings_open = ImGui::CollapsingHeader("Board Settings");
+                        if (board_settings_open) ui::renderFirmwareSettings(controller, telemetry);
+                        static bool board_console_open = false;
+                        ImGui::SetNextItemOpen(board_console_open, ImGuiCond_Once);
+                        board_console_open = ImGui::CollapsingHeader("Board Console");
+                        if (board_console_open) ui::renderBoardConsole(controller, telemetry);
                     }
                     ImGui::Spacing();
 
@@ -724,7 +752,72 @@ int main(int argc, char** argv) {
                         saved_settings.ui.header_vfd_open = thc_hdr_open;
                         markSettingsDirty();
                     }
-                    if (thc_hdr_open) {
+                    if (thc_hdr_open && board_caps.board_thc) {
+                        // grblHAL plasma plugin: the board waits for Arc OK and corrects the height itself
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
+                        ImGui::PushStyleColor(ImGuiCol_Border,  ui::theme::pal().card_border);
+                        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+                        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
+                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+                        ImGui::BeginChild("##BoardThcCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                        {
+                            ImGui::TextColored(ui::theme::pal().heading, "THC ON THE BOARD");
+                            ImGui::PushTextWrapPos(0.0f);
+                            const std::string mode = telemetry.thc_board_mode.empty() ? board_caps.board_thc_mode : telemetry.thc_board_mode;
+                            ImGui::TextDisabled("%s runs torch height control itself (plasma plugin, %s mode). After M3 it waits "
+                                                "for Arc OK, and during the cut it corrects the torch height. Its settings are "
+                                                "in the Plasma group under Board Settings.",
+                                                board_caps.display_name.c_str(), mode.empty() ? "unknown" : mode.c_str());
+                            ImGui::PopTextWrapPos();
+                            ImGui::Spacing();
+
+                            // Status lamps, wrapped onto the next line when the panel is narrow
+                            bool first_lamp = true;
+                            auto lamp = [&](const char* label, bool on, const ImVec4& on_col) {
+                                const float w = ImGui::CalcTextSize(label).x;
+                                if (!first_lamp) {
+                                    const float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                                    if (ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + w <= right) ImGui::SameLine();
+                                }
+                                first_lamp = false;
+                                ImGui::TextColored(on ? on_col : ui::theme::pal().text_muted, "%s", label);
+                            };
+                            lamp("Torch", telemetry.thc_torch_on, ui::theme::pal().text_warn);
+                            lamp("Arc OK", telemetry.thc_arc_ok_active, ui::theme::pal().text_ok);
+                            lamp("THC active", telemetry.thc_board_active, ui::theme::pal().text_ok);
+                            lamp("Up", telemetry.thc_up_active, ui::theme::pal().text_info);
+                            lamp("Down", telemetry.thc_down_active, ui::theme::pal().text_warn);
+                            lamp("Anti-dive", telemetry.thc_anti_dive_locked, ui::theme::pal().text_warn);
+                            ImGui::Text("Arc voltage: %.1f V", telemetry.thc_arc_voltage);
+
+                            core::MachineConfig thc_cfg = controller.getConfig();
+                            if (thc_cfg.thc.enabled || thc_cfg.thc.wait_for_arc_ok) {
+                                ImGui::PushTextWrapPos(0.0f);
+                                ImGui::TextDisabled("The app's own THC settings (inputs, speeds, limits) are not used with this board.");
+                                ImGui::PopTextWrapPos();
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::PopStyleVar(4);
+                        ImGui::PopStyleColor(2);
+                    } else if (thc_hdr_open && !board_caps.realtime_process_control) {
+                        ImGui::PushTextWrapPos(0.0f);
+                        ImGui::TextColored(ui::theme::pal().text_warn,
+                                           "Torch height control and Wait for Arc OK need a board with real-time control. "
+                                           "%s plans the motion itself: switch THC off to cut plasma without height control.",
+                                           board_caps.display_name.c_str());
+                        ImGui::PopTextWrapPos();
+                        core::MachineConfig thc_cfg = controller.getConfig();
+                        if (thc_cfg.thc.enabled || thc_cfg.thc.wait_for_arc_ok) {
+                            if (ImGui::Button("Switch THC off", ImVec2(ImGui::CalcTextSize("Switch THC off").x + 32.0f, 28.0f))) {
+                                thc_cfg.thc.enabled = false;
+                                thc_cfg.thc.wait_for_arc_ok = false;
+                                controller.applyConfig(thc_cfg);
+                                markSettingsDirty();
+                            }
+                        }
+                    } else if (thc_hdr_open) {
                         core::MachineConfig cfg = controller.getConfig();
                         bool thc_changed = false;
 
@@ -1557,7 +1650,9 @@ int main(int argc, char** argv) {
                         saved_settings.ui.header_io_open = io_hdr_open;
                         markSettingsDirty();
                     }
-                    if (io_hdr_open) {
+                    if (io_hdr_open && !host_board) {
+                        ui::renderNotUsedByBoardNote("The functions and polarity of the inputs and outputs", board_caps);
+                    } else if (io_hdr_open) {
                         core::MachineConfig cfg = controller.getConfig();
                         if (ui::renderIoSettings(controller, telemetry, cfg)) {
                             controller.applyConfig(cfg);
@@ -1585,6 +1680,7 @@ int main(int argc, char** argv) {
                         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
                         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
 
+                        if (host_board) {
                         // Hardware E-Stop Input Pin
                         ImGui::BeginChild("##PlasmaEStopLimitCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                         {
@@ -1607,6 +1703,7 @@ int main(int argc, char** argv) {
 
                         ImGui::Spacing();
 
+                        }
                         // Homing requirement
                         ImGui::BeginChild("##PlasmaHomingRequiredCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                         {
@@ -1640,6 +1737,7 @@ int main(int argc, char** argv) {
 
                         ImGui::Spacing();
 
+                        if (host_board) {
                         // Constant velocity: corner tolerance and curve speed limit
                         ImGui::BeginChild("##PlasmaCornersCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                         {
@@ -1651,6 +1749,10 @@ int main(int argc, char** argv) {
 
                         ImGui::Spacing();
 
+                        }
+                        if (!host_board) {
+                            ui::renderNotUsedByBoardNote("Limit switches, homing speeds, pull-off and soft limits", board_caps);
+                        } else {
                         const char* ax_names[3] = {"X AXIS LIMITS & HOMING", "Y AXIS LIMITS & HOMING", "Z AXIS LIMITS & HOMING"};
                         const char* card_ids[3] = {"##LimitsXCard", "##LimitsYCard", "##LimitsZCard"};
                         for (int a = 0; a < 3; ++a) {
@@ -1749,6 +1851,7 @@ int main(int argc, char** argv) {
                             ImGui::Spacing();
                         }
 
+                        }
                         ImGui::PopStyleVar(4);
                         ImGui::PopStyleColor(2);
 
@@ -1769,7 +1872,9 @@ int main(int argc, char** argv) {
                         saved_settings.ui.header_motor_open = motor_hdr_open;
                         markSettingsDirty();
                     }
-                    if (motor_hdr_open) {
+                    if (motor_hdr_open && !board_caps.app_owns_motor_tuning) {
+                        ui::renderNotUsedByBoardNote("Steps per mm, speeds and accelerations", board_caps);
+                    } else if (motor_hdr_open) {
                         core::MachineConfig cfg = controller.getConfig();
                         bool changed = false;
 

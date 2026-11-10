@@ -235,7 +235,7 @@ void GCodeProgramPanel::render(
 
     // Whole-Line Snap-Scrolled G-Code Listing
     constexpr float kRowHeight = 22.0f;
-    const float mdi_needed_h = ImGui::GetStyle().ItemSpacing.y + 6.0f + ImGui::GetFrameHeight();
+    const float mdi_needed_h = ImGui::GetStyle().ItemSpacing.y + 6.0f + std::max(28.0f, ImGui::GetFrameHeight());
     const float avail_h = ImGui::GetContentRegionAvail().y - mdi_needed_h;
     const int visible_rows = std::max(3, static_cast<int>(std::floor((avail_h - 2.0f) / kRowHeight)));
     const float exact_scroll_h = static_cast<float>(visible_rows) * kRowHeight + 2.0f; // +2px for top/bottom 1px border
@@ -435,8 +435,29 @@ void GCodeProgramPanel::render(
     // Shifted 6px down so buttons and input field do not touch the G-code scroll window border
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6.0f);
 
-    // Load File button moved down to the left of MDI G-Code
-    if (ImGui::Button("Load File", ImVec2(120.0f, 0.0f))) {
+    // Everything in one row that fits the panel: the input takes the room that is left. In a narrow panel the labels
+    // get shorter and the last command moves into the input's tooltip, so nothing reaches past the right edge (a
+    // wider row made the panel scroll sideways as soon as the input got the focus).
+    const float row_h   = std::max(28.0f, ImGui::GetFrameHeight());
+    const float sp      = ImGui::GetStyle().ItemSpacing.x;
+    const float row_w   = ImGui::GetContentRegionAvail().x;
+    auto btnW = [](const char* t) { return ImGui::CalcTextSize(t).x + 32.0f; };
+    const std::string last_txt = telemetry.last_mdi_command.empty() ? std::string("Ready")
+                                                                      : "Last: " + telemetry.last_mdi_command;
+    constexpr float kMinInputW = 120.0f;
+    const float wide_fixed = btnW("Load File") + btnW("Edit File") + ImGui::CalcTextSize("MDI G-Code:").x +
+                             btnW("Send MDI") + sp * 4.0f;
+    const bool  compact = row_w - wide_fixed < kMinInputW;
+    const char* load_lbl = compact ? "Load" : "Load File";
+    const char* edit_lbl = compact ? "Edit" : "Edit File";
+    const char* mdi_lbl  = compact ? "MDI:" : "MDI G-Code:";
+    const char* send_lbl = compact ? "Send" : "Send MDI";
+    const float fixed_w = btnW(load_lbl) + btnW(edit_lbl) + ImGui::CalcTextSize(mdi_lbl).x + btnW(send_lbl) + sp * 4.0f;
+    const float status_w = ImGui::CalcTextSize(last_txt.c_str()).x;
+    const bool  show_status = row_w - fixed_w - sp - status_w >= 200.0f; // The status only where the input stays usable
+    const float mdi_input_w = std::clamp(row_w - fixed_w - (show_status ? sp + status_w : 0.0f), 80.0f, 420.0f);
+
+    if (ImGui::Button(load_lbl, ImVec2(btnW(load_lbl), row_h))) {
         if (on_load_file_clicked) {
             on_load_file_clicked();
             selected_line_           = 0;
@@ -453,7 +474,7 @@ void GCodeProgramPanel::render(
     // Edit File button: active only if an external file is open on disk
     const bool has_open_file = !active_file_path_.empty() && std::filesystem::exists(active_file_path_);
     ImGui::BeginDisabled(!has_open_file);
-    if (ImGui::Button("Edit File", ImVec2(120.0f, 0.0f))) {
+    if (ImGui::Button(edit_lbl, ImVec2(btnW(edit_lbl), row_h))) {
         openFileInDefaultEditor(active_file_path_);
     }
     ImGui::EndDisabled();
@@ -466,25 +487,24 @@ void GCodeProgramPanel::render(
     }
 
     ImGui::SameLine();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ImGui::GetFrameHeight()) * 0.5f);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(theme::pal().text_info, "MDI G-Code:");
+    ImGui::TextColored(theme::pal().text_info, "%s", mdi_lbl);
 
     ImGui::SameLine();
     ImGui::BeginDisabled(is_estop);
-
-    // Input field length reduced to half the size of the previous width
-    const float avail_w = ImGui::GetContentRegionAvail().x;
-    const float mdi_input_w = std::clamp((avail_w - 180.0f) * 0.5f, 150.0f, 320.0f);
     ImGui::SetNextItemWidth(mdi_input_w);
-
     bool send_mdi = ImGui::InputTextWithHint(
         "##MdiInput",
         "Enter manual G-Code",
         mdi_input_buf_,
         sizeof(mdi_input_buf_),
         ImGuiInputTextFlags_EnterReturnsTrue);
+    if (!show_status && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", last_txt.c_str());
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Send MDI", ImVec2(95.0f, 0.0f))) {
+    if (ImGui::Button(send_lbl, ImVec2(btnW(send_lbl), row_h))) {
         send_mdi = true;
     }
     if (send_mdi && mdi_input_buf_[0] != '\0' && !is_estop) {
@@ -494,11 +514,9 @@ void GCodeProgramPanel::render(
         ImGui::SetKeyboardFocusHere(-1);
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (!telemetry.last_mdi_command.empty()) {
-        ImGui::TextDisabled("Last: %s", telemetry.last_mdi_command.c_str());
-    } else {
-        ImGui::TextDisabled("Ready");
+    if (show_status) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", last_txt.c_str());
     }
 
     if (gcode_font) {
@@ -658,8 +676,11 @@ void GCodeProgramPanel::triggerCycleStart(
     const bool is_start_from_beginning = (telemetry.active_gcode_line_index == 0);
     const bool is_resuming = is_running || is_tool_change || (telemetry.state == core::ControllerState::PausedHold);
 
-    // Only show spindle warning modal if cycle start is hit while program is NOT started from the beginning
-    if (!is_resuming && !is_start_from_beginning && !telemetry.torch_or_spindle_on && !telemetry.dry_run_mode) {
+    // Only show spindle warning modal if cycle start is hit while program is NOT started from the beginning.
+    // BreakoutMill only: in BreakoutCut the output is the plasma torch or the laser, which must never be switched on
+    // from here (the program's M3 / M4 does that where it should).
+    if (!is_resuming && !is_start_from_beginning && !telemetry.torch_or_spindle_on && !telemetry.dry_run_mode &&
+        controller.getConfig().is_mill) {
         show_spindle_warning_modal_ = true;
     } else {
         controller.startJob();
@@ -1003,7 +1024,7 @@ float GCodeProgramPanel::calculateDesiredHeight(float max_available_h, bool is_t
     const float spacing_y = ImGui::GetStyle().ItemSpacing.y;
     const float top_row_h = 34.0f;
     const float tool_change_h = is_tool_change ? (50.0f + spacing_y) : 0.0f;
-    const float mdi_needed_h = spacing_y + 6.0f + ImGui::GetFrameHeight();
+    const float mdi_needed_h = spacing_y + 6.0f + std::max(28.0f, ImGui::GetFrameHeight());
     // The program check card (height of the last frame) sits above the listing and must not take its rows
     const float non_scroll_h = pad_y + top_row_h + spacing_y + tool_change_h + diag_card_h_ + mdi_needed_h;
 

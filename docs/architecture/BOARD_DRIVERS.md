@@ -1,8 +1,16 @@
 # Board Drivers: Machine Core vs. Motion Board
 
 BreakoutCNC separates the **machine core** (everything a CNC controller does) from the **board driver**
-(how one particular motion control card is talked to). Today the only driver is the RNR Eco Motion 2.0 USB
-card; the split exists so other boards can be added without touching the machine logic.
+(how one particular motion control card is talked to). Two board families exist:
+
+- **Host-planned** (the PC plans the motion and streams timed chunks): the RNR Eco Motion 2.0 USB card, through
+  `IBoardDriver` (below).
+- **Firmware-planned** (the board plans, the PC sends G-code lines): GRBL 1.1, grblHAL and FluidNC, through
+  `core::motion::FirmwarePlannedPath` (section *Firmware-planned boards*).
+
+The board is chosen by its registry id (`MachineConfig::board_id`, saved as `[Machine] board`); see
+[board_registry.h](../../src/core/board/board_registry.h). The plans behind this are
+[MULTI_BOARD_PLAN.md](MULTI_BOARD_PLAN.md) and [GRBL_FAMILY_PLAN.md](GRBL_FAMILY_PLAN.md).
 
 ## Layers
 
@@ -27,7 +35,12 @@ card; the split exists so other boards can be added without touching the machine
 - Board-neutral types (`core::Axis`, `core::OutputBit`, `core::StepSlice`) live in
   [board_types.h](../../src/core/board/board_types.h). Nothing outside `src/core/hid` and the RNR driver
   includes the RNR protocol header.
-- `board::createBoardDriver(BoardType)` is the factory for future board selection.
+- `board::createBoardDriver(BoardType)` creates host-planned drivers; `board::BoardRegistry` lists every board
+  (id, name, family, transports, capabilities, default settings).
+- `board::BoardCapabilities` ([board_capabilities.h](../../src/core/board/board_capabilities.h)) says what the
+  selected board can do. The UI, the program check and Lua (`cnc.board()`) read it instead of asking which board it
+  is: sections such as Motors, Limits & Homing, pin assignment and THC are replaced by a note when the board keeps
+  those settings itself.
 
 ## The driver contract
 
@@ -80,20 +93,65 @@ firmware): implement `IBoardDriver`, add a `BoardType`, return it from `createBo
 `MachineController(createBoardDriver(type))`. If the board needs a different slice period, the core's 25 ms
 tick has to become configurable first (a `static_assert` guards the current assumption).
 
-**Board-planned boards** (GRBL, grblHAL, FluidNC: the board takes G-code and plans itself) need a second
-motion path in the core, because there are no step slices to stream:
+**Firmware-planned boards**: see the next section. A further GRBL-like firmware is a `FirmwareProfile` variant
+plus a registry entry; another protocol (Marlin, g2core) would be a second protocol class next to `GrblProtocol`.
 
-- jobs are sent as (pre-processed) G-code lines with the firmware's flow control instead of planned slices;
-  height-map warping and tool length offsets are applied to the lines before sending;
-- feed hold / resume / overrides / jog / homing / probing map to the firmware's own commands
-  (`!`, `~`, override bytes, `$J=`, `$H`, `G38.2`);
-- position and inputs come from the firmware's status reports.
+## Firmware-planned boards (GRBL 1.1, grblHAL, FluidNC)
 
-The expected shape is a second driver interface (or a motion-model switch in `BoardCapabilities`) and a
-G-code streaming job runner next to the slice planner; the UI, work offsets, tool table, scripts and VFD
-stay in the shared core.
+```
+ MachineController   state machine, work offsets, tool table, probing routines, MDI parsing, VFD, scripts
+        |  intents: moves (machine frame), probe, homing, jog velocity, job, hold / resume / stop, outputs
+        v
+ motion::FirmwarePlannedPath   (src/core/motion/firmware_planned_path.*)
+   connect + identify, status polling, single moves (G53), probing (G38.3, incremental), homing ($H),
+   jog feeder ($J= chunks, 0x85 cancel), job streamer + sync points, stop sequence, overrides, settings
+        |  GcodeEmitter + GcodeDialect (src/core/motion/gcode_emitter.*): lines, arcs as G2/G3, modal memory
+        v
+ board::grbl::GrblProtocol     (src/core/board/grbl/*): reader thread, character-counting flow control,
+        |                      real-time bytes, message parser, FirmwareProfile (flavour detection), codes, settings
+        v
+ transport::IByteStream        SerialPort (Windows / Linux / macOS), TcpStream; ProtocolLog for the console
+```
+
+- **Coordinates**: the app resolves work offsets, tool lengths, G53 / G28, G68 and height maps. Single moves are
+  sent as `G53` machine moves, probes and jogs are incremental, and jobs read the board's G54 offset (`$#`) after
+  their preamble (`G21G90G94G17`, `G54`, `G49`, `G92.1`, `M5M9`). G10 / G92 are never sent.
+  App machine position = firmware machine position + machine shift (used when the machine has no home switches).
+- **Sync points**: at M6, M0 / M1 and (with the Huanyang VFD driven by the app) spindle changes, the streamer sends
+  `G4P0`, waits until the board is idle and hands control to the core.
+- **Which line runs**: a path tracker follows the reported position along the sent moves (or `Ln:` where the board
+  reports line numbers).
+- **Threading**: everything runs on the core worker tick under the core lock, except the protocol's reader thread
+  (only its line queue) and `emergencyStop()` (a soft reset written straight to the port, from any thread).
+- **Board texts and report**: the connect sequence reads the board's alarm / error texts (grblHAL `$EA` / `$EE`,
+  FluidNC `$A` / `$E`); `startBoardReport()` runs read-only queries and `boardReportText()` assembles them with the
+  profile, capabilities and recent exchange (*Save board report*). `travelEnvelope()` gives each axis's travel for
+  the program check.
+- **Board THC**: grblHAL's plasma plugin is detected from `[PLUGIN:PLASMA (<mode>) ...]` / `THC` in `[NEWOPT:]` and
+  `$350`, giving the capability `board_thc`. The board then waits for Arc OK on `M3` and corrects Z itself; the
+  status field `|THC:<volts>,<flags>` feeds the THC telemetry, `[MSG:arc failed]` becomes a pause with a message,
+  and the path tracker follows plasma jobs by XY only (Z is moved by the board).
+- **Simulator**: with a firmware board selected, Simulator Mode uses the host-planned simulator; the board's
+  capabilities still decide what the UI shows.
+
+Not done yet: moving the RNR slice code out of `MachineController` into a `HostPlannedPath` (Phase 0c of
+[MULTI_BOARD_PLAN.md](MULTI_BOARD_PLAN.md)), the role-based I/O model for the RNR pins, and the GRBL-family items
+listed at the end of section 17 of [GRBL_FAMILY_PLAN.md](GRBL_FAMILY_PLAN.md) (4th axis, automatic status reports,
+machine envelope, controller fault texts, among others). The emulator test mode exists: `--fake-board` (see Testing).
 
 ## Testing
+
+`tests/board_tests.cpp` runs the machine core against `FakeGrbl` ([fake_grbl.h](../../src/core/board/grbl/fake_grbl.h)),
+an in-process GRBL / grblHAL / FluidNC emulator with a checked receive buffer: identification, MDI, jogging, homing,
+probing, a job with arcs and a tool change, hold / resume / stop / E-stop, alarms, restarts, a silent board, firmware
+settings, the console and flow control.
+
+The same emulator drives the applications for manual and scripted UI tests: `BreakoutMill.exe --fake-board`
+([fake_board_mode.cpp](../../src/ui_common/fake_board_mode.cpp)) switches hardware access off, uses
+`*_settings_fakeboard.ini`, and connects the GRBL / grblHAL / FluidNC choices to emulators. With `--ui-remote` as well,
+the app also reads `ui_remote_commands.txt` next to the executable (click, press / release, scroll, type, key, wait,
+shot, quit; see [ui_remote.h](../../src/ui_common/ui_remote.h)) and saves screenshots to `ui_remote_shots/`, so a test
+can operate the UI without the computer's mouse or keyboard.
 
 `tests/script_engine_test.cpp` Test 39 runs a full `MachineController` against `FakeBoardDriver` (no USB):
 connect, E-Stop reset, jog, outputs, a G-code job and E-Stop all have to arrive at the driver, the slice

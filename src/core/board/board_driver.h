@@ -1,5 +1,6 @@
 #pragma once
 #include "core/board/board_types.h"
+#include "core/board/board_capabilities.h"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -16,9 +17,9 @@ struct MachineConfig;
 // homing & probing sequences, spindle/VFD, THC, scripting - and talks to the hardware only through this
 // interface. A driver translates these calls into its board's wire protocol.
 //
-// Motion model: the core plans on the PC and streams fixed-period StepSlices (kSlicePeriodSec each), keeping
-// at most maxSlicesInFlight() unacknowledged slices on the board. Boards that plan motion themselves
-// (e.g. GRBL-family firmware taking G-code) need an additional motion path in the core; see
+// Motion model (host-planned family): the core plans on the PC and streams fixed-period StepSlices
+// (kSlicePeriodSec each), keeping at most maxSlicesInFlight() unacknowledged slices on the board. Boards that plan
+// motion themselves (GRBL-family firmware taking G-code) use core::FirmwarePlannedPath instead; see
 // docs/architecture/BOARD_DRIVERS.md.
 //
 // Threading: readStatus() is called by the core's worker thread without the core lock held; every other
@@ -42,18 +43,6 @@ struct BoardInfo {
     std::string serial_number;
 };
 
-struct BoardCapabilities {
-    std::string display_name;            // Shown in the UI, e.g. "RNR Eco Motion 2.0"
-    uint8_t     input_count      = 12;   // Inputs IN1..INn usable for switches, probe and E-Stop
-    uint8_t     output_count     = 4;    // Outputs OUT1..OUTn
-    uint8_t     min_pulse_khz    = 10;
-    uint8_t     max_pulse_khz    = 100;
-    size_t      max_slices_in_flight = 3; // Unacknowledged slices the board can buffer
-    bool        hardware_probe_latch = true;  // Board stops and latches positions on probe contact
-    bool        hardware_home_latch  = true;  // Board stops and latches positions on a home switch
-    bool        spindle_pwm          = true;  // 0-10 V / PWM spindle speed output
-    bool        accesses_real_hardware = true; // False for simulated / test drivers
-};
 
 // Latest board feedback, in board-neutral form
 struct BoardStatus {

@@ -4,11 +4,13 @@
 
 namespace rnr::core {
 
-// The machine core driving an RNR Eco Motion 2.0 USB card (the board the applications use today).
-// Other boards: construct a MachineController with their IBoardDriver instead.
+// The machine core with the RNR Eco Motion 2.0 as its host-planned board. Firmware-planned boards (GRBL family) are
+// selected through MachineConfig::board_id; the applications use this class for every board.
+// connect_now = false: the application connects once it has applied its settings (and so knows the board).
 class RnRController final : public MachineController {
 public:
-    RnRController() : MachineController(std::make_unique<board::RnrBoardDriver>()) {}
+    explicit RnRController(bool connect_now = true)
+        : MachineController(std::make_unique<board::RnrBoardDriver>(), connect_now) {}
 };
 
 } // namespace rnr::core
