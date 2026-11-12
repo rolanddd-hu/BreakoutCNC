@@ -48,17 +48,19 @@ bool GrblProtocol::open(std::unique_ptr<transport::IByteStream> stream, const tr
         if (error) *error = "Unknown connection type '" + target.transport + "'";
         return false;
     }
-    if (!stream->open(target, options, error)) return false;
     stream_ = std::move(stream);
+    target_ = target;
+    options_ = options;
     link_failed_ = false;
+    connecting_.store(true, std::memory_order_release);
     pending_.clear();
     pending_bytes_ = 0;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.clear();
+        open_error_.clear();
         last_receive_ = Clock::now();
     }
-    log_->add(Dir::Info, "Opened " + (target.label.empty() ? target.address : target.label));
     reader_run_ = true;
     reader_ = std::thread(&GrblProtocol::readerLoop, this);
     return true;
@@ -78,10 +80,35 @@ void GrblProtocol::close() {
 }
 
 void GrblProtocol::setControlLines(bool dtr, bool rts) {
-    if (stream_) stream_->setControlLines(dtr, rts);
+    if (stream_ && !connecting()) stream_->setControlLines(dtr, rts);
+}
+
+std::string GrblProtocol::openError() const {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return open_error_;
 }
 
 void GrblProtocol::readerLoop() {
+    {
+        std::string err;
+        if (!stream_->open(target_, options_, &err)) {
+            if (err.empty()) err = "Cannot open " + target_.address;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                open_error_ = err;
+            }
+            log_->add(Dir::Error, err);
+            link_failed_ = true;
+            connecting_.store(false, std::memory_order_release);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            last_receive_ = Clock::now();
+        }
+        log_->add(Dir::Info, "Opened " + (target_.label.empty() ? target_.address : target_.label));
+        connecting_.store(false, std::memory_order_release);
+    }
     std::string partial;
     uint8_t buf[512];
     while (reader_run_.load()) {
@@ -149,7 +176,7 @@ bool GrblProtocol::canSend(size_t line_chars) const {
 }
 
 uint32_t GrblProtocol::sendLine(const std::string& line) {
-    if (!stream_ || link_failed_.load()) return 0;
+    if (!stream_ || link_failed_.load() || connecting()) return 0;
     const std::string data = line + "\n";
     if (!stream_->write(reinterpret_cast<const uint8_t*>(data.data()), data.size())) {
         if (!link_failed_.exchange(true)) log_->add(Dir::Error, "Connection lost (write failed)");
@@ -170,7 +197,7 @@ void GrblProtocol::forgetUnacknowledged() {
 
 bool GrblProtocol::realtime(Realtime c, bool top_bit) {
     std::lock_guard<std::mutex> lock(stream_mutex_);
-    if (!stream_ || link_failed_.load()) return false;
+    if (!stream_ || link_failed_.load() || connecting()) return false;
     const uint8_t b = realtimeByte(c, top_bit);
     if (!stream_->write(&b, 1)) {
         link_failed_ = true;

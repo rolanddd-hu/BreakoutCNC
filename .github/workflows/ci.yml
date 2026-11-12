@@ -19,7 +19,8 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-            configure: cmake -B build -A x64
+            # Warnings are errors on Windows (MSVC /W4 is clean); GCC / Clang show theirs without failing the build
+            configure: cmake -B build -A x64 -DBREAKOUTCNC_WARNINGS_AS_ERRORS=ON
             # Multi-config generator: binaries land in build/Release
             bin_dir: build/Release
             package: build/BreakoutCNC-*-win64.zip
@@ -55,15 +56,10 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      # The tests load scripts/ relative to the working directory, which CMake copies next to the binaries.
-      # They never touch hardware (rnr_hid_test is a hardware tool and is not run here).
-      - name: Script engine tests
-        working-directory: ${{ matrix.bin_dir }}
-        run: ./script_engine_test
-
-      - name: Huanyang VFD tests
-        working-directory: ${{ matrix.bin_dir }}
-        run: ./huanyang_vfd_test
+      # Every unit test registered in CMakeLists.txt (script engine, VFD, GRBL-family boards on the emulator,
+      # regression tests). They never touch hardware (rnr_hid_test is a hardware tool and is not a test).
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       # Start both GUI apps (simulator, no USB access), run the demo job for ~4 s and exit: catches startup
       # crashes and OpenGL / window problems the unit tests cannot see. Linux only: Windows runners have no
@@ -87,3 +83,35 @@ jobs:
           name: BreakoutCNC-${{ matrix.name }}
           path: ${{ matrix.package }}
           if-no-files-found: error
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer over the unit tests: raw sockets, hand-written parsers and several
+  # threads are where memory errors hide
+  sanitizers:
+    name: Linux (ASan + UBSan)
+    runs-on: ubuntu-22.04
+    # Reports without blocking until its first clean run; then remove this line
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols libgl-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+          "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+
+      - name: Build tests
+        run: cmake --build build --parallel --target script_engine_test huanyang_vfd_test board_tests regression_tests deploy_scripts deploy_resources
+
+      - name: Unit tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure

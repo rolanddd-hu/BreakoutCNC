@@ -127,6 +127,8 @@ private:
     LoadJob           load_job_;              // Owned by the worker until load_done_
     bool              load_ok_       = false;
     bool              load_mismatch_ = false;
+    std::string       load_error_;            // Worker: the file could not be read
+    std::string       load_notice_;           // Shown in the program row until the next load
     gcode::MachineTypeCheckResult load_check_;
     bool              has_next_load_ = false; // Another load requested while one was running: run it next
     LoadJob           next_load_job_;

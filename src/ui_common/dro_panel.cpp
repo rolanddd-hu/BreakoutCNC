@@ -250,7 +250,7 @@ void DroAndJogPanel::render(
     // A gets its own jog controls only when it is a rotary / independent axis, not a gantry slave
     // (a firmware board gangs motors itself: its A is always an axis of its own)
     a_jog_enabled_ = show_fourth_axis_a &&
-                     (telemetry.board_firmware_planned || controller.getConfig().gantryMasterAxis() < 0);
+                     (telemetry.board_firmware_planned || controller.getConfigShared()->gantryMasterAxis() < 0);
     handleKeyboardJog(controller, telemetry);
 
     // Compact mode for narrow side panels (e.g. 325px Minimal layout): hide MPos/Vel column,
@@ -267,7 +267,8 @@ void DroAndJogPanel::render(
     const int num_axes = show_fourth_axis_a ? 4 : 3;
     ImFont* dro_font   = AppWindow::getDroFont();
     ImFont* mono_font  = AppWindow::getGCodeFont();
-    const auto& active_cfg = controller.getConfig();
+    const auto active_cfg_ptr = controller.getConfigShared(); // Held: the reference below must outlive the call
+    const auto& active_cfg = *active_cfg_ptr;
     const bool is_imperial = (active_cfg.linear_units == core::LinearUnits::Imperial);
     const double pos_scale = is_imperial ? (1.0 / 25.4) : 1.0;
 
@@ -1025,7 +1026,7 @@ void DroAndJogPanel::render(
     }
 
     // Macro Buttons Pinned to Control Panel
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     auto& sc = cfg.scripting;
     std::vector<size_t> cp_indices;
     for (size_t i = 0; i < sc.macro_buttons.size(); ++i) {
@@ -1216,7 +1217,7 @@ void DroAndJogPanel::render(
         ImGui::Separator();
         ImGui::Spacing();
 
-        core::MachineConfig cfg = controller.getConfig();
+        core::MachineConfig cfg = *controller.getConfigShared();
         float plate_t = static_cast<float>(cfg.probe.plate_thickness_mm);
 
         ImGui::AlignTextToFramePadding();
@@ -1312,7 +1313,7 @@ void DroAndJogPanel::handleKeyboardJog(
         if (ImGui::IsKeyPressed(ImGuiKey_PageDown,   false)) controller.jogStep(core::Axis::Z, -step, feed);
         if (a_jog_enabled_) {
             // A takes the step value as shown, in degrees
-            const bool imperial = controller.getConfig().linear_units == core::LinearUnits::Imperial;
+            const bool imperial = controller.getConfigShared()->linear_units == core::LinearUnits::Imperial;
             const double a_step = imperial ? step / 25.4 : step;
             if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) controller.jogStep(core::Axis::A,  a_step, feed);
             if (ImGui::IsKeyPressed(ImGuiKey_End,  false)) controller.jogStep(core::Axis::A, -a_step, feed);

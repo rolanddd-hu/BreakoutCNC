@@ -27,8 +27,8 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG        3.4
-    GIT_SHALLOW    TRUE
+    # Every dependency is pinned to a commit (a moved tag cannot change a release build)
+    GIT_TAG        7b6aead9fb88b3623e3b3725ebb42670cbe4c579 # 3.4
 )
 FetchContent_MakeAvailable(glfw)
 
@@ -45,8 +45,7 @@ FetchContent_MakeAvailable(imgui)
 FetchContent_Declare(
     lua
     GIT_REPOSITORY https://github.com/lua/lua.git
-    GIT_TAG        v5.4.7
-    GIT_SHALLOW    TRUE
+    GIT_TAG        1ab3208a1fceb12fca8f24ba57d6e13c5bff15e3 # v5.4.7
 )
 # Lua has no CMakeLists.txt, so this only downloads it; the library is defined below
 FetchContent_MakeAvailable(lua)
@@ -62,6 +61,12 @@ list(REMOVE_ITEM LUA_SOURCES
 set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(lua_lib STATIC ${LUA_SOURCES})
 target_include_directories(lua_lib PUBLIC ${lua_SOURCE_DIR})
+if(WIN32)
+    # Script file names are UTF-8 (src/core/util/utf8_path.h): Lua's fopen / freopen get them through _wfopen
+    target_sources(lua_lib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core/util/lua_utf8_fopen.cpp)
+    set_source_files_properties(${LUA_SOURCES} PROPERTIES COMPILE_OPTIONS
+        "$<IF:$<CXX_COMPILER_ID:MSVC>,/FI${CMAKE_CURRENT_SOURCE_DIR}/src/core/util/utf8_fopen.h,-include;${CMAKE_CURRENT_SOURCE_DIR}/src/core/util/utf8_fopen.h>")
+endif()
 if(MSVC)
     target_compile_definitions(lua_lib PRIVATE _CRT_SECURE_NO_WARNINGS)
 elseif(UNIX)
@@ -76,7 +81,6 @@ add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
@@ -86,12 +90,36 @@ target_include_directories(imgui_lib PUBLIC
 )
 target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 
+# Compiler warnings for BreakoutCNC's own code (not GLFW, ImGui or Lua). CI builds with BREAKOUTCNC_WARNINGS_AS_ERRORS.
+option(BREAKOUTCNC_WARNINGS_AS_ERRORS "Treat compiler warnings in BreakoutCNC code as errors" OFF)
+add_library(breakoutcnc_warnings INTERFACE)
+if(MSVC)
+    target_compile_options(breakoutcnc_warnings INTERFACE /W4 /wd4100 /wd4127 /wd4244 /wd4267 /wd4305 /wd4456 /wd4457 /wd4458 /wd4996)
+    if(BREAKOUTCNC_WARNINGS_AS_ERRORS)
+        target_compile_options(breakoutcnc_warnings INTERFACE /WX)
+    endif()
+else()
+    target_compile_options(breakoutcnc_warnings INTERFACE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+    if(BREAKOUTCNC_WARNINGS_AS_ERRORS)
+        target_compile_options(breakoutcnc_warnings INTERFACE -Werror)
+    endif()
+endif()
+
 # 4. Shared Hardware, G-Code & Trajectory Planner Engine (rnr_core)
 add_library(rnr_core STATIC
     src/core/hid/rnr_usb_device.cpp
     src/core/gcode/gcode_parser.cpp
+    src/core/gcode/gcode_samples.cpp
+    src/core/gcode/machine_type_detect.cpp
     src/core/planner/trajectory_planner.cpp
     src/core/controller/machine_controller.cpp
+    src/core/controller/machine_controller_coordinates.cpp
+    src/core/controller/machine_controller_jog.cpp
+    src/core/controller/machine_controller_outputs.cpp
+    src/core/controller/machine_controller_homing_probing.cpp
+    src/core/controller/machine_controller_program.cpp
+    src/core/controller/machine_controller_worker.cpp
+    src/core/controller/machine_controller_boards.cpp
     src/core/io/io_map.cpp
     src/core/board/rnr_board_driver.cpp
     src/core/board/board_registry.cpp
@@ -102,6 +130,9 @@ add_library(rnr_core STATIC
     src/core/board/grbl/grbl_settings.cpp
     src/core/motion/gcode_emitter.cpp
     src/core/motion/firmware_planned_path.cpp
+    src/core/motion/firmware_planned_path_console.cpp
+    src/core/motion/firmware_planned_path_manual.cpp
+    src/core/motion/firmware_planned_path_job.cpp
     src/core/transport/byte_stream.cpp
     src/core/transport/serial_port.cpp
     src/core/transport/tcp_stream.cpp
@@ -115,20 +146,21 @@ add_library(rnr_core STATIC
     src/core/camera/camera_stream_server.cpp
     src/core/update/version_check.cpp
     src/core/controller/program_check.cpp
+    src/core/util/utf8_path.cpp
+    src/core/util/app_paths.cpp
 )
 target_include_directories(rnr_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(rnr_core PUBLIC lua_lib)
 
 # Platform-specific dependencies for rnr_core
 if(WIN32)
-    target_link_libraries(rnr_core PUBLIC hid setupapi ws2_32 winhttp mfplat mf mfreadwrite mfuuid ole32)
+    target_link_libraries(rnr_core PUBLIC hid setupapi ws2_32 winhttp winmm mfplat mf mfreadwrite mfuuid ole32)
 else()
     # Cross-platform USB HID via hidapi on Linux / macOS
     FetchContent_Declare(
         hidapi
         GIT_REPOSITORY https://github.com/libusb/hidapi.git
-        GIT_TAG        hidapi-0.14.0
-        GIT_SHALLOW    TRUE
+        GIT_TAG        d3013f0af3f4029d82872c1a9487ea461a56dee4 # hidapi-0.14.0
     )
     set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
     # hidapi 0.14 declares cmake_minimum_required(3.1.3), which CMake 4 rejects; let it configure with the
@@ -177,6 +209,9 @@ add_library(rnr_ui_common STATIC
     src/ui_common/file_dialog.cpp
     src/ui_common/mach3_migration_dialog.cpp
     src/ui_common/camera_panel.cpp
+    src/ui_common/remote_upload.cpp
+    src/ui_common/app_shell.cpp
+    src/ui_common/machine_settings_sections.cpp
     src/ui_common/tool_table_panel.cpp
     src/ui_common/lua_guide.cpp
 )
@@ -197,13 +232,18 @@ add_executable(huanyang_vfd_test tests/huanyang_vfd_test.cpp)
 target_link_libraries(huanyang_vfd_test PRIVATE rnr_core)
 
 # 6c. Script Engine & Lua 5.4 API Unit Test
-add_executable(script_engine_test tests/script_engine_test.cpp)
+add_executable(script_engine_test tests/script_engine_test.cpp tests/controller_tests.cpp tests/parser_planner_tests.cpp
+    tests/config_io_tests.cpp)
 target_link_libraries(script_engine_test PRIVATE rnr_core)
 target_include_directories(script_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src) # ui_common/lua_guide_examples.h (header only)
 
 # 6d. Board tests: GRBL-family protocol, G-code emitter, firmware path on the FakeGrbl emulator
 add_executable(board_tests tests/board_tests.cpp)
 target_link_libraries(board_tests PRIVATE rnr_core)
+
+# 6e. Regression tests for the code review findings (docs/CODE_REVIEW_FINDINGS.md)
+add_executable(regression_tests tests/regression_tests.cpp)
+target_link_libraries(regression_tests PRIVATE rnr_core)
 
 # 7. Executable: BreakoutCut (Dual-Mode Plasma & Laser Cutter Controller)
 set(BREAKOUT_CUT_SRCS src/app_cut/main_cut.cpp)
@@ -233,28 +273,38 @@ if(MSVC)
     target_link_options(BreakoutMill PRIVATE "$<$<CONFIG:Release>:/SUBSYSTEM:WINDOWS;/ENTRY:mainCRTStartup>")
 endif()
 
-# 9. Deploy scripts & resources directory to build output
+# 9. Deploy scripts & resources next to the executables (one copy, only changed files when CMake supports it)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+    set(BREAKOUTCNC_COPY_DIR copy_directory_if_different)
+else()
+    set(BREAKOUTCNC_COPY_DIR copy_directory)
+endif()
 add_custom_target(deploy_scripts ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_CURRENT_SOURCE_DIR}/scripts
-        $<IF:$<CONFIG:Debug>,${CMAKE_CURRENT_BINARY_DIR}/Debug/scripts,${CMAKE_CURRENT_BINARY_DIR}/Release/scripts>
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_CURRENT_SOURCE_DIR}/scripts
-        ${CMAKE_CURRENT_BINARY_DIR}/scripts
+    COMMAND ${CMAKE_COMMAND} -E ${BREAKOUTCNC_COPY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts $<TARGET_FILE_DIR:BreakoutMill>/scripts
     COMMENT "Deploying scripts folder to build output"
 )
-
 add_custom_target(deploy_resources ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_CURRENT_SOURCE_DIR}/resources
-        $<IF:$<CONFIG:Debug>,${CMAKE_CURRENT_BINARY_DIR}/Debug/resources,${CMAKE_CURRENT_BINARY_DIR}/Release/resources>
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_CURRENT_SOURCE_DIR}/resources
-        ${CMAKE_CURRENT_BINARY_DIR}/resources
+    COMMAND ${CMAKE_COMMAND} -E ${BREAKOUTCNC_COPY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/resources $<TARGET_FILE_DIR:BreakoutMill>/resources
     COMMENT "Deploying resources folder to build output"
 )
 add_dependencies(BreakoutMill deploy_scripts deploy_resources)
 add_dependencies(BreakoutCut deploy_scripts deploy_resources)
+
+# Warnings for BreakoutCNC's own targets
+foreach(t rnr_core rnr_ui_common rnr_hid_test huanyang_vfd_test script_engine_test board_tests regression_tests
+          BreakoutCut BreakoutMill)
+    target_link_libraries(${t} PRIVATE breakoutcnc_warnings)
+endforeach()
+
+# Unit tests: ctest --test-dir build -C Release --output-on-failure (rnr_hid_test drives real hardware: not a test)
+# They load scripts/ relative to the working directory, which is the executables' folder.
+enable_testing()
+foreach(t script_engine_test huanyang_vfd_test board_tests regression_tests)
+    add_dependencies(${t} deploy_scripts deploy_resources)
+    add_test(NAME ${t} COMMAND ${t} WORKING_DIRECTORY $<TARGET_FILE_DIR:${t}>)
+endforeach()
 
 # 10. Release package: cmake --build build --config Release --target package -> build/BreakoutCNC-<version>-win64.zip
 #     (Linux / macOS: a .tar.gz, see the CPack settings below)

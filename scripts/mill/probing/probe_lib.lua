@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Mill Probing Macro Library (probe_lib.lua)
+-- BreakoutCNC - Mill Probing Macro Library (probe_lib.lua)
 -- Reusable routines for Outside, Inside, Center (Web/Slot/Bore/Boss), & Z touch
 -- ============================================================================
 

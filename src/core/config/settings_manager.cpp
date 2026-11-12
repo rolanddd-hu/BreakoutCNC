@@ -70,7 +70,8 @@ bool SettingsManager::loadFromFile(const std::string& file_path, PersistentSetti
         s = backup;
         return true;
     }
-    if (std::filesystem::exists(file_path)) {
+    std::error_code ec;
+    if (std::filesystem::exists(file_path, ec)) {
         // Legacy file written before the integrity marker existed
         s = primary;
         return true;
@@ -270,6 +271,7 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "pwm_frequency_khz")      lz.pwm_frequency_khz      = static_cast<float>(std::atof(val.c_str()));
             if (key == "min_duty_pct")           lz.min_duty_pct           = static_cast<float>(std::atof(val.c_str()));
             if (key == "max_duty_pct")           lz.max_duty_pct           = static_cast<float>(std::atof(val.c_str()));
+            if (key == "s_max")                  lz.s_max                  = static_cast<uint16_t>(std::clamp(std::atoi(val.c_str()), 1, 60000));
             if (key == "corner_power_floor_pct") lz.corner_power_floor_pct = static_cast<float>(std::atof(val.c_str()));
             if (key == "ignore_z_motion")        lz.ignore_z_motion        = toBool(val);
             if (key == "auto_air_assist")        lz.auto_air_assist        = toBool(val);
@@ -434,6 +436,8 @@ bool SettingsManager::loadFromFileImpl(const std::string& file_path, PersistentS
             if (key == "stream_port")             cam.stream_port             = static_cast<uint16_t>(std::clamp(std::atoi(val.c_str()), 1024, 65535));
             if (key == "stream_fps")              cam.stream_fps              = std::clamp(std::atoi(val.c_str()), 1, 60);
             if (key == "stream_allow_upload")     cam.stream_allow_upload     = toBool(val);
+            if (key == "stream_access_code")      cam.stream_access_code      = val;
+            if (key == "stream_bind_address")     cam.stream_bind_address     = val;
         }
     }
 
@@ -597,6 +601,7 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "pwm_frequency_khz = " << lz.pwm_frequency_khz << "\n";
     ofs << "min_duty_pct = " << lz.min_duty_pct << "\n";
     ofs << "max_duty_pct = " << lz.max_duty_pct << "\n";
+    ofs << "s_max = " << lz.s_max << "\n";
     ofs << "corner_power_floor_pct = " << lz.corner_power_floor_pct << "\n";
     ofs << "ignore_z_motion = " << (lz.ignore_z_motion ? 1 : 0) << "\n";
     ofs << "auto_air_assist = " << (lz.auto_air_assist ? 1 : 0) << "\n";
@@ -736,6 +741,8 @@ bool SettingsManager::saveToFile(const std::string& file_path, const PersistentS
     ofs << "stream_port = " << cam.stream_port << "\n";
     ofs << "stream_fps = " << cam.stream_fps << "\n";
     ofs << "stream_allow_upload = " << (cam.stream_allow_upload ? 1 : 0) << "\n";
+    ofs << "stream_access_code = " << cam.stream_access_code << "\n";
+    ofs << "stream_bind_address = " << cam.stream_bind_address << "\n";
 
     // One section per board that has settings (connection, firmware board options)
     for (const auto& [id, profile] : s.machine.board_profiles) {

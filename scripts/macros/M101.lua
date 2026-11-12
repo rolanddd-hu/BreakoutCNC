@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Custom Macro M101: Release Pneumatic Clamp / Vacuum
+-- BreakoutCNC - Custom Macro M101: Release Pneumatic Clamp / Vacuum
 -- De-energizes auxiliary output OUT2
 -- ============================================================================
 

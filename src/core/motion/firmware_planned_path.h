@@ -40,6 +40,7 @@ struct JobRequest {
     bool   laser_dynamic = true;           // M4
     bool   laser_air_assist = false;
     float  laser_min_duty_pct = 0.0f, laser_max_duty_pct = 100.0f;
+    uint16_t laser_s_max = 1000;           // S value for 100 % power
     float  laser_power_override_pct = 100.0f;
     bool   dry_run = false;
     bool   app_drives_spindle = false;     // Huanyang VFD from the PC: spindle changes are sync points
@@ -285,6 +286,7 @@ private:
     std::array<double, 4> job_pos_{};     // App machine position after the last produced move
     uint8_t     job_outputs_ = 0xFF;      // Logical outputs emitted (0xFF = unknown)
     uint16_t    job_rpm_ = 0;
+    bool        job_laser_s_set_ = false; // The job has programmed an S word (laser power from S, S0 = off)
     std::map<uint32_t, bool> acked_tickets_;
     std::deque<SentMove> sent_moves_;
     size_t      tracker_index_ = 0;

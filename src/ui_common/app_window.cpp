@@ -377,22 +377,7 @@ AppWindow::AppWindow(const std::string& title, int width, int height)
     glfwSetDropCallback(window_, [](GLFWwindow* win, int count, const char** paths) {
         auto* self = static_cast<AppWindow*>(glfwGetWindowUserPointer(win));
         if (!self || !self->on_file_dropped_ || count < 1 || !paths[0]) return;
-        std::string path = paths[0]; // Only one program can be loaded: the first file wins
-#ifdef _WIN32
-        // GLFW gives UTF-8; std::ifstream(std::string) and the file dialog use the ANSI code page
-        const int wlen = MultiByteToWideChar(CP_UTF8, 0, paths[0], -1, nullptr, 0);
-        if (wlen > 0) {
-            std::wstring wide(static_cast<size_t>(wlen), L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, paths[0], -1, wide.data(), wlen);
-            const int alen = WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
-            if (alen > 0) {
-                std::string ansi(static_cast<size_t>(alen), '\0');
-                WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, ansi.data(), alen, nullptr, nullptr);
-                ansi.resize(static_cast<size_t>(alen) - 1);
-                path = std::move(ansi);
-            }
-        }
-#endif
+        std::string path = paths[0]; // UTF-8, like every file name in the app. Only one program can be loaded: the first wins
         self->on_file_dropped_(path);
     });
 }
@@ -507,10 +492,13 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
         perf_log = std::fopen(log_path, "w");
     }
 
-    // Frame limiter: 60 FPS, 10 FPS while minimized
-    constexpr auto kFramePeriod     = std::chrono::microseconds(16667);
-    constexpr auto kIconifiedPeriod = std::chrono::milliseconds(100);
+    // Frame limiter: 60 FPS, 10 FPS while minimized, ~15 FPS while idle (see setIdlePredicate)
+    constexpr auto   kFramePeriod      = std::chrono::microseconds(16667);
+    constexpr auto   kIconifiedPeriod  = std::chrono::milliseconds(100);
+    constexpr double kIdleWaitSeconds  = 0.066;
+    constexpr auto   kIdleAfterNoInput = std::chrono::seconds(1);
     auto next_frame = PerfClock::now();
+    auto last_input = PerfClock::now();
 
     // The default or saved size may not fit this screen (e.g. settings copied from a larger monitor)
     if (!is_fullscreen_ && glfwGetWindowAttrib(window_, GLFW_MAXIMIZED) != GLFW_TRUE) {
@@ -545,6 +533,16 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
             if (close) glfwSetWindowShouldClose(window_, GLFW_TRUE);
         }
         ImGui::NewFrame();
+        {
+            const ImGuiIO& io = ImGui::GetIO();
+            bool input = io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f || io.MouseWheel != 0.0f ||
+                         io.MouseWheelH != 0.0f || !io.InputQueueCharacters.empty() || ImGui::IsAnyItemActive();
+            for (int b = 0; b < ImGuiMouseButton_COUNT && !input; ++b) input = io.MouseDown[b];
+            for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END && !input; ++k) {
+                input = ImGui::IsKeyDown(static_cast<ImGuiKey>(k));
+            }
+            if (input) last_input = PerfClock::now();
+        }
 
         // F11 shortcut to toggle fullscreen
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
@@ -623,11 +621,18 @@ int AppWindow::runLoop(const std::function<void()>& render_callback) {
 
         // Sleep until the next frame slot; never try to catch up after a slow frame
         t_phase = PerfClock::now();
-        next_frame += (glfwGetWindowAttrib(window_, GLFW_ICONIFIED) == GLFW_TRUE) ? kIconifiedPeriod : kFramePeriod;
-        if (t_phase > next_frame + kFramePeriod) {
-            next_frame = t_phase;
+        const bool iconified = glfwGetWindowAttrib(window_, GLFW_ICONIFIED) == GLFW_TRUE;
+        const bool idle = !iconified && !ui_remote_ && may_idle_ && t_phase - last_input > kIdleAfterNoInput && may_idle_();
+        if (idle) {
+            glfwWaitEventsTimeout(kIdleWaitSeconds); // Returns at once on input
+            next_frame = PerfClock::now();
+        } else {
+            next_frame += iconified ? kIconifiedPeriod : kFramePeriod;
+            if (t_phase > next_frame + kFramePeriod) {
+                next_frame = t_phase;
+            }
+            std::this_thread::sleep_until(next_frame);
         }
-        std::this_thread::sleep_until(next_frame);
         perf::add("Idle (frame limiter)", msSince(t_phase));
         if (perf_reg.enabled &&
             perf::endFrame(perf_frames_in_second_, perf_second_start_s_, glfwGetTime(), perf_fps_)) {

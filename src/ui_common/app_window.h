@@ -51,6 +51,9 @@ public:
 
     // Dark / light theme button in the title bar; called with true when the light theme was selected
     void setOnThemeChanged(std::function<void(bool)> on_changed) { on_theme_changed_ = std::move(on_changed); }
+    // True while nothing on screen changes by itself (machine at rest, no camera): after a second without input the
+    // window then draws ~15 frames per second instead of 60, and wakes at once on any input
+    void setIdlePredicate(std::function<bool()> may_idle) { may_idle_ = std::move(may_idle); }
 
     // Operation mode (Plasma / Laser) selector for title bar
     void setOperationMode(core::OperationMode* operation_mode, std::function<void(core::OperationMode)> on_changed = nullptr) {
@@ -64,7 +67,7 @@ public:
     void setOnCloseCallback(std::function<void()> on_close) { on_close_callback_ = std::move(on_close); }
     void closeWindow() noexcept;
 
-    // A file dropped onto the window (path in the same encoding std::ifstream / the file dialog use)
+    // A file dropped onto the window (UTF-8 path, see core/util/utf8_path.h)
     void setOnFileDropped(std::function<void(const std::string&)> on_drop) { on_file_dropped_ = std::move(on_drop); }
 
     const std::string& getTitle() const noexcept { return title_; }
@@ -87,6 +90,7 @@ private:
 
     GLFWwindow* window_ = nullptr;
     std::shared_ptr<UiRemote> ui_remote_;
+    std::function<bool()>     may_idle_;
     std::string title_;
     std::function<bool()> can_close_predicate_;
     std::function<void()> on_close_blocked_;

@@ -1,5 +1,10 @@
 # BreakoutCNC — Extensible Scripting Engine Specification (Mach3/Mach4 Architecture)
 
+> **Historical design document.** It describes the plan the scripting engine was built from, and the API it lists
+> differs from what was built: `cnc.set_work_offset`, `cnc.set_current_tool` and `cnc.message` were never
+> implemented (use `cnc.set_work_pos`, `cnc.gcode("M6 T..")` / the tool table, and `cnc.log`). The current API is the
+> reference table in the app (Scripts & Macros, the (i) button) and `src/core/scripting/script_api.cpp`.
+
 ## 1. Executive Summary & Objective
 
 This specification details the architecture, language selection, API surface, concurrency model, and integration plan for introducing **extensible scripting capabilities** to **BreakoutCNC** (`BreakoutMill` and `BreakoutCut`).

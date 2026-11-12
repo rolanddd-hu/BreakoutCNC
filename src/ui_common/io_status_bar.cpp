@@ -96,7 +96,8 @@ void IoStatusBar::renderTopBar(
         }
     }
 
-    const auto& cur_cfg = controller.getConfig();
+    const auto cur_cfg_ptr = controller.getConfigShared();
+    const auto& cur_cfg = *cur_cfg_ptr;
     ImGui::SameLine();
     if (cur_cfg.linear_units == core::LinearUnits::Metric) {
         ImGui::TextColored(theme::pal().text_info, "Units: mm");
@@ -447,7 +448,7 @@ void IoStatusBar::renderPulseRateSetting(
     const core::TelemetrySnapshot& telemetry,
     const std::function<void()>& on_settings_changed)
 {
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     const auto& rates = core::MachineConfig::kPulseRatesKhz;
 
     ImGui::Spacing();
@@ -594,7 +595,7 @@ void IoStatusBar::renderBottomIoStrip(
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("OUTPUTS:");
         struct OutPill { const char* label; uint8_t bit; int channel; const char* tip; };
-        const bool mill = controller.getConfig().is_mill;
+        const bool mill = controller.getConfigShared()->is_mill;
         const OutPill outs[] = {
             {mill ? "Spindle" : "Torch / laser", core::OutputBit::OUT1_TorchOrSpindle, 1, "M3 / M5"},
             {"Flood", core::OutputBit::OUT3_FloodCoolant, 3, "M8 / M9"},
@@ -632,7 +633,7 @@ void IoStatusBar::renderBottomIoStrip(
         }
     } else {
         // Labels from the pin assignment: function or custom name per output / input (full text in the tooltips)
-        const core::MachineConfig cfg = controller.getConfig();
+        const core::MachineConfig cfg = *controller.getConfigShared();
         const auto mode = cfg.operation_mode;
         const auto input_uses = core::io::describeInputs(cfg);
         std::array<std::string, core::kPhysicalOutputCount> out_names;
@@ -747,7 +748,7 @@ void IoStatusBar::renderBottomIoStrip(
         const double now = ImGui::GetTime();
         if (now - report_time > 1.0) { // Refreshed once a second: getProgram() / glGetString() are not free
             const auto program = controller.getProgram();
-            report = buildDiagnosticsReport(controller.getConfig(), telemetry,
+            report = buildDiagnosticsReport(*controller.getConfigShared(), telemetry,
                                             program->lines.size(), program->segments.size());
             report_time = now;
         }

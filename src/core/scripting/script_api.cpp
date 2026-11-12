@@ -37,24 +37,29 @@ ApiContext* getContext(lua_State* L) {
     return ctx;
 }
 
+// Axis argument: "X", "Y", "Z", "A" (any case) or 0..3. Anything else raises a Lua error: a typo or a nil variable
+// must never silently act on X.
 int parseAxis(lua_State* L, int arg_idx) {
-    if (lua_isinteger(L, arg_idx)) {
-        int idx = static_cast<int>(lua_tointeger(L, arg_idx));
-        return std::clamp(idx, 0, 3);
-    }
-    if (lua_isstring(L, arg_idx)) {
-        const char* str = lua_tostring(L, arg_idx);
-        char ch = static_cast<char>(std::toupper(str[0]));
-        switch (ch) {
-            case 'X': return 0;
-            case 'Y': return 1;
-            case 'Z': return 2;
-            case 'A': return 3;
-            default: break;
+    const int type = lua_type(L, arg_idx);
+    if (type == LUA_TNUMBER) {
+        const lua_Number n = lua_tonumber(L, arg_idx);
+        if (n >= 0.0 && n <= 3.0 && std::floor(n) == n) return static_cast<int>(n);
+    } else if (type == LUA_TSTRING) {
+        size_t len = 0;
+        const char* str = lua_tolstring(L, arg_idx, &len);
+        if (len == 1) {
+            switch (std::toupper(static_cast<unsigned char>(str[0]))) {
+                case 'X': return 0;
+                case 'Y': return 1;
+                case 'Z': return 2;
+                case 'A': return 3;
+                default: break;
+            }
         }
     }
-    return 0;
+    return luaL_argerror(L, arg_idx, "axis must be \"X\", \"Y\", \"Z\", \"A\" or 0..3");
 }
+
 
 // ----------------------------------------------------------------------------
 // Motion & G-Code Functions
@@ -224,6 +229,36 @@ int l_cnc_zero_all(lua_State* L) {
     return 0;
 }
 
+// cnc.home("Z") homes one axis, cnc.home() or cnc.home_all() all axes, with the built-in homing cycle (never the
+// home script: the home script itself uses these). Returns once the cycle has started; follow with cnc.wait_idle().
+int startHoming(lua_State* L, int axis) {
+    ApiContext* ctx = getContext(L);
+    if (!ctx || !ctx->controller) return 0;
+    if (axis < 0) {
+        ctx->controller->homeAllAxesBuiltIn();
+    } else {
+        ctx->controller->homeAxisBuiltIn(static_cast<core::Axis>(axis));
+    }
+    const auto telem = ctx->controller->getTelemetry();
+    if (telem.state != core::ControllerState::Homing) {
+        std::string msg = "cnc.home rejected";
+        if (!telem.active_fault_message.empty()) msg += " (" + telem.active_fault_message + ")";
+        return luaL_error(L, "%s", msg.c_str());
+    }
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+int l_cnc_home(lua_State* L) {
+    const bool all = lua_isnoneornil(L, 1) ||
+                     (lua_type(L, 1) == LUA_TSTRING && std::string(lua_tostring(L, 1)) == "all");
+    return startHoming(L, all ? -1 : parseAxis(L, 1));
+}
+
+int l_cnc_home_all(lua_State* L) {
+    return startHoming(L, -1);
+}
+
 int l_cnc_is_homed(lua_State* L) {
     ApiContext* ctx = getContext(L);
     if (!ctx || !ctx->controller) {
@@ -262,8 +297,9 @@ int l_cnc_is_spindle_on(lua_State* L) {
 int l_cnc_set_spindle_rpm(lua_State* L) {
     ApiContext* ctx = getContext(L);
     if (!ctx || !ctx->controller) return 0;
-    uint32_t rpm = static_cast<uint32_t>(luaL_checkinteger(L, 1));
-    ctx->controller->setSpindleSpeedRpm(rpm);
+    const lua_Integer rpm = luaL_checkinteger(L, 1);
+    luaL_argcheck(L, rpm >= 0 && rpm <= 100000, 1, "spindle speed must be 0..100000 RPM");
+    ctx->controller->setSpindleSpeedRpm(static_cast<uint32_t>(rpm));
     return 0;
 }
 
@@ -774,17 +810,24 @@ void ScriptApi::registerApi(
 {
     if (!L) return;
 
-    // Allocate ApiContext and store in Lua registry
-    auto* ctx = new ApiContext{
+    // The ApiContext lives in a full userdata kept in the registry: lua_close() destroys it (__gc), so re-creating
+    // the Lua state for every script run does not leak it
+    lua_pushstring(L, kContextRegistryKey);
+    void* mem = lua_newuserdatauv(L, sizeof(ApiContext), 0);
+    new (mem) ApiContext{
         controller,
         engine,
         std::move(prompt_handler),
         std::move(cancellation_check),
         std::move(input_handler)
     };
-
-    lua_pushstring(L, kContextRegistryKey);
-    lua_pushlightuserdata(L, ctx);
+    lua_newtable(L);
+    lua_pushcfunction(L, [](lua_State* S) -> int {
+        static_cast<ApiContext*>(lua_touserdata(S, 1))->~ApiContext();
+        return 0;
+    });
+    lua_setfield(L, -2, "__gc");
+    lua_setmetatable(L, -2);
     lua_settable(L, LUA_REGISTRYINDEX);
 
     // Build the 'cnc' table
@@ -805,6 +848,8 @@ void ScriptApi::registerApi(
     lua_pushcfunction(L, l_cnc_zero_axis);       lua_setfield(L, -2, "zero_axis");
     lua_pushcfunction(L, l_cnc_zero_all);        lua_setfield(L, -2, "zero_all");
     lua_pushcfunction(L, l_cnc_is_homed);        lua_setfield(L, -2, "is_homed");
+    lua_pushcfunction(L, l_cnc_home);            lua_setfield(L, -2, "home");
+    lua_pushcfunction(L, l_cnc_home_all);        lua_setfield(L, -2, "home_all");
 
     // Spindle & Torch
     lua_pushcfunction(L, l_cnc_set_spindle);     lua_setfield(L, -2, "set_spindle");

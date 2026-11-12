@@ -210,7 +210,33 @@ bool HuanyangVfdController::start(const HuanyangVfdConfig& config) {
     return true;
 }
 
+void HuanyangVfdController::setStreamFactory(transport::StreamFactory factory) {
+    stream_factory_ = std::move(factory);
+}
+
 void HuanyangVfdController::stop() {
+    // The spindle must never be left running when the driver stops (VFD switched off in the settings, app exit):
+    // command a stop and give the worker up to a second to get it acknowledged before it ends
+    if (running_.load()) {
+        bool wait_for_stop = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (commanded_run_ || telemetry_.spindle_running || run_control_byte_ != 0x08 || run_dirty_) {
+                run_control_byte_ = 0x08;
+                run_dirty_ = true;
+                commanded_run_ = false;
+                wait_for_stop = telemetry_.port_open;
+            }
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        while (wait_for_stop && std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!run_dirty_ || !telemetry_.port_open) break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
     if (running_.exchange(false)) {
         if (worker_thread_.joinable()) {
             worker_thread_.join();
@@ -467,27 +493,39 @@ bool HuanyangVfdController::openPlatformPort(const std::string& port_name, uint3
     opts.rts = true;
     opts.read_timeout_ms = 20;
     opts.drain_writes = true; // The reply timeout starts when the request has left the UART
-    return serial_.open(port_name, opts, &error);
+    serial_ = stream_factory_ ? stream_factory_() : std::make_unique<transport::SerialPort>();
+    if (!serial_) {
+        error = "No RS-485 link";
+        return false;
+    }
+    const transport::ConnectionTarget target{"serial", port_name, port_name};
+    if (!serial_->open(target, opts, &error)) {
+        serial_.reset();
+        return false;
+    }
+    return true;
 }
 
 void HuanyangVfdController::closePlatformPort() {
-    serial_.close();
+    if (serial_) serial_->close();
+    serial_.reset();
 }
 
 bool HuanyangVfdController::platformPortOpen() const {
-    return serial_.isOpen();
+    return serial_ && serial_->isOpen();
 }
 
 void HuanyangVfdController::flushPlatformPort() {
-    serial_.flushInput();
+    if (serial_) serial_->flushInput();
 }
 
 bool HuanyangVfdController::writePlatformPort(const uint8_t* data, size_t len) {
-    return serial_.write(data, len);
+    return serial_ && serial_->write(data, len);
 }
 
 size_t HuanyangVfdController::readPlatformPort(uint8_t* data, size_t max_len) {
-    const long n = serial_.read(data, max_len, 20);
+    if (!serial_) return 0;
+    const long n = serial_->read(data, max_len, 20);
     return n > 0 ? static_cast<size_t>(n) : 0;
 }
 

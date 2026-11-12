@@ -44,6 +44,8 @@ struct HuanyangVfdConfig {
     float       limit_dc_volts     = 0.0f;
     float       limit_ac_volts     = 0.0f;
     float       limit_temp_c       = 0.0f;
+
+    bool operator==(const HuanyangVfdConfig&) const = default;
 };
 
 // ============================================================================
@@ -151,6 +153,9 @@ public:
     // Read PD001, PD002, PD005, PD011 and PD144 from the inverter; the result arrives in telemetry.params
     void requestParameterRead();
 
+    // Test hook: the RS-485 link is opened through this factory instead of a serial port. Call before start().
+    void setStreamFactory(transport::StreamFactory factory);
+
     // Static CRC-16 utility (Modbus polynomial 0xA001)
     static uint16_t calculateCrc16(const uint8_t* buffer, size_t length);
 
@@ -194,7 +199,8 @@ private:
     uint16_t                 freq_raw_        = 0;
 
     // Owned by the worker thread only
-    transport::SerialPort    serial_;
+    std::unique_ptr<transport::IByteStream> serial_;
+    transport::StreamFactory stream_factory_;          // Set before start() (tests); empty = serial port
     std::chrono::steady_clock::time_point last_tx_time_;
     std::chrono::steady_clock::time_point last_successful_rx_time_;
 

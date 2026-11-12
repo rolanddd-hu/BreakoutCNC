@@ -1,4 +1,5 @@
 #include "ui_common/gcode_panel.h"
+#include "core/util/utf8_path.h"
 #include "ui_common/theme.h"
 #include "ui_common/app_window.h"
 #include "ui_common/frame_stats.h"
@@ -41,9 +42,9 @@ void GCodeProgramPanel::render(
     // Sync active_file_path_ if loaded_filename points to an existing file
     if (!loaded_filename.empty() && loaded_filename != active_file_path_) {
         std::error_code ec;
-        if (std::filesystem::exists(loaded_filename, ec)) {
+        if (std::filesystem::exists(util::pathFromUtf8(loaded_filename), ec)) {
             active_file_path_ = loaded_filename;
-            last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
+            last_file_write_time_ = std::filesystem::last_write_time(util::pathFromUtf8(active_file_path_), ec);
             has_file_write_time_ = !ec;
         }
     }
@@ -54,8 +55,8 @@ void GCodeProgramPanel::render(
         if (now - last_file_poll_time_ > std::chrono::milliseconds(250)) {
             last_file_poll_time_ = now;
             std::error_code ec;
-            if (std::filesystem::exists(active_file_path_, ec)) {
-                auto cur_time = std::filesystem::last_write_time(active_file_path_, ec);
+            if (std::filesystem::exists(util::pathFromUtf8(active_file_path_), ec)) {
+                auto cur_time = std::filesystem::last_write_time(util::pathFromUtf8(active_file_path_), ec);
                 if (!ec && cur_time != last_file_write_time_) {
                     const bool is_cutting = (telemetry.state == core::ControllerState::RunningGCode ||
                                              telemetry.state == core::ControllerState::DwellPierce);
@@ -153,16 +154,17 @@ void GCodeProgramPanel::render(
     ImGui::AlignTextToFramePadding();
     std::string display_filename;
     if (!loaded_filename.empty()) {
-        std::filesystem::path p(loaded_filename);
-        display_filename = p.filename().string();
+        display_filename = util::pathToUtf8(util::pathFromUtf8(loaded_filename).filename());
     }
     if (isLoading()) {
         // Short text on purpose: this line shares the row with the cycle buttons and does not wrap
         // load_job_.path is never written by the worker, so reading it here is safe
-        const std::string loading_name = std::filesystem::path(load_job_.path).filename().string();
+        const std::string loading_name = util::pathToUtf8(util::pathFromUtf8(load_job_.path).filename());
         ImGui::TextColored(theme::pal().text_warn, "Loading %s...", loading_name.c_str());
     } else if (!go_to_error_.empty()) {
         ImGui::TextColored(theme::pal().text_warn, "%s", go_to_error_.c_str());
+    } else if (!load_notice_.empty()) {
+        ImGui::TextColored(theme::pal().text_danger, "%s", load_notice_.c_str());
     } else {
         ImGui::TextDisabled("Next:#%04zu | %s (%zu pierces, %.0fmm)",
                             telemetry.active_gcode_line_index + 1,
@@ -472,7 +474,9 @@ void GCodeProgramPanel::render(
     ImGui::SameLine();
 
     // Edit File button: active only if an external file is open on disk
-    const bool has_open_file = !active_file_path_.empty() && std::filesystem::exists(active_file_path_);
+    std::error_code exists_ec;
+    const bool has_open_file = !active_file_path_.empty() &&
+                               std::filesystem::exists(util::pathFromUtf8(active_file_path_), exists_ec);
     ImGui::BeginDisabled(!has_open_file);
     if (ImGui::Button(edit_lbl, ImVec2(btnW(edit_lbl), row_h))) {
         openFileInDefaultEditor(active_file_path_);
@@ -579,6 +583,7 @@ void GCodeProgramPanel::startLoadJob(LoadJob job) {
     load_job_      = std::move(job);
     load_ok_       = false;
     load_mismatch_ = false;
+    load_error_.clear();
     load_done_.store(false);
     // The worker only touches load_job_ / load_ok_ / load_mismatch_ / load_check_ until it sets load_done_.
     // loadGCodeString() parses without holding the controller lock and refuses while a job runs.
@@ -586,13 +591,14 @@ void GCodeProgramPanel::startLoadJob(LoadJob job) {
         auto& j = load_job_;
         bool readable = true;
         if (j.read_file) {
-            std::ifstream ifs(j.path); // Same as the Load File dialog: an unreadable file is ignored
+            std::ifstream ifs(util::pathFromUtf8(j.path)); // UTF-8 name
             if (ifs) {
                 std::ostringstream ss;
                 ss << ifs.rdbuf();
                 j.content = ss.str();
             } else {
                 readable = false;
+                load_error_ = "Cannot open " + util::pathToUtf8(util::pathFromUtf8(j.path).filename());
             }
         }
         if (readable && j.check_machine_type) {
@@ -609,6 +615,8 @@ void GCodeProgramPanel::startLoadJob(LoadJob job) {
 void GCodeProgramPanel::pollBackgroundLoad() {
     if (!load_thread_.joinable() || !load_done_.load(std::memory_order_acquire)) return;
     load_thread_.join();
+    load_notice_ = load_error_;
+    load_error_.clear();
     if (load_mismatch_) {
         // Same dialog as a mismatching file from Load File: "Load File Anyway" loads it without the check
         pending_file_path_    = load_job_.path;
@@ -619,7 +627,7 @@ void GCodeProgramPanel::pollBackgroundLoad() {
         if (load_job_.read_file) {
             active_file_path_ = load_job_.path; // Watched for external edits like any loaded file
             std::error_code ec;
-            last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
+            last_file_write_time_ = std::filesystem::last_write_time(util::pathFromUtf8(active_file_path_), ec);
             has_file_write_time_  = !ec;
         }
         if (on_file_approved_) on_file_approved_(load_job_.path, load_job_.content);
@@ -654,7 +662,7 @@ void GCodeProgramPanel::checkAndPromptGCodeFile(
     if (!check.has_mismatch) {
         active_file_path_ = file_path;
         std::error_code ec;
-        last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
+        last_file_write_time_ = std::filesystem::last_write_time(util::pathFromUtf8(active_file_path_), ec);
         has_file_write_time_ = !ec;
         requestLoad(file_path, gcode_content);
     } else {
@@ -680,7 +688,7 @@ void GCodeProgramPanel::triggerCycleStart(
     // BreakoutMill only: in BreakoutCut the output is the plasma torch or the laser, which must never be switched on
     // from here (the program's M3 / M4 does that where it should).
     if (!is_resuming && !is_start_from_beginning && !telemetry.torch_or_spindle_on && !telemetry.dry_run_mode &&
-        controller.getConfig().is_mill) {
+        controller.getConfigShared()->is_mill) {
         show_spindle_warning_modal_ = true;
     } else {
         controller.startJob();
@@ -923,7 +931,7 @@ void GCodeProgramPanel::renderMismatchModal() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        std::string filename_only = std::filesystem::path(pending_file_path_).filename().string();
+        std::string filename_only = util::pathToUtf8(util::pathFromUtf8(pending_file_path_).filename());
         ImGui::TextWrapped("The selected G-Code file appears to be intended for a different machine process than the current controller profile:");
 
         ImGui::Spacing();
@@ -991,7 +999,7 @@ void GCodeProgramPanel::renderMismatchModal() {
         if (ImGui::Button("Load File Anyway", ImVec2(170.0f, 36.0f))) {
             active_file_path_ = pending_file_path_;
             std::error_code ec;
-            last_file_write_time_ = std::filesystem::last_write_time(active_file_path_, ec);
+            last_file_write_time_ = std::filesystem::last_write_time(util::pathFromUtf8(active_file_path_), ec);
             has_file_write_time_ = !ec;
             requestLoad(pending_file_path_, std::move(pending_file_content_));
             pending_file_path_.clear();

@@ -1,4 +1,6 @@
 #include "ui_common/file_dialog.h"
+#include "core/util/utf8_path.h"
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
@@ -23,16 +25,17 @@ std::string openFileDialog(
     const std::vector<std::string>& patterns)
 {
 #ifdef _WIN32
-    char file_buf[MAX_PATH] = {0};
-    OPENFILENAMEA ofn{};
+    // Wide API: any file name, returned as UTF-8 (the ANSI dialog cannot return names outside the code page)
+    std::vector<wchar_t> file_buf(32768, L'\0');
+    OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = nullptr;
 
     // Build a properly double-null-terminated filter buffer so embedded \0 is never truncated
-    std::vector<char> filter_buf;
+    std::wstring filter_buf;
     auto append_filter_part = [&](const std::string& str) {
-        filter_buf.insert(filter_buf.end(), str.begin(), str.end());
-        filter_buf.push_back('\0');
+        filter_buf += util::wideFromUtf8(str);
+        filter_buf.push_back(L'\0');
     };
 
     if (!patterns.empty()) {
@@ -52,17 +55,18 @@ std::string openFileDialog(
     // Always include "All Files (*.*)" option
     append_filter_part("All Files (*.*)");
     append_filter_part("*.*");
-    filter_buf.push_back('\0'); // Double null terminator
+    filter_buf.push_back(L'\0'); // Double null terminator
 
-    ofn.lpstrFilter = filter_buf.data();
-    ofn.lpstrFile   = file_buf;
-    ofn.nMaxFile    = sizeof(file_buf);
-    ofn.lpstrTitle  = title.c_str();
+    const std::wstring wtitle = util::wideFromUtf8(title);
+    ofn.lpstrFilter = filter_buf.c_str();
+    ofn.lpstrFile   = file_buf.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file_buf.size());
+    ofn.lpstrTitle  = wtitle.c_str();
     ofn.nFilterIndex = 1;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
-    if (GetOpenFileNameA(&ofn)) {
-        return std::string(file_buf);
+    if (GetOpenFileNameW(&ofn)) {
+        return util::utf8FromWide(file_buf.data());
     }
     return {};
 
@@ -155,9 +159,11 @@ std::string openLuaScriptDialog() {
 bool openFileInDefaultEditor(const std::string& path) {
     if (path.empty()) return false;
 #ifdef _WIN32
-    HINSTANCE h = ShellExecuteA(nullptr, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    const std::wstring wpath = util::wideFromUtf8(path);
+    HINSTANCE h = ShellExecuteW(nullptr, L"open", wpath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(h) <= 32) {
-        h = ShellExecuteA(nullptr, "open", "notepad.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
+        const std::wstring quoted = L"\"" + wpath + L"\"";
+        h = ShellExecuteW(nullptr, L"open", L"notepad.exe", quoted.c_str(), nullptr, SW_SHOWNORMAL);
     }
     return reinterpret_cast<INT_PTR>(h) > 32;
 #elif defined(__APPLE__)

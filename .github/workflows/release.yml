@@ -63,13 +63,8 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Script engine tests
-        working-directory: ${{ matrix.bin_dir }}
-        run: ./script_engine_test
-
-      - name: Huanyang VFD tests
-        working-directory: ${{ matrix.bin_dir }}
-        run: ./huanyang_vfd_test
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Startup smoke test (Linux, virtual display)
         if: runner.os == 'Linux'

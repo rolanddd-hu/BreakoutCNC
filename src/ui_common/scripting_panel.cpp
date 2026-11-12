@@ -1,4 +1,5 @@
 #include "scripting_panel.h"
+#include "core/util/utf8_path.h"
 #include "ui_common/app_window.h"
 #include "ui_common/file_dialog.h"
 #include "ui_common/theme.h"
@@ -71,13 +72,13 @@ void ScriptingPanel::render(
     // Script Status Banner
     if (is_running) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::pal().surface_warn);
-        ImGui::BeginChild("##ScriptRunningBanner", ImVec2(0.0f, 42.0f), true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::BeginChild("##ScriptRunningBanner", ImVec2(0.0f, 46.0f), true, ImGuiWindowFlags_NoScrollbar);
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(theme::pal().text_warn, "SCRIPT RUNNING: %s", telem.active_script_name.c_str());
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 110.0f);
         ImGui::PushStyleColor(ImGuiCol_Button, theme::pal().btn_danger);
         ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_danger));
-        if (ImGui::Button("ABORT SCRIPT", ImVec2(100.0f, 26.0f))) {
+        if (ImGui::Button("ABORT SCRIPT", ImVec2(100.0f, 28.0f))) {
             controller.cancelScript();
         }
         ImGui::PopStyleColor(2);
@@ -226,6 +227,31 @@ void ScriptingPanel::render(
         ImGui::SetTooltip("Add New Custom Macro Button...");
     }
 
+    // Script hooks: M6 (mill only) and HOME ALL
+    ImGui::Spacing();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Hooks:");
+    if (cfg.is_mill) {
+        ImGui::SameLine();
+        if (ImGui::Checkbox("M6 script", &sc.m6_script_enabled)) {
+            controller.applyConfig(cfg);
+            if (on_config_changed) on_config_changed();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Every M6 in a program stops the spindle, holds the job and runs\n%s.\n"
+                              "Off: the machine retracts and waits for the operator.", sc.m6_script_path.c_str());
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Home script", &sc.home_script_enabled)) {
+        controller.applyConfig(cfg);
+        if (on_config_changed) on_config_changed();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("HOME ALL runs %s instead of the built-in homing cycle.\n"
+                          "The H buttons of single axes always use the built-in cycle.", sc.home_script_path.c_str());
+    }
+
     // Handle opening modals
     if (show_add_modal_) {
         ImGui::OpenPopup("Add Custom Macro Button##AddModal");
@@ -266,8 +292,7 @@ void ScriptingPanel::render(
                 std::strncpy(modal_path_, sel.c_str(), sizeof(modal_path_) - 1);
                 modal_path_[sizeof(modal_path_) - 1] = '\0';
                 if (modal_label_[0] == '\0') {
-                    std::filesystem::path p(sel);
-                    std::string stem = p.stem().string();
+                    std::string stem = util::pathToUtf8(util::pathFromUtf8(sel).stem());
                     std::strncpy(modal_label_, stem.c_str(), sizeof(modal_label_) - 1);
                     modal_label_[sizeof(modal_label_) - 1] = '\0';
                 }

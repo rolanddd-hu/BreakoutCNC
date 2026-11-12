@@ -23,7 +23,7 @@ bool CameraPanel::render(
         devices_initialized_ = true;
     }
 
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     core::CameraConfig& cam = cfg.camera;
     bool changed = false;
 
@@ -186,7 +186,7 @@ bool CameraPanel::render(
                         ImGui::TextDisabled("Offset: X %+.2f, Y %+.2f %s  |  FOV: %.1f x %.1f %s",
                                             cam.offset_x_mm * u_scale, cam.offset_y_mm * u_scale, u_lbl,
                                             cam.fov_x_mm * u_scale, cam.fov_y_mm * u_scale, u_lbl);
-                        if (ImGui::Button("Recalibrate Camera...", ImVec2(-1.0f, 26.0f)) && viewport != nullptr) {
+                        if (ImGui::Button("Recalibrate Camera...", ImVec2(-1.0f, 28.0f)) && viewport != nullptr) {
                             cal_step_ = 0;
                             viewport->startCameraCalibration();
                         }
@@ -217,7 +217,7 @@ bool CameraPanel::render(
                     const float half_w = (ImGui::GetContentRegionAvail().x - 8.0f) * 0.5f;
                     if (cal_step_ == 0) ImGui::PushStyleColor(ImGuiCol_Button, theme::pal().btn_primary);
                     if (cal_step_ == 0) ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_primary));
-                    if (ImGui::Button("1. XY Offset", ImVec2(half_w, 26.0f))) {
+                    if (ImGui::Button("1. XY Offset", ImVec2(half_w, 28.0f))) {
                         cal_step_ = 0;
                         if (viewport) viewport->cancelWaitingForDentClick();
                     }
@@ -226,7 +226,7 @@ bool CameraPanel::render(
                     ImGui::SameLine();
                     if (cal_step_ == 1) ImGui::PushStyleColor(ImGuiCol_Button, theme::pal().btn_primary);
                     if (cal_step_ == 1) ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_primary));
-                    if (ImGui::Button("2. Field of View", ImVec2(half_w, 26.0f))) {
+                    if (ImGui::Button("2. Field of View", ImVec2(half_w, 28.0f))) {
                         cal_step_ = 1;
                     }
                     if (cal_step_ == 1) ImGui::PopStyleColor(2);
@@ -294,7 +294,7 @@ bool CameraPanel::render(
                         ImGui::TextDisabled("Select how you want to measure the camera Field of View:");
                         if (fov_method_ == 0) ImGui::PushStyleColor(ImGuiCol_Button, theme::pal().btn_primary);
                         if (fov_method_ == 0) ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_primary));
-                        if (ImGui::Button("Method A: Move +X & Click", ImVec2(half_w, 26.0f))) {
+                        if (ImGui::Button("Method A: Move +X & Click", ImVec2(half_w, 28.0f))) {
                             fov_method_ = 0;
                         }
                         if (fov_method_ == 0) ImGui::PopStyleColor(2);
@@ -302,7 +302,7 @@ bool CameraPanel::render(
                         ImGui::SameLine();
                         if (fov_method_ == 1) ImGui::PushStyleColor(ImGuiCol_Button, theme::pal().btn_primary);
                         if (fov_method_ == 1) ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_primary));
-                        if (ImGui::Button("Method B: Tape Measure", ImVec2(half_w, 26.0f))) {
+                        if (ImGui::Button("Method B: Tape Measure", ImVec2(half_w, 28.0f))) {
                             fov_method_ = 1;
                             if (viewport) viewport->cancelWaitingForDentClick();
                         }
@@ -339,7 +339,7 @@ bool CameraPanel::render(
                                     viewport->startWaitingForDentClick([&controller, viewport, moved_mm](double norm_dx, double norm_dy, int img_w, int img_h) {
                                         double norm_dist = std::max(std::abs(norm_dx), std::hypot(norm_dx, norm_dy));
                                         if (norm_dist > 0.01 && img_w > 0 && img_h > 0) {
-                                            core::MachineConfig updated = controller.getConfig();
+                                            core::MachineConfig updated = *controller.getConfigShared();
                                             updated.camera.fov_x_mm      = std::clamp(std::abs(moved_mm) / norm_dist, 5.0, 2000.0);
                                             updated.camera.fov_y_mm      = updated.camera.fov_x_mm * (static_cast<double>(img_h) / static_cast<double>(img_w));
                                             updated.camera.is_calibrated = true;
@@ -455,12 +455,70 @@ bool CameraPanel::render(
                     changed = true;
                 }
 
+                // Listen address: all networks, one of them, or this PC only
+                auto listenLabel = [](const std::string& a) -> std::string {
+                    if (a.empty()) return "All networks";
+                    if (a == "127.0.0.1") return "This PC only";
+                    return "Only " + a;
+                };
+                {
+                    const char* lbl = "Listen on";
+                    const float lbl_w = ImGui::CalcTextSize(lbl).x;
+                    ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - lbl_w - 12.0f));
+                    const bool open = ImGui::BeginCombo(lbl, listenLabel(cam.stream_bind_address).c_str());
+                    if (open) {
+                        // Read the addresses once each time the list opens (name lookup is not free)
+                        if (!listen_combo_open_) local_ips_ = core::CameraStreamServer::localIpv4Addresses();
+                        std::vector<std::string> choices{"", "127.0.0.1"};
+                        for (const auto& ip : local_ips_) choices.push_back(ip);
+                        if (!cam.stream_bind_address.empty() &&
+                            std::find(choices.begin(), choices.end(), cam.stream_bind_address) == choices.end()) {
+                            choices.push_back(cam.stream_bind_address); // Saved address no longer present
+                        }
+                        for (const auto& c : choices) {
+                            if (ImGui::Selectable(listenLabel(c).c_str(), c == cam.stream_bind_address)) {
+                                cam.stream_bind_address = c;
+                                changed = true;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    listen_combo_open_ = open;
+                }
+
+                {
+                    char code_buf[33];
+                    std::snprintf(code_buf, sizeof(code_buf), "%s", cam.stream_access_code.c_str());
+                    ImGui::SetNextItemWidth(140.0f);
+                    if (ImGui::InputText("Access code", code_buf, sizeof(code_buf), ImGuiInputTextFlags_Password)) {
+                        cam.stream_access_code = code_buf;
+                        changed = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+                        ImGui::TextUnformatted("The page asks for this code once per browser session. Changing it "
+                                               "signs every viewer out. Leave it empty for no code.");
+                        ImGui::PopTextWrapPos();
+                        ImGui::EndTooltip();
+                    }
+                }
+
                 if (ImGui::Checkbox("Allow remote G-code upload", &cam.stream_allow_upload)) {
                     changed = true;
                 }
                 ImGui::PushTextWrapPos(0.0f);
-                ImGui::TextDisabled("The server has no password: anyone on your network can open it. "
-                                    "Uploads are refused while a job is active.");
+                if (cam.stream_access_code.empty()) {
+                    ImGui::TextColored(theme::pal().text_warn,
+                                       "No access code: anyone who can reach this PC on the selected network can watch "
+                                       "the camera and press the remote E-stop%s.",
+                                       cam.stream_allow_upload ? ", and load G-code" : "");
+                }
+                ImGui::TextDisabled("Uploads are refused while a job is active. The remote E-stop is not a safety "
+                                    "device: keep the machine's own E-stop within reach.");
+                if (!stream_srv_.isRunning() && !stream_srv_.lastError().empty()) {
+                    ImGui::TextColored(theme::pal().text_danger, "%s", stream_srv_.lastError().c_str());
+                }
                 ImGui::PopTextWrapPos();
 
                 if (stream_srv_.isRunning()) {
@@ -471,8 +529,10 @@ bool CameraPanel::render(
                     if (ImGui::SmallButton("Copy URL")) {
                         ImGui::SetClipboardText(url.c_str());
                     }
-                    ImGui::TextDisabled("Active Viewers: %d  |  Includes live DRO & Remote E-STOP",
-                                        stream_srv_.getActiveClientCount());
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextDisabled("Camera viewers: %d of %d  |  Includes live DRO & Remote E-STOP",
+                                        stream_srv_.getActiveStreamCount(), core::CameraStreamServer::kMaxStreams);
+                    ImGui::PopTextWrapPos();
                 }
             }
         }

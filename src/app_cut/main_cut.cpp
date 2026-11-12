@@ -9,6 +9,10 @@
 #include "ui_common/io_status_bar.h"
 #include "ui_common/gcode_panel.h"
 #include "ui_common/app_dir.h"
+#include "ui_common/remote_upload.h"
+#include "ui_common/app_shell.h"
+#include "ui_common/machine_settings_sections.h"
+#include "core/util/utf8_path.h"
 #include "ui_common/scripting_panel.h"
 #include "ui_common/workspace_panel.h"
 #include "ui_common/file_dialog.h"
@@ -44,9 +48,10 @@ int main(int argc, char** argv) {
     config::PersistentSettings saved_settings{};
 
     core::RnRController controller(false); // Connects below, once the settings (and the board) are applied
-    saved_settings.machine = controller.getConfig();
+    saved_settings.machine = *controller.getConfigShared();
     // Off unless the settings file says otherwise: slowing down on curves changes the cut and locks the THC anti-dive
     saved_settings.machine.limit_curve_speed = false;
+    saved_settings.machine.scripting.home_script_path = "scripts/cut/home_all.lua";
     bool had_saved_settings = config::SettingsManager::loadFromFile(settings_file, saved_settings);
     if (!had_saved_settings && !fake_board) {
         // Fallback to legacy settings file if present
@@ -94,37 +99,14 @@ int main(int argc, char** argv) {
     bool        remote_viewport_fit_needed = false;
 
     stream_server.setLoadGCodeCallback([&](const std::string& filename, const std::string& content) -> core::LoadGCodeResult {
-        const auto tel = controller.getTelemetry();
-        if (tel.state == core::ControllerState::RunningGCode ||
-            tel.state == core::ControllerState::DwellPierce ||
-            tel.state == core::ControllerState::Probing ||
-            tel.state == core::ControllerState::Homing)
-        {
-            return {false, "Machine is currently executing a motion job. Stop or wait before loading.", 0};
-        }
-
-        std::error_code ec;
-        std::filesystem::path upload_dir = std::filesystem::temp_directory_path() / "BreakoutCNC" / "uploads";
-        std::filesystem::create_directories(upload_dir, ec);
-        std::filesystem::path disk_path = upload_dir / filename;
-        {
-            std::ofstream ofs(disk_path, std::ios::binary | std::ios::trunc);
-            if (ofs) {
-                ofs.write(content.data(), content.size());
-            }
-        }
-
-        if (!controller.loadGCodeString(content)) {
-            return {false, "Failed to parse G-code: no valid toolpath moves found", 0};
-        }
-
-        const size_t seg_count = controller.getProgram()->segments.size();
-        {
+        std::string path;
+        auto result = ui::loadRemoteUpload(controller, filename, content, path);
+        if (result.success) {
             std::lock_guard<std::mutex> lock(remote_upload_mtx);
-            remote_loaded_path = disk_path.string();
+            remote_loaded_path = path;
             remote_viewport_fit_needed = true;
         }
-        return {true, "", seg_count};
+        return result;
     });
 
     ui::CameraPanel          camera_panel(camera_mgr, stream_server);
@@ -198,8 +180,12 @@ int main(int argc, char** argv) {
     std::string loaded_filename;
     loadDemoProgram(saved_settings.machine.operation_mode, loaded_filename);
     std::string persisted_file_path;
+    // Older versions stored the name in the ANSI code page: names are UTF-8 now
+    saved_settings.ui.last_gcode_file_path = util::utf8FromLegacy(saved_settings.ui.last_gcode_file_path);
+    ui::cleanOldRemoteUploads(saved_settings.ui.last_gcode_file_path);
+    std::error_code last_file_ec;
     if (!saved_settings.ui.last_gcode_file_path.empty() &&
-        std::filesystem::exists(saved_settings.ui.last_gcode_file_path))
+        std::filesystem::exists(util::pathFromUtf8(saved_settings.ui.last_gcode_file_path), last_file_ec))
     {
         // Parsed in the background on the first frame, so the window appears right away; remembered even if
         // the app is closed before the parse finishes
@@ -215,10 +201,11 @@ int main(int argc, char** argv) {
     core::OperationMode current_op_mode = saved_settings.machine.operation_mode;
     controller.setOperationMode(current_op_mode);
 
+    std::string settings_save_error; // Shown until dismissed or a save succeeds
     auto saveCurrentSettings = [&]() {
         if (smoke_test) return; // A smoke test never changes the settings next to the executable
         const auto tel = controller.getTelemetry();
-        saved_settings.machine = controller.getConfig();
+        saved_settings.machine = *controller.getConfigShared();
         window.getWindowGeometry(
             saved_settings.ui.window_pos_x,
             saved_settings.ui.window_pos_y,
@@ -256,7 +243,13 @@ int main(int argc, char** argv) {
             saved_settings.ui.last_work_pos_mm[i]    = tel.work_pos_mm[i];
         }
 
-        config::SettingsManager::saveToFile(settings_file, saved_settings);
+        if (config::SettingsManager::saveToFile(settings_file, saved_settings)) {
+            settings_save_error.clear();
+        } else if (settings_save_error.empty()) {
+            settings_save_error = "The settings could not be saved to " + settings_file +
+                                  " next to the application (read-only folder?). Work offsets, the tool table and "
+                                  "the last position are lost when the application closes.";
+        }
     };
 
     bool minimal_layout = saved_settings.ui.minimal_layout;
@@ -269,7 +262,7 @@ int main(int argc, char** argv) {
     };
 
     dro_panel.setOnConfigChanged([&]() {
-        saved_settings.machine = controller.getConfig();
+        saved_settings.machine = *controller.getConfigShared();
         markSettingsDirty();
     });
 
@@ -337,6 +330,9 @@ int main(int argc, char** argv) {
         gcode_panel.queueFileToLoad(arg_file);
     }
     window.setOnFileDropped([&](const std::string& path) { gcode_panel.queueFileToLoad(path); });
+    window.setIdlePredicate([&] {
+        return !gcode_panel.isLoading() && ui::screenIsStatic(controller.getTelemetry(), *controller.getConfigShared());
+    });
 
     bool show_exit_confirm_modal = false;
     bool force_close = false;
@@ -376,10 +372,11 @@ int main(int argc, char** argv) {
                 window.closeWindow();
             }
         }
-        // Global keyboard E-Stop: ESC always halts the machine, whatever has keyboard focus
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        // Global keyboard E-Stop: ESC halts a moving machine whatever has keyboard focus (at rest it closes a popup)
+        if (ui::escapeTriggersEStop(controller.getTelemetry())) {
             controller.triggerEStop();
         }
+        ui::renderSettingsSaveWarning(settings_save_error);
 
         // Process any pending remote G-Code upload from the web server
         {
@@ -401,13 +398,15 @@ int main(int argc, char** argv) {
 
         const auto telemetry   = controller.getTelemetry();
         const board::BoardCapabilities& board_caps = ui::boardCaps(controller, telemetry);
+        const ui::SettingsSectionContext settings_ctx{controller, board_caps, saved_settings.ui, markSettingsDirty,
+                                                      &mach3_wizard, 3};
         const bool host_board = board_caps.family == board::Family::HostPlanned;
         const auto program_snapshot = controller.getProgram(); // Held for the whole frame
         const auto& parse_res  = *program_snapshot;
         const auto& segments   = program_snapshot->segments;
 
-        camera_mgr.updateLiveTelemetry(telemetry, controller.getConfig());
-        stream_server.updateTelemetry(telemetry, controller.getConfig().linear_units,
+        camera_mgr.updateLiveTelemetry(telemetry, *controller.getConfigShared());
+        stream_server.updateTelemetry(telemetry, controller.getConfigShared()->linear_units,
                                       current_op_mode == core::OperationMode::Laser ? "BreakoutCut - Laser" : "BreakoutCut - Plasma",
                                       loaded_filename);
 
@@ -526,7 +525,7 @@ int main(int argc, char** argv) {
                 }
                 if (lua_hdr_open) {
                     s_plasma_lua_open = true;
-                    core::MachineConfig cur_cfg = controller.getConfig();
+                    core::MachineConfig cur_cfg = *controller.getConfigShared();
                     scripting_panel.render(controller, cur_cfg, [&]() {
                         saved_settings.machine = cur_cfg;
                         markSettingsDirty();
@@ -664,7 +663,7 @@ int main(int argc, char** argv) {
                             float fsz_lbl = 11.0f;
                             float fsz_val = 14.0f;
 
-                            const bool is_imperial_feed = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+                            const bool is_imperial_feed = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
                             const double feed_scale = is_imperial_feed ? (1.0 / 25.4) : 1.0;
                             const char* feed_unit_lbl = is_imperial_feed ? "IPM" : "mm/m";
                             const char* feed_sec_lbl = is_imperial_feed ? "in/s" : "mm/s";
@@ -711,7 +710,7 @@ int main(int argc, char** argv) {
                                     ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_warn_subtle);
                                     ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::pal().text_warn);
                                 }
-                                if (ImGui::Button("Reset 100%##Feed", ImVec2(right_btn_w, 24.0f))) {
+                                if (ImGui::Button("Reset 100%##Feed", ImVec2(right_btn_w, 28.0f))) {
                                     controller.setFeedOverride(100.0f);
                                     s_drag_feed_ov = 100.0f;
                                     markSettingsDirty();
@@ -791,7 +790,7 @@ int main(int argc, char** argv) {
                             lamp("Anti-dive", telemetry.thc_anti_dive_locked, ui::theme::pal().text_warn);
                             ImGui::Text("Arc voltage: %.1f V", telemetry.thc_arc_voltage);
 
-                            core::MachineConfig thc_cfg = controller.getConfig();
+                            core::MachineConfig thc_cfg = *controller.getConfigShared();
                             if (thc_cfg.thc.enabled || thc_cfg.thc.wait_for_arc_ok) {
                                 ImGui::PushTextWrapPos(0.0f);
                                 ImGui::TextDisabled("The app's own THC settings (inputs, speeds, limits) are not used with this board.");
@@ -808,7 +807,7 @@ int main(int argc, char** argv) {
                                            "%s plans the motion itself: switch THC off to cut plasma without height control.",
                                            board_caps.display_name.c_str());
                         ImGui::PopTextWrapPos();
-                        core::MachineConfig thc_cfg = controller.getConfig();
+                        core::MachineConfig thc_cfg = *controller.getConfigShared();
                         if (thc_cfg.thc.enabled || thc_cfg.thc.wait_for_arc_ok) {
                             if (ImGui::Button("Switch THC off", ImVec2(ImGui::CalcTextSize("Switch THC off").x + 32.0f, 28.0f))) {
                                 thc_cfg.thc.enabled = false;
@@ -818,7 +817,7 @@ int main(int argc, char** argv) {
                             }
                         }
                     } else if (thc_hdr_open) {
-                        core::MachineConfig cfg = controller.getConfig();
+                        core::MachineConfig cfg = *controller.getConfigShared();
                         bool thc_changed = false;
 
                         ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
@@ -987,7 +986,7 @@ int main(int argc, char** argv) {
                         markSettingsDirty();
                     }
                     if (probe_hdr_open) {
-                        core::MachineConfig cfg = controller.getConfig();
+                        core::MachineConfig cfg = *controller.getConfigShared();
                         bool probe_changed = false;
 
                         ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
@@ -1078,7 +1077,7 @@ int main(int argc, char** argv) {
                             markSettingsDirty();
                         }
                         if (laser_power_hdr_open) {
-                            core::MachineConfig cfg = controller.getConfig();
+                            core::MachineConfig cfg = *controller.getConfigShared();
                             bool changed = false;
 
                             ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
@@ -1203,7 +1202,7 @@ int main(int argc, char** argv) {
                                         ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_danger_subtle);
                                         ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::pal().text_danger);
                                     }
-                                    if (ImGui::Button("Reset 100%##LaserPwr", ImVec2(right_w, 24.0f))) {
+                                    if (ImGui::Button("Reset 100%##LaserPwr", ImVec2(right_w, 28.0f))) {
                                         controller.setLaserPowerOverride(100.0f);
                                         s_drag_laser_ov = 100.0f;
                                         markSettingsDirty();
@@ -1242,6 +1241,17 @@ int main(int argc, char** argv) {
                                     ImGui::SetTooltip("Ceiling power cap (typically 85-90% to extend CO2 glass tube longevity, 100% for diodes).");
                                 }
 
+                                int s_max = cfg.laser.s_max;
+                                ImGui::SetNextItemWidth(140.0f);
+                                if (ImGui::InputInt("S for 100% Power", &s_max, 0, 0)) {
+                                    cfg.laser.s_max = static_cast<uint16_t>(std::clamp(s_max, 1, 60000));
+                                    changed = true;
+                                }
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip("The S value your CAM writes for full power: 1000 (LightBurn, Mach3) or 255.\n"
+                                                      "S0 switches the beam off; a program without any S word cuts at full power.");
+                                }
+
                                 float corner_d = cfg.laser.corner_power_floor_pct;
                                 ImGui::SetNextItemWidth(140.0f);
                                 if (ImGui::SliderFloat("Corner Power Floor %", &corner_d, 0.0f, 30.0f, "%.0f%%")) {
@@ -1272,7 +1282,7 @@ int main(int argc, char** argv) {
                             markSettingsDirty();
                         }
                         if (laser_align_hdr_open) {
-                            core::MachineConfig cfg = controller.getConfig();
+                            core::MachineConfig cfg = *controller.getConfigShared();
                             bool changed = false;
 
                             ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
@@ -1391,7 +1401,7 @@ int main(int argc, char** argv) {
                                     changed = true;
                                 }
 
-                                if (ImGui::Button("Zero Work Coordinates to Red Dot", ImVec2(-1.0f, 26.0f))) {
+                                if (ImGui::Button("Zero Work Coordinates to Red Dot", ImVec2(-1.0f, 28.0f))) {
                                     controller.setWorkPosition(core::Axis::X, telemetry.work_pos_mm[0] - cfg.laser.red_dot_offset_x_mm);
                                     controller.setWorkPosition(core::Axis::Y, telemetry.work_pos_mm[1] - cfg.laser.red_dot_offset_y_mm);
                                 }
@@ -1419,7 +1429,7 @@ int main(int argc, char** argv) {
                             markSettingsDirty();
                         }
                         if (laser_air_hdr_open) {
-                            core::MachineConfig cfg = controller.getConfig();
+                            core::MachineConfig cfg = *controller.getConfigShared();
                             bool changed = false;
 
                             ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
@@ -1509,7 +1519,7 @@ int main(int argc, char** argv) {
                             markSettingsDirty();
                         }
                         if (laser_safe_hdr_open) {
-                            core::MachineConfig cfg = controller.getConfig();
+                            core::MachineConfig cfg = *controller.getConfigShared();
                             bool changed = false;
 
                             ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
@@ -1634,7 +1644,7 @@ int main(int argc, char** argv) {
                     }
                     if (cam_hdr_open) {
                         if (camera_panel.render(controller, telemetry, nullptr, false)) {
-                            saved_settings.machine = controller.getConfig();
+                            saved_settings.machine = *controller.getConfigShared();
                             markSettingsDirty();
                         }
                     }
@@ -1653,7 +1663,7 @@ int main(int argc, char** argv) {
                     if (io_hdr_open && !host_board) {
                         ui::renderNotUsedByBoardNote("The functions and polarity of the inputs and outputs", board_caps);
                     } else if (io_hdr_open) {
-                        core::MachineConfig cfg = controller.getConfig();
+                        core::MachineConfig cfg = *controller.getConfigShared();
                         if (ui::renderIoSettings(controller, telemetry, cfg)) {
                             controller.applyConfig(cfg);
                             markSettingsDirty();
@@ -1670,196 +1680,8 @@ int main(int argc, char** argv) {
                         markSettingsDirty();
                     }
                     if (limits_hdr_open) {
-                        core::MachineConfig cfg = controller.getConfig();
-                        bool changed = false;
-
-                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
-                        ImGui::PushStyleColor(ImGuiCol_Border,  ui::theme::pal().card_border);
-                        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-                        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
-                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
-
-                        if (host_board) {
-                        // Hardware E-Stop Input Pin
-                        ImGui::BeginChild("##PlasmaEStopLimitCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                        {
-                            ImGui::TextColored(ui::theme::pal().heading, "E-STOP INPUT");
-                            ImGui::Spacing();
-
-                            int estop_pin = cfg.estop_pin;
-                            ImGui::SetNextItemWidth(140.0f);
-                            if (ImGui::SliderInt("E-Stop Pin (0=Off, IN1..12)", &estop_pin, 0, 12)) {
-                                cfg.estop_pin = static_cast<uint8_t>(estop_pin);
-                                changed = true;
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Checkbox("Active Low##EStop", &cfg.estop_invert)) changed = true;
-                            if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Active Low: Checked = Normally-Closed (NC) switch connected to COM/GND.\nTriggers E-Stop when opened or pulled low. Unchecked = Active High (NO switch).");
-                            }
-                        }
-                        ImGui::EndChild();
-
-                        ImGui::Spacing();
-
-                        }
-                        // Homing requirement
-                        ImGui::BeginChild("##PlasmaHomingRequiredCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                        {
-                            ImGui::TextColored(ui::theme::pal().heading, "HOMING");
-                            ImGui::Spacing();
-                            if (ImGui::Checkbox("Require homing for G53 / G28 / G30##ReqHome", &cfg.require_homing)) changed = true;
-                            ImGui::PushTextWrapPos(0.0f);
-                            if (cfg.require_homing) {
-                                ImGui::TextDisabled("Programs and MDI commands that move in machine coordinates (G53, G28, G30) "
-                                                    "are refused until those axes are homed.");
-                            } else {
-                                ImGui::TextColored(ui::theme::pal().text_warn,
-                                                   "Machine coordinates are then not tied to switches: they continue from the position saved when the app last closed. "
-                                                   "If the axes were moved by hand or lost steps, G53 / G28 / G30 moves go to the wrong place. "
-                                                   "Use this only on a machine without home switches.");
-                            }
-                            ImGui::PopTextWrapPos();
-                        }
-                        ImGui::EndChild();
-
-                        ImGui::Spacing();
-
-                        // Automatic Z lift at program start
-                        ImGui::BeginChild("##PlasmaProgramStartCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                        {
-                            ImGui::TextColored(ui::theme::pal().heading, "PROGRAM START");
-                            ImGui::Spacing();
-                            if (ui::renderProgramStartSettings(cfg)) changed = true;
-                        }
-                        ImGui::EndChild();
-
-                        ImGui::Spacing();
-
-                        if (host_board) {
-                        // Constant velocity: corner tolerance and curve speed limit
-                        ImGui::BeginChild("##PlasmaCornersCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                        {
-                            ImGui::TextColored(ui::theme::pal().heading, "CORNERS & CURVES");
-                            ImGui::Spacing();
-                            if (ui::renderCornerSettings(cfg)) changed = true;
-                        }
-                        ImGui::EndChild();
-
-                        ImGui::Spacing();
-
-                        }
-                        if (!host_board) {
-                            ui::renderNotUsedByBoardNote("Limit switches, homing speeds, pull-off and soft limits", board_caps);
-                        } else {
-                        const char* ax_names[3] = {"X AXIS LIMITS & HOMING", "Y AXIS LIMITS & HOMING", "Z AXIS LIMITS & HOMING"};
-                        const char* card_ids[3] = {"##LimitsXCard", "##LimitsYCard", "##LimitsZCard"};
-                        for (int a = 0; a < 3; ++a) {
-                            ImGui::PushID(100 + a);
-                            ImGui::BeginChild(card_ids[a], ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                            {
-                                ImGui::TextColored(ui::theme::pal().heading, "%s", ax_names[a]);
-                                ImGui::Spacing();
-
-                                int home_pin = cfg.axes[a].home_pin;
-                                int lim_m    = cfg.axes[a].limit_minus_pin;
-                                int lim_p    = cfg.axes[a].limit_plus_pin;
-
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::SliderInt("Home Pin (0=Off, IN1..12)", &home_pin, 0, 12)) {
-                                    cfg.axes[a].home_pin = static_cast<uint8_t>(home_pin);
-                                    changed = true;
-                                }
-                                ImGui::SameLine();
-                                if (ImGui::Checkbox("Active Low##H", &cfg.axes[a].home_invert)) changed = true;
-                                if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Active Low: Checked = Switch connects to COM/GND when triggered.\nUnchecked = Active High.");
-                                }
-
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::SliderInt("Limit- Pin (0=Off, IN1..12)", &lim_m, 0, 12)) {
-                                    cfg.axes[a].limit_minus_pin = static_cast<uint8_t>(lim_m);
-                                    changed = true;
-                                }
-                                ImGui::SameLine();
-                                if (ImGui::Checkbox("Active Low##LM", &cfg.axes[a].limit_minus_invert)) changed = true;
-                                if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Active Low: Checked = Switch connects to COM/GND when triggered.\nUnchecked = Active High.");
-                                }
-
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::SliderInt("Limit+ Pin (0=Off, IN1..12)", &lim_p, 0, 12)) {
-                                    cfg.axes[a].limit_plus_pin = static_cast<uint8_t>(lim_p);
-                                    changed = true;
-                                }
-                                ImGui::SameLine();
-                                if (ImGui::Checkbox("Active Low##LP", &cfg.axes[a].limit_plus_invert)) changed = true;
-                                if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Active Low: Checked = Switch connects to COM/GND when triggered.\nUnchecked = Active High.");
-                                }
-
-                                ImGui::Spacing();
-                                ImGui::Separator();
-                                ImGui::Spacing();
-
-                                if (ImGui::Checkbox("Home Dir (-)", &cfg.axes[a].homing_dir_negative)) {
-                                    changed = true;
-                                }
-
-                                bool is_imp = (cfg.linear_units == core::LinearUnits::Imperial);
-                                double dist_scale = is_imp ? (1.0 / 25.4) : 1.0;
-
-                                float pulloff = static_cast<float>(cfg.axes[a].home_pulloff_mm * dist_scale);
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::InputFloat(is_imp ? "Home Pull-Off (in)" : "Home Pull-Off (mm)", &pulloff, is_imp ? 0.02f : 0.5f, is_imp ? 0.1f : 2.0f, is_imp ? "%.3f" : "%.2f")) {
-                                    cfg.axes[a].home_pulloff_mm = std::max(0.01, static_cast<double>(pulloff) / dist_scale);
-                                    changed = true;
-                                }
-
-                                float h_feed = static_cast<float>(cfg.axes[a].homing_feed_mm_min * dist_scale);
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::InputFloat(is_imp ? "Homing Speed (IPM)" : "Homing Speed (mm/min)", &h_feed, is_imp ? 2.0f : 50.0f, is_imp ? 10.0f : 200.0f, is_imp ? "%.1f" : "%.0f")) {
-                                    cfg.axes[a].homing_feed_mm_min = std::max(1.0, static_cast<double>(h_feed) / dist_scale);
-                                    changed = true;
-                                }
-
-                                ImGui::Spacing();
-                                ImGui::Separator();
-                                ImGui::Spacing();
-
-                                if (ImGui::Checkbox("Enable Soft Limits", &cfg.axes[a].soft_limits_enabled)) {
-                                    changed = true;
-                                }
-                                if (cfg.axes[a].soft_limits_enabled) {
-                                    float smin = static_cast<float>(cfg.axes[a].soft_limit_min_mm * dist_scale);
-                                    float smax = static_cast<float>(cfg.axes[a].soft_limit_max_mm * dist_scale);
-                                    ImGui::SetNextItemWidth(140.0f);
-                                    if (ImGui::InputFloat(is_imp ? "Soft Limit Min (in)" : "Soft Limit Min (mm)", &smin, is_imp ? 0.2f : 5.0f, is_imp ? 1.0f : 25.0f, is_imp ? "%.2f" : "%.1f")) {
-                                        cfg.axes[a].soft_limit_min_mm = static_cast<double>(smin) / dist_scale;
-                                        changed = true;
-                                    }
-                                    ImGui::SetNextItemWidth(140.0f);
-                                    if (ImGui::InputFloat(is_imp ? "Soft Limit Max (in)" : "Soft Limit Max (mm)", &smax, is_imp ? 0.2f : 5.0f, is_imp ? 1.0f : 25.0f, is_imp ? "%.2f" : "%.1f")) {
-                                        cfg.axes[a].soft_limit_max_mm = static_cast<double>(smax) / dist_scale;
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            ImGui::EndChild();
-                            ImGui::PopID();
-                            ImGui::Spacing();
-                        }
-
-                        }
-                        ImGui::PopStyleVar(4);
-                        ImGui::PopStyleColor(2);
-
-                        if (changed) {
-                            controller.applyConfig(cfg);
-                            markSettingsDirty();
-                        }
-                    }
+                ui::renderLimitsHomingSection(settings_ctx);
+            }
 
                     ImGui::Spacing();
 
@@ -1875,248 +1697,8 @@ int main(int argc, char** argv) {
                     if (motor_hdr_open && !board_caps.app_owns_motor_tuning) {
                         ui::renderNotUsedByBoardNote("Steps per mm, speeds and accelerations", board_caps);
                     } else if (motor_hdr_open) {
-                        core::MachineConfig cfg = controller.getConfig();
-                        bool changed = false;
-
-                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::pal().card_bg);
-                        ImGui::PushStyleColor(ImGuiCol_Border,  ui::theme::pal().card_border);
-                        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-                        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
-                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
-
-                        // Card: Global System Units & Velocity Configuration
-                        ImGui::BeginChild("##PlasmaMotorUnitCard", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                        {
-                            ImGui::TextColored(ui::theme::pal().heading, "UNITS & MACH3 IMPORT");
-                            ImGui::Spacing();
-
-                            // Mach3 Migration Action Button
-                            ImGui::PushStyleColor(ImGuiCol_Button,        ui::theme::pal().btn_primary);
-                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::theme::pal().btn_primary_hov);
-                            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ui::theme::pal().btn_primary_act);
-                            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::contrastText(ui::theme::pal().btn_primary));
-                            if (ImGui::Button("MIGRATE FROM MACH3 XML...", ImVec2(-1.0f, 30.0f))) {
-                                mach3_wizard.openMigrationWizard(controller.getConfig());
-                            }
-                            ImGui::PopStyleColor(4);
-                            if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Import motor tuning (steps/unit, velocity, acceleration), pin assignments,\ninversions, homing speeds, soft limits, and torch/output relays directly from a Mach3 XML profile\nfollowed by the interactive 5-Stage Post-Migration Machine Verification Routine.");
-                            }
-
-                            ImGui::Spacing();
-                            ImGui::Separator();
-                            ImGui::Spacing();
-
-                            // Unit Selector
-                            ImGui::Text("Unit of Measurement:");
-                            ImGui::SameLine();
-                            const bool is_metric = (cfg.linear_units == core::LinearUnits::Metric);
-                            const bool is_imperial = (cfg.linear_units == core::LinearUnits::Imperial);
-
-                            if (is_metric) {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_primary);
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::theme::pal().btn_primary_hov);
-                            } else {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_neutral);
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::theme::pal().btn_neutral_hov);
-                            }
-                            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::contrastText(ImGui::GetStyleColorVec4(ImGuiCol_Button)));
-                            if (ImGui::Button("  METRIC (mm)  ")) {
-                                if (!is_metric) {
-                                    cfg.linear_units = core::LinearUnits::Metric;
-                                    saved_settings.ui.speed_unit_idx = 0;
-                                    changed = true;
-                                }
-                            }
-                            ImGui::PopStyleColor(3);
-                            if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Set system-wide machine units to Metric (Millimeters, mm/min, mm/s).");
-                            }
-
-                            ImGui::SameLine();
-
-                            if (is_imperial) {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_primary);
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::theme::pal().btn_primary_hov);
-                            } else {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ui::theme::pal().btn_neutral);
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::theme::pal().btn_neutral_hov);
-                            }
-                            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::contrastText(ImGui::GetStyleColorVec4(ImGuiCol_Button)));
-                            if (ImGui::Button("  IMPERIAL (Inches)  ")) {
-                                if (!is_imperial) {
-                                    cfg.linear_units = core::LinearUnits::Imperial;
-                                    saved_settings.ui.speed_unit_idx = 0;
-                                    changed = true;
-                                }
-                            }
-                            ImGui::PopStyleColor(3);
-                            if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Set system-wide machine units to Imperial (Inches, in/min [IPM], in/s).");
-                            }
-
-                            ImGui::Spacing();
-                            ImGui::Separator();
-                            ImGui::Spacing();
-
-                            // Filtered velocity configuration unit based on global unit
-                            const char* metric_speed_units[] = {
-                                "mm/min (Metric mm/m)",
-                                "mm/sec (Metric mm/s)"
-                            };
-                            const char* imperial_speed_units[] = {
-                                "in/min (Imperial IPM)",
-                                "in/sec (Imperial in/s)"
-                            };
-
-                            int current_speed_idx = std::clamp(saved_settings.ui.speed_unit_idx, 0, 1);
-
-                            ImGui::SetNextItemWidth(220.0f);
-                            if (is_metric) {
-                                if (ImGui::Combo("Velocity Unit", &current_speed_idx, metric_speed_units, IM_ARRAYSIZE(metric_speed_units))) {
-                                    saved_settings.ui.speed_unit_idx = current_speed_idx;
-                                    markSettingsDirty();
-                                }
-                            } else {
-                                if (ImGui::Combo("Velocity Unit", &current_speed_idx, imperial_speed_units, IM_ARRAYSIZE(imperial_speed_units))) {
-                                    saved_settings.ui.speed_unit_idx = current_speed_idx;
-                                    markSettingsDirty();
-                                }
-                            }
-                            if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Configure the units used for max velocity and feedrate tuning for all axes.");
-                            }
-                        }
-                        ImGui::EndChild();
-
-                        ImGui::Spacing();
-
-                        const bool is_imperial = (cfg.linear_units == core::LinearUnits::Imperial);
-                        const int speed_sub_idx = std::clamp(saved_settings.ui.speed_unit_idx, 0, 1);
-
-                        double to_disp_factor = 60.0;
-                        const char* speed_label = "Max Speed (mm/m)";
-                        const char* speed_fmt = "%.0f";
-                        float speed_step = 100.0f;
-                        float speed_step_fast = 500.0f;
-
-                        const char* steps_label = "Steps/mm";
-                        const char* accel_label = "Acceleration (mm/s^2)";
-                        const char* decel_label = "Deceleration (mm/s^2)";
-                        double steps_mult = 1.0;
-                        double accel_mult = 1.0;
-
-                        if (!is_imperial) {
-                            if (speed_sub_idx == 1) {
-                                to_disp_factor = 1.0;
-                                speed_label = "Max Speed (mm/s)";
-                                speed_fmt = "%.1f";
-                                speed_step = 5.0f;
-                                speed_step_fast = 25.0f;
-                            } else {
-                                to_disp_factor = 60.0;
-                                speed_label = "Max Speed (mm/m)";
-                                speed_fmt = "%.0f";
-                                speed_step = 100.0f;
-                                speed_step_fast = 500.0f;
-                            }
-                            steps_label = "Steps/mm";
-                            accel_label = "Acceleration (mm/s^2)";
-                            decel_label = "Deceleration (mm/s^2)";
-                            steps_mult = 1.0;
-                            accel_mult = 1.0;
-                        } else {
-                            if (speed_sub_idx == 1) {
-                                to_disp_factor = 1.0 / 25.4;
-                                speed_label = "Max Speed (in/s)";
-                                speed_fmt = "%.2f";
-                                speed_step = 0.5f;
-                                speed_step_fast = 2.0f;
-                            } else {
-                                to_disp_factor = 60.0 / 25.4;
-                                speed_label = "Max Speed (IPM)";
-                                speed_fmt = "%.1f";
-                                speed_step = 10.0f;
-                                speed_step_fast = 50.0f;
-                            }
-                            steps_label = "Steps/inch";
-                            accel_label = "Acceleration (in/s^2)";
-                            decel_label = "Deceleration (in/s^2)";
-                            steps_mult = 25.4;
-                            accel_mult = 1.0 / 25.4;
-                        }
-
-                        const char* ax_names[3] = {"X AXIS MOTOR TUNING", "Y AXIS MOTOR TUNING", "Z AXIS MOTOR TUNING"};
-                        const char* motor_card_ids[3] = {"##MotorXCard", "##MotorYCard", "##MotorZCard"};
-                        for (int a = 0; a < 3; ++a) {
-                            ImGui::PushID(200 + a);
-                            ImGui::BeginChild(motor_card_ids[a], ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-                            {
-                                ImGui::TextColored(ui::theme::pal().heading, "%s", ax_names[a]);
-                                ImGui::Spacing();
-
-                                float steps = static_cast<float>(cfg.axes[a].steps_per_mm * steps_mult);
-                                float disp_v = static_cast<float>(cfg.axes[a].max_velocity_mm_s * to_disp_factor);
-                                float acc   = static_cast<float>(cfg.axes[a].acceleration_mm_s2 * accel_mult);
-                                float dec   = static_cast<float>(cfg.axes[a].deceleration_mm_s2 * accel_mult);
-
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::InputFloat(steps_label, &steps, 1.0f, 10.0f, "%.2f")) {
-                                    cfg.axes[a].steps_per_mm = std::max(0.1, static_cast<double>(steps) / steps_mult);
-                                    changed = true;
-                                }
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::InputFloat(speed_label, &disp_v, speed_step, speed_step_fast, speed_fmt)) {
-                                    cfg.axes[a].max_velocity_mm_s = std::max(0.01, static_cast<double>(disp_v) / to_disp_factor);
-                                    changed = true;
-                                }
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::InputFloat(accel_label, &acc, is_imperial ? 1.0f : 25.0f, is_imperial ? 5.0f : 100.0f, "%.1f")) {
-                                    cfg.axes[a].acceleration_mm_s2 = std::max(0.5, static_cast<double>(acc) / accel_mult);
-                                    changed = true;
-                                }
-                                ImGui::SetNextItemWidth(140.0f);
-                                if (ImGui::InputFloat(decel_label, &dec, is_imperial ? 1.0f : 25.0f, is_imperial ? 5.0f : 100.0f, "%.1f")) {
-                                    cfg.axes[a].deceleration_mm_s2 = std::max(0.5, static_cast<double>(dec) / accel_mult);
-                                    changed = true;
-                                }
-
-                                ImGui::Spacing();
-                                ImGui::Separator();
-                                ImGui::Spacing();
-
-                                if (ImGui::Checkbox("Step Active Low", &cfg.axes[a].step_active_low)) {
-                                    changed = true;
-                                }
-                                if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Invert step pulse polarity (Active Low vs Active High) for stepper driver optocoupler.");
-                                }
-                                ImGui::SameLine();
-                                if (ImGui::Checkbox("Dir Invert (Active Low)", &cfg.axes[a].dir_active_low)) {
-                                    changed = true;
-                                }
-                                if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Invert direction signal polarity to reverse motor rotation without swapping motor wires.");
-                                }
-                            }
-                            ImGui::EndChild();
-                            ImGui::PopID();
-                            ImGui::Spacing();
-                        }
-
-                        if (ui::renderGantrySlaveCombo(cfg)) {
-                            changed = true;
-                        }
-
-                        ImGui::PopStyleVar(4);
-                        ImGui::PopStyleColor(2);
-
-                        if (changed) {
-                            controller.applyConfig(cfg);
-                            markSettingsDirty();
-                        }
-                    }
+                ui::renderMotorsSection(settings_ctx);
+            }
                 }
                 ImGui::EndChild(); // ##PlasmaSettingsScroll
             }
@@ -2171,7 +1753,7 @@ int main(int argc, char** argv) {
 
         // Mach3 XML Profile Migration & 5-Stage Post-Migration Machine Verification Wizard
         if (mach3_wizard.render(controller, true)) {
-            saved_settings.machine = controller.getConfig();
+            saved_settings.machine = *controller.getConfigShared();
             markSettingsDirty();
         }
 

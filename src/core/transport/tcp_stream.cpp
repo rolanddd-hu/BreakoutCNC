@@ -46,6 +46,44 @@ void closeSocket(SocketHandle s) { closesocket(s); }
 void ensureWinsock() {}
 void closeSocket(SocketHandle s) { ::close(s); }
 #endif
+
+// Waits until the socket is readable (or writable). poll() on POSIX: select() with FD_SET is undefined for
+// descriptors >= FD_SETSIZE (1024). Returns > 0 ready, 0 timeout, < 0 error.
+int waitSocket(SocketHandle s, bool for_write, uint32_t timeout_ms) {
+#ifdef _WIN32
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(s, &set);
+    timeval tv{static_cast<long>(timeout_ms / 1000), static_cast<long>((timeout_ms % 1000) * 1000)};
+    return ::select(0, for_write ? nullptr : &set, for_write ? &set : nullptr, nullptr, &tv);
+#else
+    pollfd p{s, static_cast<short>(for_write ? POLLOUT : POLLIN), 0};
+    int r;
+    do {
+        r = ::poll(&p, 1, static_cast<int>(timeout_ms));
+    } while (r < 0 && errno == EINTR);
+    if (r > 0 && !for_write && (p.revents & (POLLERR | POLLNVAL))) return -1;
+    return r;
+#endif
+}
+
+// "host", "host:port", "[v6]", "[v6]:port" or a bare IPv6 address (no port)
+void splitHostPort(const std::string& address, std::string& host, std::string& port) {
+    host = address;
+    if (!address.empty() && address[0] == '[') {
+        const size_t close = address.find(']');
+        if (close != std::string::npos) {
+            host = address.substr(1, close - 1);
+            if (close + 1 < address.size() && address[close + 1] == ':') port = address.substr(close + 2);
+        }
+        return;
+    }
+    const size_t colon = address.rfind(':');
+    if (colon != std::string::npos && address.find(':') == colon) {
+        port = address.substr(colon + 1);
+        host = address.substr(0, colon);
+    }
+}
 } // namespace
 
 TcpStream::TcpStream() : sock_(kNoSocket) {}
@@ -57,13 +95,9 @@ TcpStream::~TcpStream() {
 bool TcpStream::open(const ConnectionTarget& target, const StreamOptions& options, std::string* error) {
     close();
     ensureWinsock();
-    std::string host = target.address;
+    std::string host;
     std::string port = std::to_string(options.default_tcp_port);
-    const size_t colon = host.rfind(':');
-    if (colon != std::string::npos && host.find(':') == colon) {
-        port = host.substr(colon + 1);
-        host = host.substr(0, colon);
-    }
+    splitHostPort(target.address, host, port);
     if (host.empty()) {
         if (error) *error = "No network address entered";
         return false;
@@ -88,11 +122,7 @@ bool TcpStream::open(const ConnectionTarget& target, const StreamOptions& option
         fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
 #endif
         ::connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
-        fd_set wr;
-        FD_ZERO(&wr);
-        FD_SET(s, &wr);
-        timeval tv{3, 0};
-        bool ok = ::select(static_cast<int>(s) + 1, nullptr, &wr, nullptr, &tv) > 0;
+        bool ok = waitSocket(s, true, 3000) > 0;
         if (ok) {
             int err = 0;
             socklen_t len = sizeof(err);
@@ -145,11 +175,7 @@ long TcpStream::read(uint8_t* buf, size_t max, uint32_t timeout_ms) {
     const intptr_t sv = sock_.load();
     if (sv == kNoSocket) return -1;
     const SocketHandle s = static_cast<SocketHandle>(sv);
-    fd_set rd;
-    FD_ZERO(&rd);
-    FD_SET(s, &rd);
-    timeval tv{static_cast<long>(timeout_ms / 1000), static_cast<long>((timeout_ms % 1000) * 1000)};
-    const int r = ::select(static_cast<int>(s) + 1, &rd, nullptr, nullptr, &tv);
+    const int r = waitSocket(s, false, timeout_ms);
     if (r < 0) return -1;
     if (r == 0) return 0;
     const int n = ::recv(s, reinterpret_cast<char*>(buf), static_cast<int>(max), 0);

@@ -369,7 +369,7 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
         ImGui::TextColored(theme::pal().heading, "GRID AREA");
         ImGui::Spacing();
 
-        const bool is_imperial = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+        const bool is_imperial = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
         const double u_scale = is_imperial ? (1.0 / 25.4) : 1.0;
         const double u_unscale = is_imperial ? 25.4 : 1.0;
         const char* u_str = is_imperial ? "in" : "mm";
@@ -546,7 +546,7 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
         double dx = (surface_points_x_ > 1) ? (surface_max_x_ - surface_min_x_) / (surface_points_x_ - 1) : 0.0;
         double dy = (surface_points_y_ > 1) ? (surface_max_y_ - surface_min_y_) / (surface_points_y_ - 1) : 0.0;
 
-        const bool is_imperial = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+        const bool is_imperial = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
         const double u_scale = is_imperial ? (1.0 / 25.4) : 1.0;
 
         ImGui::Spacing();
@@ -782,7 +782,7 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
             ImGui::Text("%d x %d (%zu pts)", shm.points_x, shm.points_y, shm.grid_z.size());
             ImGui::NextColumn();
 
-            const bool is_imperial_shm = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+            const bool is_imperial_shm = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
             const double shm_scale = is_imperial_shm ? (1.0 / 25.4) : 1.0;
             const char* z_fmt = is_imperial_shm ? "%+.4f in" : "%+.3f mm";
             const char* p2p_fmt = is_imperial_shm ? "%.4f in" : "%.3f mm";

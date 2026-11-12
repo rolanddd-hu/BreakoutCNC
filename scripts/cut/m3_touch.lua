@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Plasma Initial Height Sense (IHS) Touch-Off Macro
+-- BreakoutCNC - Plasma Initial Height Sense (IHS) Touch-Off Macro
 -- Runs automatically on M3 before torch fire to establish material surface
 -- ============================================================================
 

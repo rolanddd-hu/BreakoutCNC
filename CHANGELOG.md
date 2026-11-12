@@ -34,13 +34,58 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   axes only), feeds above the board's maximum rates (`$110`-`$113`) and custom outputs the board does not have are
   warned about.
 - Lua: `cnc.board()` returns the selected board and what it can do.
+- Remote monitoring: an optional **access code** (the page asks for it once per browser session) and a **Listen on**
+  choice (all networks, one network address, or this PC only).
 - **Test mode without a board:** start BreakoutMill or BreakoutCut with `--fake-board` to drive a built-in GRBL 1.1,
   grblHAL and FluidNC emulator. Hardware access and the VFD link are off in this mode, and it uses its own settings
   file (`*_settings_fakeboard.ini`).
 - Program check: warnings for G61 / G64 (no effect on these boards) and for THC programs on a board that cannot run
   THC.
+- BreakoutCut laser: **S for 100% Power** (*Laser Power*), 1000 by default or 255 for CAM that writes `S0`-`S255`; the
+  program check warns about S values above it.
+- **Hooks** in *Scripts & Macros*: tick **M6 script** (BreakoutMill) and **Home script**. With the home script ticked,
+  HOME ALL runs `home_all.lua`; the H buttons of single axes always use the built-in cycle. Lua: `cnc.home("Z")` and
+  `cnc.home()` start the built-in homing cycle from a script.
+- A settings file that cannot be saved (read-only folder) is reported in the window instead of being lost silently.
+- The window draws about 15 frames per second instead of 60 while nothing changes (machine at rest, no camera, no
+  input for a second), and wakes at once on any input.
 
 ### Fixed
+- **Laser `S0` cut at full power** on the RNR board and kept the previous power on GRBL-family boards. `S0` is now 0 %
+  (beam off).
+- **Huanyang VFD:** switching the VFD off in the settings (or closing the application) while the spindle ran could
+  leave the spindle running. A stop command is now sent and acknowledged first.
+- The shipped `home_all.lua` scripts called a Lua function that did not exist (`cnc.home`).
+- Lua: an unknown axis name (`cnc.zero_axis("B")`, a `nil` variable) acted on X; it is now an error. A negative
+  spindle speed is refused.
+- Lua scripts can no longer catch the E-stop cancellation (`pcall`, `coroutine`) or remove it (`debug.sethook`), and
+  every script starts from a fresh Lua state (globals left by one script no longer change the next one).
+- Many small feed override steps added up to nothing on the RNR board; every change now reaches the planner.
+- A probe cancelled or failed during a tool change wait returned to Idle instead of the tool change.
+- A refused MDI line (soft limit, bad word) could still switch the work offset (G54..G59) or the tool length offset.
+- A G2 / G3 line with only I / J (a modal full circle) was ignored.
+- File names with characters outside the Windows code page (for example `ő` on a Western system, Cyrillic) could not
+  be opened from the file dialog, the command line, by drag and drop or from Lua scripts, and showed garbled.
+- Connecting to an unreachable network board froze the window for several seconds.
+- A file without moves replaced the loaded program; it is now refused with a message, and a remote upload refused
+  during a job says why.
+- Esc pressed to close a dropdown while the machine was at rest triggered the E-stop (it still stops a moving
+  machine, whatever has the focus).
+- Program file names in the remote upload folder are no longer kept forever (cleaned at startup).
+- COM ports above COM128 are listed, in numeric order.
+- Remote monitoring web server security:
+  - Another web page opened on the shop network can no longer upload G-code or press the remote E-stop through the
+    browser, and a web site cannot read the camera or the job state by pointing its own name at the PC (DNS
+    rebinding). Actions need the dashboard's own header and origin, and the server only answers to the PC's address
+    or name. The page cannot be shown inside another site.
+  - An uploaded file named after a Windows device (`COM3.nc`, `CON`, `NUL`) is saved under a safe name instead of
+    being written to that device.
+  - Slow or idle connections can no longer block the server (and the remote E-stop): requests have a deadline,
+    connections per device and camera viewers are limited, and a camera viewer that leaves frees its place even when
+    no camera is selected. A request body is only read for an allowed upload, one upload at a time.
+  - Changing the port or switching the server off and on can no longer hang or leak the port, and closing the app
+    waits for an upload still being loaded instead of crashing. No other program can take over the server's port; a
+    port already in use is shown in the panel.
 - GRBL-family boards: coolant is switched with one M7 / M8 / M9 per line. GRBL refuses two words of that modal group
   in one line (error 21), which stopped jobs at their first coolant change and the manual Flood / Mist buttons.
 - GRBL-family boards, BreakoutCut plasma: the torch is switched on with `M3 S<$30>` instead of a bare `M3`; with S0 a

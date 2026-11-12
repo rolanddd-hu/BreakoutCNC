@@ -1,57 +1,32 @@
 #pragma once
-#include <string>
+#include "core/util/app_paths.h"
+#include "core/util/utf8_path.h"
 #include <filesystem>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
+#include <string>
 
 namespace rnr::scripting {
 
+// Finds a script file: as given (absolute, or relative to the working directory), then relative to the executable's
+// folder, its parent and grandparent (the repository root when run from build/Release). UTF-8 in and out.
 inline std::string resolveScriptPath(const std::string& path_str) {
     if (path_str.empty()) return {};
 
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path p(path_str);
+    const fs::path p = util::pathFromUtf8(path_str);
+    auto found = [&](const fs::path& c) { return fs::exists(c, ec) && !fs::is_directory(c, ec); };
 
-    // Direct check (working directory or absolute path)
-    if (fs::exists(p, ec) && !fs::is_directory(p, ec)) {
-        return fs::absolute(p, ec).string();
+    if (found(p)) return util::pathToUtf8(fs::absolute(p, ec));
+    if (p.is_absolute()) return {};
+
+    const fs::path exe = util::executablePath();
+    if (exe.empty()) return {};
+    fs::path dir = exe.parent_path();
+    for (int up = 0; up < 3 && !dir.empty(); ++up) {
+        const fs::path c = dir / p;
+        if (found(c)) return util::pathToUtf8(fs::absolute(c, ec));
+        dir = dir.parent_path();
     }
-
-#ifdef _WIN32
-    // Search relative to executable directory
-    char exe_buf[MAX_PATH] = {0};
-    if (GetModuleFileNameA(NULL, exe_buf, MAX_PATH)) {
-        fs::path exe_dir = fs::path(exe_buf).parent_path();
-
-        // Candidate A: <exe_dir>/<path>
-        fs::path c1 = exe_dir / p;
-        if (fs::exists(c1, ec) && !fs::is_directory(c1, ec)) {
-            return fs::absolute(c1, ec).string();
-        }
-
-        // Candidate B: <exe_dir>/../<path>
-        fs::path c2 = exe_dir.parent_path() / p;
-        if (fs::exists(c2, ec) && !fs::is_directory(c2, ec)) {
-            return fs::absolute(c2, ec).string();
-        }
-
-        // Candidate C: <exe_dir>/../../<path> (repo root when run from build/Release)
-        fs::path c3 = exe_dir.parent_path().parent_path() / p;
-        if (fs::exists(c3, ec) && !fs::is_directory(c3, ec)) {
-            return fs::absolute(c3, ec).string();
-        }
-    }
-#endif
-
     return {};
 }
 

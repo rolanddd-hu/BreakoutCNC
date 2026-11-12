@@ -260,6 +260,21 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
         }
     }
 
+    // Laser: S values above the S for 100 % power are cut at full power
+    if (!cfg.is_mill && cfg.operation_mode == OperationMode::Laser && cfg.laser.s_max > 0) {
+        for (size_t i = in.start_segment; i < segs.size(); ++i) {
+            const auto& s = segs[i];
+            if (s.spindle_s_set && s.spindle_rpm > cfg.laser.s_max) {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf), "S%u is above the S value for 100%% laser power (S%u): it cuts at full "
+                              "power. Check 'S for 100%% Power' in the laser settings.",
+                              static_cast<unsigned>(s.spindle_rpm), static_cast<unsigned>(cfg.laser.s_max));
+                out.warnings.push_back({ProgramIssueKind::Warning, s.gcode_line, buf});
+                break;
+            }
+        }
+    }
+
     // Spindle speeds outside the VFD's range: the VFD controller limits them
     if (cfg.is_mill && cfg.vfd.enabled && cfg.vfd.max_rpm > 0) {
         uint16_t prev = 0;

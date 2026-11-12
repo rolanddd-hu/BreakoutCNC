@@ -432,7 +432,6 @@ private:
                 const bool was_probe = b.probe;
                 planner_.pop_front();
                 if (was_probe) {
-                    char buf[96];
                     out("[PRB:" + values(pos) + ":0]");
                     finishCompletion();
                 }
@@ -798,7 +797,6 @@ private:
             return true;
         }
         if (line == "$#") {
-            char buf[96];
             out("[G54:" + values(g54) + "]");
             out("[G55:" + values({}) + "]");
             out("[G28:0.000,0.000,0.000]");

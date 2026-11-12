@@ -37,6 +37,8 @@ public:
 private:
 #ifdef _WIN32
     void* handle_ = nullptr;
+    void* read_event_ = nullptr;  // Overlapped I/O events, one per direction (reads on the reader thread,
+    void* write_event_ = nullptr; // writes from any thread under write_mutex_)
 #else
     int fd_ = -1;
 #endif

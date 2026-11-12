@@ -1,4 +1,6 @@
 #include "ui_common/app_dir.h"
+#include "core/util/app_paths.h"
+#include "core/util/utf8_path.h"
 #include <cstring>
 #include <filesystem>
 #include <vector>
@@ -11,38 +13,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#include <cstdint>
+#include <shellapi.h>
 #endif
 
 namespace rnr::ui {
-
-namespace {
-std::filesystem::path executablePath() {
-#ifdef _WIN32
-    std::vector<wchar_t> buf(MAX_PATH);
-    while (true) {
-        const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
-        if (n == 0) return {};
-        if (n < buf.size()) return std::filesystem::path(std::wstring(buf.data(), n));
-        buf.resize(buf.size() * 2);
-    }
-#elif defined(__APPLE__)
-    uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size);
-    std::vector<char> buf(size + 1, '\0');
-    if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
-    std::error_code ec;
-    const auto p = std::filesystem::canonical(buf.data(), ec);
-    return ec ? std::filesystem::path(buf.data()) : p;
-#else
-    std::error_code ec;
-    const auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
-    return ec ? std::filesystem::path{} : p;
-#endif
-}
-} // namespace
 
 bool hasCommandLineFlag(int argc, char** argv, const char* flag) {
     for (int i = 1; i < argc; ++i) {
@@ -53,14 +27,31 @@ bool hasCommandLineFlag(int argc, char** argv, const char* flag) {
 
 std::string enterExecutableDirectory(int argc, char** argv) {
     std::error_code ec;
-    std::string arg_file;
+    std::string arg_file; // UTF-8
+#ifdef _WIN32
+    // argv is in the ANSI code page, which cannot hold every file name: read the wide command line instead
+    (void)argc;
+    (void)argv;
+    int wargc = 0;
+    if (LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc)) {
+        for (int i = 1; i < wargc; ++i) {
+            const std::wstring a = wargv[i];
+            if (a.empty() || a.rfind(L"--", 0) == 0) continue;
+            const auto abs = std::filesystem::absolute(std::filesystem::path(a), ec);
+            arg_file = util::pathToUtf8(ec ? std::filesystem::path(a) : abs);
+            break;
+        }
+        LocalFree(wargv);
+    }
+#else
     for (int i = 1; i < argc; ++i) {
         if (!argv[i] || argv[i][0] == '\0' || std::strncmp(argv[i], "--", 2) == 0) continue;
         const auto abs = std::filesystem::absolute(argv[i], ec);
         arg_file = ec ? std::string(argv[i]) : abs.string();
         break;
     }
-    const auto exe = executablePath();
+#endif
+    const auto exe = util::executablePath();
     if (!exe.empty()) {
         std::filesystem::current_path(exe.parent_path(), ec); // On failure keep the current folder
     }

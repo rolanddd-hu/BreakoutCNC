@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 
 #ifdef _WIN32
@@ -91,6 +92,16 @@ bool SerialPort::open(const ConnectionTarget& target, const StreamOptions& optio
         return false;
     }
     PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+    read_event_  = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    write_event_ = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!read_event_ || !write_event_) {
+        if (read_event_) CloseHandle(static_cast<HANDLE>(read_event_));
+        if (write_event_) CloseHandle(static_cast<HANDLE>(write_event_));
+        read_event_ = write_event_ = nullptr;
+        CloseHandle(h);
+        if (error) *error = "Cannot open " + port + " (out of system resources)";
+        return false;
+    }
     handle_ = h;
     return true;
 }
@@ -101,6 +112,9 @@ void SerialPort::close() {
         CancelIoEx(static_cast<HANDLE>(handle_), nullptr);
         CloseHandle(static_cast<HANDLE>(handle_));
         handle_ = nullptr;
+        CloseHandle(static_cast<HANDLE>(read_event_));
+        CloseHandle(static_cast<HANDLE>(write_event_));
+        read_event_ = write_event_ = nullptr;
     }
 }
 
@@ -112,8 +126,7 @@ long SerialPort::read(uint8_t* buf, size_t max, uint32_t timeout_ms) {
     HANDLE h = static_cast<HANDLE>(handle_);
     if (!h) return -1;
     OVERLAPPED ov{};
-    ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    if (!ov.hEvent) return -1;
+    ov.hEvent = static_cast<HANDLE>(read_event_); // ReadFile resets it
     DWORD got = 0;
     long result = 0;
     if (ReadFile(h, buf, static_cast<DWORD>(max), &got, &ov)) {
@@ -132,7 +145,6 @@ long SerialPort::read(uint8_t* buf, size_t max, uint32_t timeout_ms) {
     } else {
         result = -1;
     }
-    CloseHandle(ov.hEvent);
     if (result == 0 && got == 0) {
         // The device may have gone away: a removed USB adapter keeps returning 0 bytes on some drivers
         DWORD errors = 0;
@@ -147,8 +159,7 @@ bool SerialPort::write(const uint8_t* data, size_t n) {
     HANDLE h = static_cast<HANDLE>(handle_);
     if (!h) return false;
     OVERLAPPED ov{};
-    ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    if (!ov.hEvent) return false;
+    ov.hEvent = static_cast<HANDLE>(write_event_); // WriteFile resets it
     DWORD written = 0;
     bool ok = false;
     if (WriteFile(h, data, static_cast<DWORD>(n), &written, &ov)) {
@@ -156,7 +167,6 @@ bool SerialPort::write(const uint8_t* data, size_t n) {
     } else if (GetLastError() == ERROR_IO_PENDING) {
         ok = GetOverlappedResult(h, &ov, &written, TRUE) && written == n;
     }
-    CloseHandle(ov.hEvent);
     if (ok && options_.drain_writes) FlushFileBuffers(h);
     return ok;
 }
@@ -201,12 +211,23 @@ std::vector<SerialPortInfo> SerialPort::enumerate() {
             const std::string com = f.substr(open_paren + 1, close_paren - open_paren - 1);
             std::string desc = f.substr(0, open_paren);
             while (!desc.empty() && desc.back() == ' ') desc.pop_back();
+            bool listed = false;
             for (auto& p : ports) {
-                if (p.name == com) p.description = desc;
+                if (p.name == com) {
+                    p.description = desc;
+                    listed = true;
+                }
             }
+            if (!listed && com.rfind("COM", 0) == 0) ports.push_back({com, desc}); // Above COM128
+
         }
         SetupDiDestroyDeviceInfoList(devs);
     }
+    // COM2 before COM10
+    std::sort(ports.begin(), ports.end(), [](const SerialPortInfo& a, const SerialPortInfo& b) {
+        const int na = std::atoi(a.name.c_str() + 3), nb = std::atoi(b.name.c_str() + 3);
+        return na != nb ? na < nb : a.name < b.name;
+    });
     return ports;
 }
 

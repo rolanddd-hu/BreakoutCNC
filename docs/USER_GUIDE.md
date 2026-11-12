@@ -94,7 +94,7 @@ Keyboard:
 
 | Key | Action |
 |---|---|
-| **Esc** | E-stop, whatever has keyboard focus |
+| **Esc** | E-stop while the machine moves or a job is paused, whatever has keyboard focus. At rest, Esc first closes an open dropdown or leaves a text field |
 | Arrow keys | Jog X / Y |
 | Page Up / Page Down | Jog Z |
 | Home / End | Jog A+ / A- (BreakoutMill, when A is not slaved to another axis) |
@@ -110,7 +110,9 @@ Keyboard:
   and the current speed.
 - **Zero X / Y / Z / A** sets the work zero of that axis at the current position (in the active work offset, G54 by
   default). **ZERO ALL** does all axes.
-- **H** homes one axis, **HOME ALL** runs the homing sequence (`scripts/mill/home_all.lua`).
+- **H** homes one axis, **HOME ALL** homes Z, then Y, then X with the built-in homing cycle. With **Home script**
+  ticked (Scripts & Macros, Hooks), HOME ALL runs `scripts/mill/home_all.lua` (BreakoutCut:
+  `scripts/cut/home_all.lua`) instead; the H buttons always use the built-in cycle.
 - **GO TO ZERO** moves to the work zero, **PROBE Z** opens the Z touch-off dialog.
 - **Jog:** *Continuous Hold* moves while a button or key is held, *Step Increment* moves a fixed distance per press.
   **Jog Speed** scales the jog feed. Several axes can be jogged at once from the keyboard. In continuous mode, hold
@@ -554,7 +556,9 @@ Plasma programs from SheetCam and similar CAM programs use M3 / M5 to fire the t
 
 - *Laser Power:* source type presets, **Dynamic Laser Power (M4)** (power follows the speed, so
   corners do not burn), **Ignore G-Code Z Moves** (fixed focus height), min / max duty and the live power override.
-  Programs use `S0`–`S1000` for 0–100 % power.
+  Programs use `S0`–`S1000` for 0–100 % power; set **S for 100% Power** to 255 if your CAM writes `S0`–`S255`. `S0`
+  switches the beam off (LightBurn and LaserGRBL use it for overscan and white pixels); a program without any S word
+  cuts at full power. The program check warns about S values above the 100 % value.
 - *Laser Alignment & Framing:* **FRAME JOB BOUNDING BOX** traces the job outline, so you can position the
   material: with a low-power beam, the red-dot pointer (OUT2), both, or motion only. **FIRE TEST PULSE** gives a short
   pulse (duration and power set above it) for focusing.
@@ -580,10 +584,23 @@ dialog, or use **Button Color** in the right-click menu (also on pinned buttons)
 
 *Camera & Remote View* (BreakoutMill) / *Remote View* (BreakoutCut): a camera can be
 shown under the toolpath (with calibration so the toolpath lines up with the workpiece), and a small web server can
-stream it (`http://<pc>:8080/stream` by default) together with the job state and a remote E-stop.
+stream it together with the job state and a remote E-stop. Open the **URL** shown in the panel
+(`http://<pc address>:8080` by default) in a browser on the same network.
 
-> The web server has **no password**: enable it only on a network you trust. Uploading G-code from the browser is a
-> separate option and off by default.
+- **Listen on**: *All networks*, only one of the PC's network addresses (for example the shop network but not the
+  office WiFi), or *This PC only*.
+- **Access code**: when set, the page asks for it once per browser session; changing it signs every viewer out. Five
+  wrong codes from one device lock that device out for a minute. The code is stored in the settings file as plain
+  text: it keeps casual visitors out, it is not a strong password. Without a code, anyone who can reach the PC on the
+  selected network can watch the camera and press the remote E-stop.
+- **Allow remote G-code upload** is a separate option and off by default. Uploads are refused while a job is running
+  or paused, and the file name is reduced to safe characters.
+- Other web sites cannot use the server through your browser: it only answers to the PC's address or name, and the
+  E-stop and upload only work from its own page.
+- At most four browsers can watch the camera at once, so the page and the E-stop always get through.
+
+> The remote E-stop depends on the network and the browser: it is **not a safety device**. Keep the machine's own
+> E-stop within reach. Do not make the server reachable from the internet (port forwarding).
 
 ## 12. Troubleshooting and getting help
 

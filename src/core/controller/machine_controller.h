@@ -43,6 +43,7 @@ public:
     void setDryRunMode(bool enabled) override;
     void applyConfig(const MachineConfig& cfg) override;
     MachineConfig getConfig() const override;
+    std::shared_ptr<const MachineConfig> getConfigShared() const override;
     TelemetrySnapshot getTelemetry() const override;
 
     void triggerEStop() override;
@@ -92,6 +93,8 @@ public:
 
     void homeAxis(core::Axis axis) override;
     void homeAllAxes() override;
+    void homeAxisBuiltIn(core::Axis axis) override { homeAxis(axis); }
+    void homeAllAxesBuiltIn() override;
     void probeAxis(core::Axis axis, double max_travel_mm, double feed_mm_min) override;
     void probeZWithToolSetter() override;
     void probeWorkAxisEdge(core::Axis axis, bool positive_dir) override;
@@ -123,6 +126,7 @@ public:
     void stopJob() override;
     void setFeedOverride(float percent) override;
     void setPierceDelayOverride(float seconds) override;
+    // Test accessor: copies the whole queue under the lock (never call it from the UI)
     std::deque<planner::PlannedSlice> getSliceQueue() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return slice_queue_;
@@ -197,6 +201,14 @@ private:
     void closeProgramRunLocked();
     void finishQueueLocked();
     void updateSpindleLocked(bool gcode_running);
+    // Spindle speed: the range without a VFD is 0..kDefaultSpindleMaxRpm
+    uint32_t spindleMaxRpmLocked() const noexcept;
+    // The commanded speed changed: PWM duty (mill only; BreakoutCut's PWM is the laser power), the board's PWM output
+    // (send_pwm) and the VFD follow
+    void applyCommandedRpmLocked(uint32_t rpm, bool send_pwm);
+    // A program / MDI S word: it becomes the commanded speed unless the operator overrides it. reset_override = the
+    // S word cancels the operator's override (MDI, a newly loaded program)
+    void setProgramSpindleRpmLocked(uint16_t rpm, bool reset_override, bool send_pwm);
     void updateContinuousJogLocked();
 
     void faultLocked(const std::string& message, ControllerState state = ControllerState::EStop);
@@ -214,6 +226,24 @@ private:
     void bumpWorkspaceRevisionLocked() noexcept { config_.workspace_revision++; }
 
     bool motionActiveLocked() const noexcept;
+    // A job is running or paused (feed hold, M0). include_tool_change: also while it waits at an M6. Commands that
+    // only need the machine at rest (zeroing, offsets) are allowed at an M6; the program, height map and settings
+    // must not change under a job waiting there.
+    bool jobActiveLocked(bool include_tool_change) const noexcept;
+    // State after a move or a probe ends: ToolChangeHold while a tool change waits, else Idle
+    ControllerState restStateLocked() const noexcept;
+    // Door closed, chiller flowing and no PSU fault (inputs that are not configured count as fine)
+    bool laserInterlocksOkLocked() const noexcept;
+    // Manual moves (go to zero, retracts, tool change park): planned as plain machine moves, no laser rules
+    std::deque<planner::PlannedSlice> planManualMovesLocked(const std::vector<ToolpathSegment>& moves) const;
+    // M6: runs the M6 script when it is enabled and found (it continues the job itself); false = not started
+    bool runM6ScriptLocked();
+    // Description of a tool from the program's comments ("(T2 D=6 flat end mill)"), empty if none
+    std::string toolDescriptionLocked(uint16_t tool) const;
+    // Retract to the tool change height and the optional park position (within the soft limits)
+    std::vector<ToolpathSegment> toolChangeMovesLocked();
+    // Starts / stops the VFD driver to match config_.vfd. Takes the controller lock itself: never call it holding it.
+    void syncVfd();
     bool readyForCommandLocked(bool allow_tool_change_hold, const char* what);
     bool evaluatePinStateLocked(uint8_t pin_1_to_12, bool invert) const noexcept;
     bool anyLimitActiveLocked(std::string* desc) const;
@@ -252,6 +282,8 @@ private:
     void reparseLoadedProgramIfNeeded(bool wait = true);
 
     // Homing
+    // axis < 0: all axes (Z, Y, X). Never runs the home script.
+    void startBuiltInHomingLocked(int axis);
     void startNextHomingAxisLocked();
     void homingTickLocked();
     bool homeSwitchActiveLocked(size_t axis) const;
@@ -268,11 +300,15 @@ private:
     // Serializes program re-parses so a slower, older one can never replace a newer result; taken before mutex_
     std::mutex reparse_mutex_;
     MachineConfig config_{};
+    mutable std::shared_ptr<const MachineConfig> config_snapshot_; // getConfigShared(): replaced when config_ differs
     MachineConfig pending_config_{};
     bool          has_pending_config_ = false;
     std::unique_ptr<board::IBoardDriver> board_;
     size_t max_slices_in_flight_ = 3; // Unacknowledged slices kept on the board (from its capabilities)
     HuanyangVfdController vfd_controller_{};
+    std::atomic<bool>     vfd_sync_needed_{false};   // config_.vfd changed: syncVfd() after releasing mutex_
+    std::mutex            vfd_lifecycle_mutex_;      // Serializes syncVfd() (UI thread and worker)
+    float                 queued_feed_override_pct_ = 100.0f; // Override the queued slices were planned with
     TelemetrySnapshot telemetry_{};
     uint16_t hw_inputs_bitmask_ = 0;
 

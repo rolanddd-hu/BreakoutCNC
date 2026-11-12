@@ -268,7 +268,7 @@ else
     cnc.prompt("Job Log", "Could not open job_log.csv for writing.", {"OK"})
 end)LUA";
 
-inline constexpr const char* kHookM6 = R"LUA(-- scripts/mill/m6.lua  (Settings > Lua Scripting > M6 script)
+inline constexpr const char* kHookM6 = R"LUA(-- scripts/mill/m6.lua  (Scripts & Macros > Hooks > M6 script)
 local new_tool = cnc.get_pending_tool()
 
 cnc.set_spindle(false)

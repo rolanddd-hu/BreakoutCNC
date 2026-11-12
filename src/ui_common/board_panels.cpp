@@ -1,4 +1,5 @@
 #include "ui_common/board_panels.h"
+#include "core/util/utf8_path.h"
 #include "breakout_version.h"
 #include "core/board/board_registry.h"
 #include "core/transport/serial_port.h"
@@ -61,7 +62,7 @@ void renderNotUsedByBoardNote(const char* what, const board::BoardCapabilities& 
 void renderBoardSelector(core::IMotionController& controller, const core::TelemetrySnapshot& telemetry,
                          const std::function<void()>& on_settings_changed) {
     const auto& reg = board::BoardRegistry::instance();
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     const auto* current = reg.find(cfg.board_id);
     const bool can_change = machineAtRest(telemetry);
 
@@ -428,7 +429,7 @@ void renderFirmwareSettings(core::IMotionController& controller, const core::Tel
         const std::string file = openFileDialog("Restore board settings", "Text files (*.txt)\0*.txt\0All files\0*.*\0",
                                                 {"*.txt"});
         if (!file.empty()) {
-            std::ifstream ifs(file);
+            std::ifstream ifs(util::pathFromUtf8(file));
             std::string line;
             size_t n = 0;
             while (std::getline(ifs, line)) {

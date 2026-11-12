@@ -389,7 +389,7 @@ void ToolpathViewport::render(
 
     // Check active Top-Down Camera state (BreakoutMill)
     const bool has_top_down_cam = (camera_mgr_ != nullptr && camera_mgr_->isRoleActive(core::CameraRole::TopDown));
-    const core::CameraConfig cam_cfg = controller ? controller->getConfig().camera : core::CameraConfig{};
+    const core::CameraConfig cam_cfg = controller ? controller->getConfigShared()->camera : core::CameraConfig{};
 
     if (!has_top_down_cam) {
         camera_calibrating_     = false;
@@ -1000,7 +1000,7 @@ void ToolpathViewport::render(
         return std::ceil(text_w(label) + text_w(value) + 28.0f);
     };
 
-    const bool is_imp = (controller && controller->getConfig().linear_units == core::LinearUnits::Imperial);
+    const bool is_imp = (controller && controller->getConfigShared()->linear_units == core::LinearUnits::Imperial);
     const double b_scale = is_imp ? (1.0 / 25.4) : 1.0;
     char bounds_val[64];
     if (is_imp) {

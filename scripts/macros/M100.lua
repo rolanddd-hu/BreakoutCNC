@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Custom Macro M100: Engage Pneumatic Clamp / Vacuum
+-- BreakoutCNC - Custom Macro M100: Engage Pneumatic Clamp / Vacuum
 -- Actuates auxiliary output OUT2
 -- ============================================================================
 

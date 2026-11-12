@@ -37,10 +37,15 @@ public:
     GrblProtocol(const GrblProtocol&) = delete;
     GrblProtocol& operator=(const GrblProtocol&) = delete;
 
+    // The stream is opened on the reader thread (a TCP connect can take seconds; the caller holds the machine lock):
+    // open() returns at once, connecting() is true until the stream is open, and a failure shows as linkFailed()
+    // with openError(). Lines and real-time bytes are not sent while connecting.
     bool open(std::unique_ptr<transport::IByteStream> stream, const transport::ConnectionTarget& target,
               const transport::StreamOptions& options, std::string* error);
     void close();
     bool isOpen() const { return stream_ != nullptr; }
+    bool connecting() const { return connecting_.load(std::memory_order_acquire); }
+    std::string openError() const;
     bool linkFailed() const { return link_failed_.load(); }
     bool accessesRealHardware() const { return stream_ && stream_->accessesRealHardware(); }
     void setControlLines(bool dtr, bool rts);
@@ -71,6 +76,10 @@ private:
     std::thread reader_;
     std::atomic<bool> reader_run_{false};
     std::atomic<bool> link_failed_{false};
+    std::atomic<bool> connecting_{false};
+    transport::ConnectionTarget target_;
+    transport::StreamOptions    options_;
+    std::string                 open_error_; // Guarded by queue_mutex_
 
     mutable std::mutex queue_mutex_;
     std::deque<std::string> queue_;

@@ -390,6 +390,7 @@ const ApiEntry kApi[] = {
     {"Position", "cnc.zero_axis(axis)  /  cnc.zero_all()", "Sets the work coordinate of \"X\", \"Y\", \"Z\" or \"A\" (or all) to 0 at the current position. Refused while a job is active."},
     {"Position", "cnc.set_work_pos(axis, value)", "The current position of the axis reads `value` (G92-style, adjusts the active work offset)."},
     {"Position", "cnc.is_homed(axis)", "true when the axis was homed in this session."},
+    {"Motion", "cnc.home(axis)  /  cnc.home()", "Starts the built-in homing cycle for one axis or all axes (Z, Y, X). Follow with cnc.wait_idle(). Raises an error when homing is refused."},
     {"Spindle & I/O", "cnc.set_spindle(on)  /  cnc.is_spindle_on()", "Spindle on/off (OUT1 unless moved in Inputs & Outputs). Refused in E-STOP and dry run; a configured but silent VFD trips E-STOP."},
     {"Spindle & I/O", "cnc.set_spindle_rpm(rpm)  /  cnc.get_spindle_rpm()", "Commanded speed; clamped to the VFD min/max RPM."},
     {"Spindle & I/O", "cnc.set_torch(on)  /  cnc.is_torch_on()", "Plasma torch (same output channel as the spindle)."},
@@ -615,9 +616,11 @@ void LuaGuide::renderHooksTab() {
          "cnc.estop(). The shipped m6.lua already handles both tool length modes.");
 
     heading("HOMING HOOK");
-    paragraph("With 'Home script' enabled, the HOME buttons run scripts/mill/home_all.lua instead of the built-in "
-              "homing cycle. The built-in cycle (switch search, zero, pull-off) is recommended unless you need "
-              "a special order or squaring routine.");
+    paragraph("With 'Home script' ticked (Scripts & Macros, Hooks), HOME ALL runs home_all.lua instead of the built-in "
+              "homing cycle; the H buttons of single axes always use the built-in cycle. In the script, cnc.home(\"Z\") "
+              "homes one axis and cnc.home() all of them with the built-in cycle; follow each with cnc.wait_idle(). "
+              "The built-in cycle (switch search, zero, pull-off) is recommended unless you need a special order or "
+              "squaring routine.");
 
     heading("M-CODE MACROS (M100 - M999)");
     paragraph("A file scripts/macros/M<number>.lua runs when that M-code is entered in MDI (or bound to a macro "

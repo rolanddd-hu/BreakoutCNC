@@ -3,6 +3,7 @@
 #include "core/camera/camera_manager.h"
 #include "core/camera/camera_stream_server.h"
 #include "ui_common/toolpath_viewport.h"
+#include <string>
 #include <vector>
 
 namespace rnr::ui {
@@ -26,6 +27,8 @@ private:
     bool                                  devices_initialized_ = false;
     int                                   cal_step_            = 0; // 0 = Step 1 (XY Offset), 1 = Step 2 (FOV)
     int                                   fov_method_          = 0; // 0 = Method A (Move & Click), 1 = Method B (Tape Measure)
+    std::vector<std::string>              local_ips_;          // Listen address choices (read when the list opens)
+    bool                                  listen_combo_open_   = false;
 };
 
 } // namespace rnr::ui

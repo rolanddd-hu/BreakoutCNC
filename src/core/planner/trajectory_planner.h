@@ -22,7 +22,7 @@ struct PlannedSlice {
     double                tlo_mm            = 0.0;               // ...and its length (0 outside tool table mode)
     uint16_t              tool_number       = 1;
     uint16_t              spindle_rpm       = 0;
-    std::string           tool_description;
+    bool                  spindle_s_set     = false; // S word programmed (S0 = laser beam off)
     uint8_t               workspace_index   = 0;
 };
 
@@ -140,6 +140,9 @@ private:
     };
     std::deque<RecentMove> recent_moves_;
     bool                   recent_moves_partial_ = false;
+    // plan() working buffers, kept between calls (no allocations in the motion tick once grown)
+    std::vector<MotionItem> win_buf_;
+    std::vector<double>     junction_buf_, v_exit_buf_, v_entry_max_buf_;
     std::array<double, 4>  prev_unit_{};
     const core::ToolpathSegment* last_motion_meta_ = nullptr;
     uint8_t                last_motion_mask_ = 0;

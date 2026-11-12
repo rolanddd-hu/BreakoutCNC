@@ -483,6 +483,39 @@ void testArcs() {
                 first + count - 1);
 }
 
+// Review finding A1: a programmed S0 in laser mode reaches the board as S0 (beam off), not as the previous power
+void testLaserS0() {
+    std::printf("[Test 6e] Laser: S0 is sent as S0...\n");
+    Rig r(FakeGrbl::Flavour::Grbl11, board::kGrblBoardId, [](FakeGrbl& g) { g.setSetting(32, "1"); });
+    auto cfg = r.c->getConfig();
+    cfg.is_mill = false;
+    cfg.operation_mode = core::OperationMode::Laser;
+    cfg.laser.chiller_flow_pin = cfg.laser.door_interlock_pin = cfg.laser.laser_fault_pin = 0;
+    cfg.thc.enabled = false;
+    r.c->applyConfig(cfg);
+    CHECK(r.ready());
+    CHECK(r.c->loadGCodeString("G21 G90\nM4 S500\nG1 X10 F1200\nG1 X20 S0\nG1 X30 S500\nM5\n"));
+    r.c->startJob();
+    const bool started = waitFor([&] { return r.t().state == core::ControllerState::RunningGCode; }, 2000);
+    CHECK(started);
+    if (!started) std::printf("    fault: %s\n", r.t().active_fault_message.c_str());
+    CHECK(r.idle(15000));
+    const auto lines = r.g->receivedLines();
+    int s500_before = -1, s0 = -1, s500_after = -1;
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        const bool has0 = lines[i].find("S0") != std::string::npos && lines[i].find("S0.") == std::string::npos;
+        const bool has500 = lines[i].find("S500") != std::string::npos;
+        if (has500 && s0 < 0) s500_before = i;
+        if (has0 && s500_before >= 0 && s0 < 0) s0 = i;
+        if (has500 && s0 >= 0) s500_after = i;
+    }
+    CHECK(s500_before >= 0 && s0 > s500_before && s500_after > s0);
+    if (!(s500_before >= 0 && s0 > s500_before && s500_after > s0)) {
+        for (const auto& l : lines) std::printf("    sent: %s\n", l.c_str());
+    }
+    std::printf("  -> done\n");
+}
+
 void testBoardThc() {
     std::printf("[Test 6c] Plasma with torch height control on the board (grblHAL plasma plugin)...\n");
     {
@@ -900,6 +933,7 @@ int main() {
     testJob();
     testLineTracking();
     testArcs();
+    testLaserS0();
     testBoardThc();
     testHoldStopEstop();
     testErrorsAndRestart();

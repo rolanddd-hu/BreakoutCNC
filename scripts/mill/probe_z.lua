@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Z Tool Setter Touch-Off Routine (probe_z.lua)
+-- BreakoutCNC - Z Tool Setter Touch-Off Routine (probe_z.lua)
 -- ============================================================================
 
 local PLATE_THICKNESS_MM = 15.0
