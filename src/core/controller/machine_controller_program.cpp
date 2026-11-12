@@ -11,7 +11,7 @@ using namespace mc_detail;
 void MachineController::setProgramLocked(std::shared_ptr<const gcode::ParseResult> program) {
     program_ = program ? std::move(program) : std::make_shared<const gcode::ParseResult>();
     telemetry_.total_segments = program_->segments.size();
-    job_planner_.reset();
+    slice_->dropJobPlanLocked();
 }
 
 std::shared_ptr<const gcode::ParseResult> MachineController::getProgram() const {
@@ -67,7 +67,7 @@ bool MachineController::loadGCodeString(const std::string& gcode_text) {
     telemetry_.job_elapsed_seconds     = 0.0;
     telemetry_.pending_tool_number     = 0;
     telemetry_.pending_tool_description.clear();
-    slice_queue_.clear();
+    slice_->clearQueuedMotion();
 
     if (parsed->hasErrors()) {
         telemetry_.active_fault_message = "Program has " + std::to_string(parsed->errors.size()) +
@@ -122,7 +122,6 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
         return false;
     }
     const double unit_scale = hasG(20) || hasG(70) ? 25.4 : 1.0;
-    const bool laser = (config_.operation_mode == OperationMode::Laser && !config_.is_mill);
 
     // Custom M-code macros M100..M999 (e.g. M101.lua)
     for (const auto& w : words) {
@@ -323,21 +322,9 @@ bool MachineController::executeMdiCommand(const std::string& gcode_line) {
         seg.workspace_index = telemetry_.active_workspace;
         moves.push_back(seg);
     }
-    if (!moves.empty() && fwActiveLocked()) {
-        mdi_accepted = fwStartManualMovesLocked(moves, ControllerState::Jogging);
-        return mdi_accepted;
-    }
     if (!moves.empty()) {
-        MachineConfig mdi_cfg = config_;
-        if (!laser) mdi_cfg.is_mill = true;
-        slice_queue_ = planner::TrajectoryPlanner::sliceProgram(
-            moves, mdi_cfg, telemetry_.feed_override_pct, 0.0f, telemetry_.dry_run_mode, kDtSec);
-        if (!slice_queue_.empty()) {
-            if (board_->isOpen() && !telemetry_.simulator_mode) {
-                board_->beginJog(Axis::X, config_.limit_override);
-            }
-            telemetry_.state = ControllerState::Jogging;
-        }
+        mdi_accepted = motionLocked().startManualMoves(moves, ControllerState::Jogging, ManualMovePlan::Mdi);
+        return mdi_accepted;
     }
     mdi_accepted = true;
     return true;
@@ -371,16 +358,10 @@ void MachineController::setNextGCodeLine(size_t line_index) {
         }
     }
     telemetry_.active_segment_index = target_seg;
-    last_sent_program_segment_valid_ = false;
-
-    if (telemetry_.state == ControllerState::PausedHold ||
-        telemetry_.state == ControllerState::ToolChangeHold)
-    {
-        slice_queue_.clear();
-        job_planner_.reset();
-        hold_needs_replan_ = false;
-        telemetry_.state = ControllerState::Idle;
-    }
+    const bool discard_held_job = telemetry_.state == ControllerState::PausedHold ||
+                                  telemetry_.state == ControllerState::ToolChangeHold;
+    slice_->forgetJobPositionLocked(discard_held_job);
+    if (discard_held_job) telemetry_.state = ControllerState::Idle;
 }
 
 // ============================================================================
@@ -398,6 +379,8 @@ planner::FrameContext MachineController::jobFrameLocked() const {
         }
         f.inherit_tlo_mm = telemetry_.active_tlo_mm;
     }
+    // Shares the program's table: stays valid while a job holds the frame, even if a new program is loaded
+    f.machine_targets = std::shared_ptr<const std::vector<MachineTarget>>(program_, &program_->machine_targets);
     return f;
 }
 
@@ -421,7 +404,7 @@ bool MachineController::validateProgramForRunLocked(size_t start_seg) {
     in.simulator        = telemetry_.simulator_mode;
     in.start_segment    = start_seg;
     in.include_warnings = false;
-    in.board_thc        = fwActiveLocked() && fw_->boardRunsThc();
+    in.board_thc        = motionLocked().boardRunsThc();
     fillBoardLimitsLocked(in.board);
     const auto check = checkProgramAgainstMachine(prog, config_, in);
     if (!check.start_refusal.empty()) {
@@ -474,34 +457,10 @@ bool MachineController::ProgramCheckKey::operator==(const ProgramCheckKey& o) co
            config_revision == o.config_revision && tool_revision == o.tool_revision &&
            frame.enabled == o.frame.enabled && frame.workspace_offsets == o.frame.workspace_offsets &&
            frame.plan_workspace == o.frame.plan_workspace && frame.apply_tool_lengths == o.frame.apply_tool_lengths &&
-           frame.tool_lengths == o.frame.tool_lengths && frame.inherit_tlo_mm == o.frame.inherit_tlo_mm;
+           frame.tool_lengths == o.frame.tool_lengths && frame.inherit_tlo_mm == o.frame.inherit_tlo_mm &&
+           frame.machine_targets == o.frame.machine_targets;
 }
 
-void MachineController::rebuildPlannedSlicesLocked(size_t start_from_segment, bool resume_in_place) {
-    slice_queue_.clear();
-    job_planner_.reset();
-    const auto& segs = program_->segments;
-    if (segs.empty() || start_from_segment >= segs.size()) {
-        return;
-    }
-
-    job_frame_ = jobFrameLocked();
-    size_t program_first = start_from_segment;
-    std::array<double, 4> plan_start{};
-    std::vector<ToolpathSegment> prefix = buildJobPrefixLocked(start_from_segment, resume_in_place, program_first, plan_start);
-
-    planner::PlannerOptions opts;
-    opts.feed_override_pct       = telemetry_.feed_override_pct;
-    opts.pierce_delay_override_s = telemetry_.pierce_delay_override_s;
-    opts.dry_run_no_torch        = telemetry_.dry_run_mode;
-    opts.slice_dt_sec            = kDtSec;
-    job_planner_ = std::make_unique<planner::StreamingPlanner>(config_, plan_start, opts, job_frame_);
-    queued_feed_override_pct_ = opts.feed_override_pct;
-    job_planner_->setSource(std::move(prefix),
-                            std::shared_ptr<const std::vector<ToolpathSegment>>(program_, &program_->segments),
-                            program_first);
-    job_planner_->plan(slice_queue_, kRefillAmount * 2);
-}
 
 
 // Approach moves before a job (start lift to safe Z, Run From Line, resume in place), in the planning frame of
@@ -625,7 +584,7 @@ std::vector<ToolpathSegment> MachineController::buildJobPrefixLocked(size_t star
             non_motion.start_xyza_mm = cur;
             non_motion.end_xyza_mm   = cur;
             non_motion.workspace_index = plan_ws;
-            non_motion.machine_axes_mask = 0;
+            non_motion.machine_target = kNoMachineTarget;
             non_motion.tlo_tool = 0;
             prefix.push_back(non_motion);
         }
@@ -702,56 +661,7 @@ std::vector<ToolpathSegment> MachineController::buildJobPrefixLocked(size_t star
     return prefix;
 }
 
-void MachineController::refillJobQueueLocked() {
-    if (!job_planner_ || job_planner_->finished() || hold_decel_active_) return;
-    const auto s = telemetry_.state;
-    if (s != ControllerState::RunningGCode && s != ControllerState::DwellPierce) return;
-    if (slice_queue_.size() >= kRefillThreshold) return;
-    job_planner_->plan(slice_queue_, kRefillAmount);
-}
 
-void MachineController::replanFromQueueTailLocked() {
-    // Keep a short buffer of already-planned slices and re-plan everything after it with the new feed
-    if (!job_planner_ || hold_decel_active_ || slice_queue_.size() <= kOverrideKeepSlices) return;
-    const auto& last = slice_queue_[kOverrideKeepSlices - 1];
-    const auto& prev = slice_queue_[kOverrideKeepSlices - 2];
-    if (last.is_dwell || last.is_tool_change || last.is_program_stop || last.is_hold_decel || !last.from_program ||
-        prev.is_dwell || prev.is_tool_change || prev.is_program_stop || !prev.from_program) {
-        return;
-    }
-    if (last.segment_index >= program_->segments.size()) return;
-
-    std::array<double, 4> unit{};
-    double d2 = 0.0;
-    for (size_t a = 0; a < 4; ++a) {
-        unit[a] = last.target_pos_mm[a] - prev.target_pos_mm[a];
-        d2 += unit[a] * unit[a];
-    }
-    const double d = std::sqrt(d2);
-    if (d > 1e-9) {
-        for (auto& u : unit) u /= d;
-    }
-    const double v = d / kDtSec;
-
-    // Remainder of the current segment becomes the prefix of the new planner
-    ToolpathSegment rem = program_->segments[last.segment_index];
-    rem.start_xyza_mm = last.target_pos_mm;
-
-    planner::PlannerOptions opts;
-    opts.feed_override_pct       = telemetry_.feed_override_pct;
-    opts.pierce_delay_override_s = telemetry_.pierce_delay_override_s;
-    opts.dry_run_no_torch        = telemetry_.dry_run_mode;
-    opts.slice_dt_sec            = kDtSec;
-    auto np = std::make_unique<planner::StreamingPlanner>(config_, last.target_pos_mm, opts, job_frame_);
-    np->setSource({rem}, std::shared_ptr<const std::vector<ToolpathSegment>>(program_, &program_->segments),
-                  last.segment_index + 1, true);
-    np->setInitialMotion(v, unit);
-
-    slice_queue_.erase(slice_queue_.begin() + static_cast<std::ptrdiff_t>(kOverrideKeepSlices), slice_queue_.end());
-    job_planner_ = std::move(np);
-    queued_feed_override_pct_ = opts.feed_override_pct;
-    job_planner_->plan(slice_queue_, kRefillAmount);
-}
 
 void MachineController::startJob() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -772,33 +682,11 @@ void MachineController::startJob() {
         return;
     }
 
-    if (telemetry_.state == ControllerState::PausedHold) {
-        if (hold_decel_active_) {
-            // Still decelerating from the hold: resume as soon as the machine has stopped
-            resume_after_hold_ = true;
-            stop_after_hold_   = false;
-            telemetry_.state   = ControllerState::RunningGCode;
-            return;
-        }
-        if (!hold_needs_replan_ && (!slice_queue_.empty() || (job_planner_ && !job_planner_->finished()))) {
-            telemetry_.state = ControllerState::RunningGCode; // M0 / M1 resume: continue the queued motion
-            telemetry_.active_fault_message.clear();
-            return;
-        }
-    }
-
-    bool fw_m0_resume = false;
-    if (fwActiveLocked() && telemetry_.state == ControllerState::PausedHold) {
-        if (fw_->jobActive()) {
-            // Feed hold on the board: cycle start continues the buffered motion
-            fw_->resume();
-            telemetry_.state = ControllerState::RunningGCode;
-            telemetry_.active_fault_message.clear();
-            fw_state_grace_until_ = Clock::now() + std::chrono::milliseconds(400);
-            return;
-        }
-        fw_m0_resume = fw_program_stop_;
-    }
+    auto& motion = motionLocked();
+    const bool paused = telemetry_.state == ControllerState::PausedHold;
+    // Feed hold still decelerating, an M0 with motion queued, or a hold on a firmware board: continue that motion
+    if (paused && motion.resumeHeldJob()) return;
+    const ResumePoint resume = paused ? motion.pausedResumePoint() : ResumePoint{};
 
     if (telemetry_.state != ControllerState::Idle &&
         telemetry_.state != ControllerState::PausedHold &&
@@ -806,33 +694,26 @@ void MachineController::startJob() {
     {
         return;
     }
-    if (cont_jog_active_ || (!slice_queue_.empty() && telemetry_.state == ControllerState::Idle)) {
+    if (cont_jog_active_ || (motion.motionQueued() && telemetry_.state == ControllerState::Idle)) {
         return;
     }
-    if (fwActiveLocked() && (!fw_->ready() || fw_->busyWithMotion())) {
+    if (motion.boardBusy()) {
         telemetry_.active_fault_message = "Cycle Start rejected: the board is busy";
         return;
     }
-    if (fwActiveLocked() && !config_.is_mill && config_.operation_mode == OperationMode::Plasma &&
-        (config_.thc.enabled || config_.thc.wait_for_arc_ok) && !fw_->boardRunsThc()) {
+    if (!config_.is_mill && config_.operation_mode == OperationMode::Plasma &&
+        (config_.thc.enabled || config_.thc.wait_for_arc_ok) && !motion.thcAvailable()) {
         telemetry_.active_fault_message = "Cycle Start rejected: torch height control and Wait for Arc OK need a board "
                                           "with real-time control; switch THC off for this board";
         return;
     }
 
-    const bool resume_in_place = fw_m0_resume ||
-        ((telemetry_.state == ControllerState::PausedHold) && last_sent_from_program_ && !fwActiveLocked());
+    const bool resume_in_place = resume.in_place;
 
     // If resuming from Manual Tool Change Hold (M6), confirm the new tool is installed
     const bool was_tool_hold = (telemetry_.state == ControllerState::ToolChangeHold || telemetry_.pending_tool_number > 0);
 
-    size_t start_seg = telemetry_.active_segment_index;
-    if (fw_m0_resume) {
-        start_seg = fw_resume_segment_;
-    } else if (telemetry_.state == ControllerState::PausedHold && last_sent_program_segment_valid_ && !fwActiveLocked()) {
-        // Resume from the segment that was actually sent last (acknowledgements may lag behind)
-        start_seg = last_sent_program_segment_;
-    }
+    size_t start_seg = resume.has_segment ? resume.segment : telemetry_.active_segment_index;
     if (start_seg >= program_->segments.size()) {
         start_seg = 0;
     }
@@ -867,19 +748,7 @@ void MachineController::startJob() {
     telemetry_.active_segment_index    = start_seg;
     telemetry_.segment_progress_0_to_1 = 0.0f;
 
-    hold_decel_active_ = false;
-    hold_needs_replan_ = false;
-    resume_after_hold_ = false;
-    stop_after_hold_   = false;
-    if (fwActiveLocked()) {
-        fw_program_stop_ = false;
-        if (fwStartJobLocked(start_seg, resume_in_place)) {
-            telemetry_.state = ControllerState::RunningGCode;
-        }
-        return;
-    }
-    rebuildPlannedSlicesLocked(start_seg, resume_in_place);
-    telemetry_.state = slice_queue_.empty() ? ControllerState::Idle : ControllerState::RunningGCode;
+    motion.startJob(start_seg, resume_in_place);
 }
 
 void MachineController::pauseJob() {
@@ -891,61 +760,7 @@ void MachineController::pauseJobLocked() {
     if (telemetry_.state != ControllerState::RunningGCode && telemetry_.state != ControllerState::DwellPierce) {
         return;
     }
-    if (fwActiveLocked()) {
-        // Feed hold on the board: it decelerates on the path; spindle and coolant stay on
-        telemetry_.state = ControllerState::PausedHold;
-        telemetry_.current_feed_mm_min = 0.0;
-        fw_->hold();
-        fw_seen_held_ = false;
-        fw_state_grace_until_ = Clock::now() + std::chrono::milliseconds(400);
-        return;
-    }
-    telemetry_.state = ControllerState::PausedHold;
-    telemetry_.current_feed_mm_min = 0.0;
-    manual_spindle_requested_ = false;
-    if (config_.spindle_ramp_down_s <= 0.01) {
-        spindle_ramp_pct_ = 0.0;
-        telemetry_.spindle_speed_pct = 0.0f;
-        telemetry_.spindle_ramping_up = false;
-        telemetry_.spindle_ramping_down = false;
-        telemetry_.torch_or_spindle_on = false;
-        telemetry_.outputs_bitmask &= ~core::OutputBit::OUT1_TorchOrSpindle;
-        if (outputsLiveLocked()) {
-            setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
-        }
-    }
-    beginHoldDecelLocked(false);
-}
-
-void MachineController::beginHoldDecelLocked(bool stop_after) {
-    if (hold_decel_active_) {
-        if (stop_after) {
-            stop_after_hold_   = true;
-            resume_after_hold_ = false;
-        }
-        return;
-    }
-    job_planner_.reset();
-    hold_needs_replan_ = true;
-    resume_after_hold_ = false;
-    const double v0 = last_sent_target_valid_ ? last_sent_speed_mm_s_ : 0.0;
-    const std::array<double, 4> from = last_sent_target_valid_ ? last_sent_target_ : telemetry_.work_pos_mm;
-    planner::TrajectoryPlanner::planFeedHoldDeceleration(slice_queue_, from, v0, config_, kDtSec);
-    // Planned slices carry outputs; during a hold the torch / laser must not be re-enabled
-    for (auto& s : slice_queue_) {
-        if (telemetry_.state == ControllerState::PausedHold) {
-            s.slice.outputs_mask &= ~core::OutputBit::OUT1_TorchOrSpindle;
-        }
-    }
-    if (slice_queue_.empty()) {
-        hold_decel_active_ = false;
-        if (stop_after) {
-            stopJobLocked(false);
-        }
-    } else {
-        hold_decel_active_ = true;
-        stop_after_hold_   = stop_after;
-    }
+    motionLocked().pauseJob();
 }
 
 void MachineController::stopJobLocked(bool is_estop) {
@@ -954,57 +769,26 @@ void MachineController::stopJobLocked(bool is_estop) {
         script_runner_->cancel();
     }
 
-    if (fwActiveLocked()) {
-        if (is_estop && !suppress_fw_estop_) {
-            fw_->emergencyStop();
-        } else if (!is_estop && fw_->busy()) {
-            fw_->stop();
-        }
-        fw_program_stop_ = false;
-        fw_sync_wait_ = false;
-        fw_outputs_applied_ = 0xFF;
-    }
+    // The active firmware board stops; the slice path is reset in any case (it holds nothing for a firmware board)
+    if (fwActiveLocked()) firmware_->stopMotion(is_estop);
+    slice_->stopMotion(is_estop);
     const bool hw = board_->isOpen() && !telemetry_.simulator_mode;
-    if (hw && is_estop) {
-        // Halt the board first, then the outputs, then drop anything still buffered
-        board_->emergencyStop();
-        setBoardOutputsLocked(0x00, false);
-    }
 
-    slice_queue_.clear();
-    job_planner_.reset();
-    in_flight_seqs_.clear();
-    homing_axis_queue_.clear();
-    homing_phase_              = HomingPhase::None;
     active_probe_mode_         = ProbeMode::None;
     cont_jog_active_           = false;
     cont_jog_held_             = {false, false, false, false};
     cont_jog_target_vel_mm_s_  = {0.0, 0.0, 0.0, 0.0};
-    cont_jog_current_vel_mm_s_ = {0.0, 0.0, 0.0, 0.0};
-    hold_decel_active_         = false;
-    hold_needs_replan_         = false;
-    resume_after_hold_         = false;
-    stop_after_hold_           = false;
-    settle_active_             = false;
     torch_on_duration_s_       = 0.0;
     manual_spindle_requested_  = false;
     pulse_active_              = false;
     air_postflow_timer_s_      = 0.0;
     last_sent_laser_pwm_duty_  = 0xFFFF;
-    last_sent_target_valid_    = false;
-    last_sent_speed_mm_s_      = 0.0;
     telemetry_.live_laser_power_pct = 0.0f;
     telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
     telemetry_.current_feed_mm_min  = 0.0;
     telemetry_.segment_progress_0_to_1 = 0.0f;
     telemetry_.pending_tool_number     = 0;
     telemetry_.pending_tool_description.clear();
-
-    if (hw) {
-        board_->cancelMotion();
-    }
-    program_run_open_     = false; // Cancel ends any open run
-    program_outputs_sent_ = 0xFFFF;
 
     if (is_estop) {
         // Immediate hard cut-off of every output on E-Stop
@@ -1053,51 +837,22 @@ void MachineController::stopJobLocked(bool is_estop) {
 
 void MachineController::stopJob() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (fwActiveLocked() && fw_->busy() && !fw_->stopping()) {
-        // Controlled stop on the board: hold, wait, reset (position kept); JobFinished / MoveDone follow
-        fw_->stop();
-        if (fw_->busy()) {
-            telemetry_.active_fault_message = "Stopping...";
-            return;
-        }
-    }
-    const auto s = telemetry_.state;
-    const bool path_motion = (s == ControllerState::RunningGCode || s == ControllerState::DwellPierce ||
-                              (s == ControllerState::Jogging && !cont_jog_active_) ||
-                              (s == ControllerState::PausedHold && hold_decel_active_));
-    if (path_motion && !slice_queue_.empty() && last_sent_target_valid_ && last_sent_speed_mm_s_ > 0.5) {
-        // Controlled stop: decelerate along the path, then stop (no lost steps)
-        beginHoldDecelLocked(true);
-        return;
-    }
+    // Path motion decelerates first (no lost steps); a firmware board runs its own stop sequence
+    if (motionLocked().controlledStop()) return;
     stopJobLocked();
 }
 
 void MachineController::setFeedOverride(float percent) {
     std::lock_guard<std::mutex> lock(mutex_);
-    float old_pct = telemetry_.feed_override_pct;
     const float max_pct = firmwareBoardSelectedLocked() ? 200.0f : 250.0f;
     telemetry_.feed_override_pct = std::clamp(percent, 10.0f, max_pct);
-    if (fwActiveLocked()) fw_->setFeedOverride(telemetry_.feed_override_pct);
-    (void)old_pct;
-    // Feed override never raises motion above the configured axis limits (enforced by the planner). The planner gets
-    // every change; the slices already queued are re-planned once the override differs by 0.5 % or more from the
-    // one they were planned with, so many small steps add up instead of being lost.
-    if (job_planner_) {
-        job_planner_->setFeedOverride(telemetry_.feed_override_pct);
-        if (std::abs(queued_feed_override_pct_ - telemetry_.feed_override_pct) >= 0.5f &&
-            (telemetry_.state == ControllerState::RunningGCode || telemetry_.state == ControllerState::PausedHold)) {
-            replanFromQueueTailLocked();
-        }
-    }
+    motionLocked().setFeedOverride(telemetry_.feed_override_pct);
 }
 
 void MachineController::setPierceDelayOverride(float seconds) {
     std::lock_guard<std::mutex> lock(mutex_);
     telemetry_.pierce_delay_override_s = std::clamp(seconds, 0.0f, 10.0f);
-    if (job_planner_) {
-        job_planner_->setPierceDelayOverride(telemetry_.pierce_delay_override_s);
-    }
+    motionLocked().setPierceDelayOverride(telemetry_.pierce_delay_override_s);
 }
 
 } // namespace rnr::core

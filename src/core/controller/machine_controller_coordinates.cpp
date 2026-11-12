@@ -13,22 +13,7 @@ void MachineController::setMachinePositionLocked(const std::array<double, 4>& ma
     for (size_t a = 0; a < 4; ++a) {
         telemetry_.work_pos_mm[a] = telemetry_.machine_pos_mm[a] - telemetry_.work_offset_mm[a];
     }
-    syncBoardPositionLocked();
-    last_sent_target_valid_ = false;
-}
-
-void MachineController::syncBoardPositionLocked() {
-    if (!board_->isOpen() || telemetry_.simulator_mode) return;
-    // The machine position was redefined (connect, homing, restored position, new steps/mm). The RNR Eco Motion 2.0
-    // ignores Set Axis Positions, so its counters keep their own zero: they are no longer proven to be machine
-    // coordinates until they match the commanded position again. Adopting them anyway moved the machine position
-    // (and every work offset) by the homing distance at the next E-stop.
-    feedback_validated_ = false;
-    std::array<int32_t, 4> steps{};
-    for (size_t i = 0; i < 4; ++i) {
-        steps[i] = static_cast<int32_t>(std::llround(telemetry_.machine_pos_mm[i] * config_.axes[i].steps_per_mm));
-    }
-    board_->setAxisPositions(steps);
+    slice_->positionRedefinedLocked();
 }
 
 std::array<double, 4> MachineController::workToMachineLocked(const std::array<double, 4>& work) const {
@@ -140,17 +125,7 @@ void MachineController::goToWorkZeroXY() {
     if (!checkLinearMoveLocked(cur, up) || !checkLinearMoveLocked(up, xy)) return;
     if (safe_z - cur[2] > 1e-3) addRapid(cur, up);
     addRapid(up, xy);
-    if (fwActiveLocked()) {
-        fwStartManualMovesLocked(moves, ControllerState::Jogging);
-        return;
-    }
-    slice_queue_ = planManualMovesLocked(moves);
-    if (!slice_queue_.empty()) {
-        if (board_->isOpen() && !telemetry_.simulator_mode) {
-            board_->beginJog(Axis::X, config_.limit_override);
-        }
-        telemetry_.state = ControllerState::Jogging;
-    }
+    motionLocked().startManualMoves(moves, ControllerState::Jogging, ManualMovePlan::Machine);
 }
 
 void MachineController::selectWorkspace(uint8_t index) {
@@ -288,7 +263,7 @@ void MachineController::measureToolLength(uint16_t tool) {
 // ============================================================================
 bool MachineController::withinSoftLimitsLocked(const std::array<double, 4>& machine_pt, std::string* err) const {
     // Firmware boards enforce their own soft limits ($20); the app's limits belong to its own motor settings
-    if (fwActiveLocked()) return true;
+    if (!motionLocked().appSoftLimits()) return true;
     for (size_t a = 0; a < 4; ++a) {
         const auto& ax = config_.axes[a];
         // Soft limits are only meaningful relative to a homed machine coordinate system
@@ -321,27 +296,13 @@ bool MachineController::queueLinearMoveLocked(const std::array<double, 4>& end_w
 {
     const std::array<double, 4> start_w = telemetry_.work_pos_mm;
     if (!checkLinearMoveLocked(start_w, end_work)) return false;
-    if (fwActiveLocked()) {
-        ToolpathSegment s{};
-        s.type          = rapid ? SegmentType::RapidMove : SegmentType::CutLinear;
-        s.start_xyza_mm = start_w;
-        s.end_xyza_mm   = end_work;
-        s.feed_mm_min   = feed_mm_min;
-        s.length_mm     = dist3(start_w, end_work);
-        return fwStartManualMovesLocked({s}, state);
-    }
-    if (rapid) {
-        ToolpathSegment s{};
-        s.type          = SegmentType::RapidMove;
-        s.start_xyza_mm = start_w;
-        s.end_xyza_mm   = end_work;
-        s.length_mm     = dist3(start_w, end_work);
-        slice_queue_ = planManualMovesLocked({s});
-    } else {
-        slice_queue_ = planner::TrajectoryPlanner::sliceLinearMove(start_w, end_work, feed_mm_min, config_, 0);
-    }
-    telemetry_.state = state;
-    return true;
+    ToolpathSegment s{};
+    s.type          = rapid ? SegmentType::RapidMove : SegmentType::CutLinear;
+    s.start_xyza_mm = start_w;
+    s.end_xyza_mm   = end_work;
+    s.feed_mm_min   = feed_mm_min;
+    s.length_mm     = dist3(start_w, end_work);
+    return motionLocked().startManualMoves({s}, state, ManualMovePlan::Sequence);
 }
 
 } // namespace rnr::core

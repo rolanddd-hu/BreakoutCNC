@@ -337,7 +337,9 @@ void test27() {
         assert(g28.machine_axes_used == 0x04);
         bool found_machine_move = false;
         for (const auto& s : g28.segments) {
-            if (s.machine_axes_mask == 0x04 && s.machine_target_mm[2] == 0.0) found_machine_move = true;
+            if (!s.hasMachineTarget()) continue;
+            const auto& mt = g28.machine_targets.at(s.machine_target);
+            if (mt.axes_mask == 0x04 && mt.mm[2] == 0.0) found_machine_move = true;
         }
         assert(found_machine_move);
 
@@ -789,8 +791,9 @@ void test50() {
         std::cout << "\n[Test 50] Testing the program check (homing, tool table, soft limits, feed, spindle)...\n";
         using namespace rnr::core;
         using rnr::gcode::GCodeParser;
-        const auto run = [](const std::string& gcode, const MachineConfig* cfg, const MachineCheckInput& in) {
+        const auto run = [](const std::string& gcode, const MachineConfig* cfg, MachineCheckInput in) {
             auto p = std::make_shared<const rnr::gcode::ParseResult>(GCodeParser::parse(gcode));
+            in.frame.machine_targets = std::shared_ptr<const std::vector<MachineTarget>>(p, &p->machine_targets);
             return buildProgramCheck(p, cfg, in);
         };
         const auto find = [](const ProgramCheckResult& r, ProgramIssueKind kind,

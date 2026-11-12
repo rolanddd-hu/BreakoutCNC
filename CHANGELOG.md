@@ -51,6 +51,15 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   input for a second), and wakes at once on any input.
 
 ### Fixed
+- **Hole centre probing on GRBL-family boards** failed at the first move back to the start: the next probe started
+  while the board still moved (refused), and once that was fixed it was planned from a position read during the move,
+  so it stopped short of the far wall. It now waits for the board to finish and starts from where it stopped.
+- **Cancelling surface probing on GRBL-family boards** left the board running its probe move; it now stops it.
+- **G53 / G28 / G30 in a program**: the moves after a machine-coordinate move kept the height (and any other axis)
+  the program reached at load time, in work coordinates. When a work offset or the tool length changed after loading
+  (touching off Z, a new tool), an XY move after `G28 G91 Z0` moved Z away from the top as well. An axis a machine
+  move left at a machine coordinate now stays there until the program names it again; a drilling cycle after it
+  travels at that height and then goes to its R plane.
 - **RNR Eco Motion 2.0** (found with a board on the bench):
   - After homing or a restored position, an E-stop could move the machine position (and every work offset) by the
     homing distance: the board's step counters do not follow a new machine zero, and the app adopted them.
@@ -120,6 +129,8 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   (its text moves to the STOP JOG tooltip).
 
 ### Changed
+- Large programs need less memory: a parsed move takes 136 bytes instead of 192 (G53 / G28 / G30 end points are kept
+  apart from the moves).
 - Settings that the selected board keeps itself (motor tuning, switch inputs, homing speeds, pin assignment, THC,
   corner tolerance) are replaced by a short note pointing to *Board Settings*.
 - The applications connect to the board after loading their settings, so the saved board is the one that is opened.

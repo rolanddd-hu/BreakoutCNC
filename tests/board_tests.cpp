@@ -336,6 +336,55 @@ void testHomingAndProbing() {
     std::printf("  -> done\n");
 }
 
+// Hole centre probing (a repositioning move between the probes) and a cancelled surface probe on a firmware board
+void testProbingSequences() {
+    std::printf("[Test 5b] Hole centre probing and a cancelled surface probe...\n");
+    Rig r(FakeGrbl::Flavour::GrblHal, board::kGrblHalBoardId, [](FakeGrbl& g) {
+        g.probe_hole_x = 40.0;
+        g.probe_hole_y = 30.0;
+        g.probe_hole_radius = 10.0;
+    });
+    CHECK(r.ready());
+    auto cfg = r.c->getConfig();
+    cfg.probe.tool_diameter_mm = 0.0;
+    r.c->applyConfig(cfg);
+    CHECK(r.c->executeMdiCommand("G0 X42 Y28 Z0"));
+    CHECK(r.idle());
+    // Walls at X 30.202 / 49.798 from Y28, then Y 20 / 40 from X40: the centre is machine X40 Y30
+    r.c->probeHoleCenterXY(24.0);
+    CHECK(waitFor([&] { return r.t().state == core::ControllerState::Probing; }, 1000));
+    CHECK(r.idle(20000));
+    auto t = r.t();
+    if (!(near(t.machine_pos_mm[0], 40.0, 0.05) && near(t.machine_pos_mm[1], 30.0, 0.05))) {
+        std::printf("  hole centre: machine X%.3f Y%.3f, message: %s\n", t.machine_pos_mm[0], t.machine_pos_mm[1],
+                    t.active_fault_message.c_str());
+        for (const auto& e : r.c->getBoardLog(0)) {
+            if (e.text.find("G38") != std::string::npos || e.text.find("G53") != std::string::npos ||
+                e.text.find("PRB") != std::string::npos)
+                std::printf("    %d %s\n", static_cast<int>(e.dir), e.text.c_str());
+        }
+    }
+    CHECK(near(t.machine_pos_mm[0], 40.0, 0.05) && near(t.machine_pos_mm[1], 30.0, 0.05));
+    CHECK(near(t.work_pos_mm[0], 0.0, 0.05) && near(t.work_pos_mm[1], 0.0, 0.05));
+
+    // Surface probing with no surface to find (slow, deep probe move), cancelled while the board probes
+    r.g->probe_hole_radius = NAN;
+    cfg = r.c->getConfig();
+    cfg.probe.fast_feed_mm_min = 20.0;
+    cfg.probe.surface_max_depth_below_zero_mm = 50.0;
+    r.c->applyConfig(cfg);
+    r.c->startSurfaceProbing(-5.0, 5.0, -5.0, 5.0, 2, 2);
+    CHECK(waitFor([&] { return r.t().state == core::ControllerState::Probing && r.g->currentState() == "Run"; }, 8000));
+    r.c->cancelSurfaceProbing();
+    CHECK(waitFor([&] { return !r.t().surface_probing_active; }, 5000));
+    CHECK(waitFor([&] { return r.g->currentState() == "Idle"; }, 3000)); // Before the fix: kept probing for seconds
+    const double z_stopped = r.g->position()[2];
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(near(r.g->position()[2], z_stopped));
+    CHECK(r.idle(5000));
+    std::printf("  -> done\n");
+}
+
 const char* kJob =
     "G21 G90\n"
     "G0 X0 Y0 Z5\n"
@@ -375,6 +424,26 @@ void testJob() {
     CHECK(!r.g->overflowed);
     CHECK(r.t().active_segment_index == r.c->getProgram()->segments.size());
     std::printf("  -> done (max receive buffer use %zu bytes)\n", r.g->max_rx_used);
+}
+
+// G53 in a program: the target comes from the program's machine target table when the job runs, so a work offset
+// changed after loading does not move it (firmware path)
+void testMachineCoordinateJob() {
+    std::printf("[Test 6b] G53 in a job after the work offset changed...\n");
+    Rig r(FakeGrbl::Flavour::Grbl11, board::kGrblBoardId);
+    CHECK(r.ready());
+    r.c->homeAllAxes();
+    CHECK(waitFor([&] { return r.t().state == core::ControllerState::Homing; }, 1000));
+    CHECK(r.idle(8000));
+    r.c->setWorkspaceOffset(0, {1.0, 2.0, 10.0, 0.0});
+    CHECK(r.c->loadGCodeString("G21 G90\nG0 X5 Y5 Z2\nG53 G0 Z-4\nG0 X8\nM30\n"));
+    r.c->setWorkspaceOffset(0, {1.0, 2.0, 20.0, 0.0});
+    r.c->startJob();
+    CHECK(waitFor([&] { return r.t().state == core::ControllerState::RunningGCode; }, 2000));
+    CHECK(waitFor([&] { return r.t().state == core::ControllerState::Idle && r.g->currentState() == "Idle"; }, 15000));
+    const auto p = r.g->position();
+    CHECK(near(p[2], -4.0) && near(p[0], 9.0) && near(p[1], 7.0));
+    std::printf("  -> done\n");
 }
 
 void testLineTracking() {
@@ -930,7 +999,9 @@ int main() {
     testConnect(FakeGrbl::Flavour::FluidNC, board::kFluidNcBoardId, "FluidNC");
     testManualControl();
     testHomingAndProbing();
+    testProbingSequences();
     testJob();
+    testMachineCoordinateJob();
     testLineTracking();
     testArcs();
     testLaserS0();

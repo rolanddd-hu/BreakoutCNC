@@ -8,174 +8,14 @@ using namespace mc_detail;
 // ============================================================================
 // Hardware stop / settle helpers
 // ============================================================================
-void MachineController::beginSettleLocked() {
-    settle_active_ = true;
-    settle_board_idle_seen_ = false;
-    settle_deadline_ = Clock::now() + kSettleTimeout;
-}
 
-bool MachineController::settledLocked() const {
-    return settle_board_idle_seen_ || Clock::now() >= settle_deadline_;
-}
 
-void MachineController::stopMotionForEventLocked() {
-    slice_queue_.clear();
-    job_planner_.reset();
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->cancelMotion();
-        in_flight_seqs_.clear();
-        beginSettleLocked();
-    }
-    last_sent_target_valid_ = false;
-    last_sent_speed_mm_s_ = 0.0;
-}
 
 // ============================================================================
 // Homing (per axis: back off switch if needed -> seek switch -> set zero -> pull off)
 // ============================================================================
-bool MachineController::homeSwitchActiveLocked(size_t axis) const {
-    const auto& ax = config_.axes[axis];
-    if (telemetry_.simulator_mode) {
-        // Simulated home switch located at machine zero
-        return ax.homing_dir_negative ? (telemetry_.machine_pos_mm[axis] <= 0.0)
-                                      : (telemetry_.machine_pos_mm[axis] >= 0.0);
-    }
-    return evaluatePinStateLocked(ax.home_pin, ax.home_invert);
-}
 
-void MachineController::startNextHomingAxisLocked() {
-    auto finishHoming = [&](const std::string& message) {
-        homing_axis_queue_.clear();
-        homing_phase_ = HomingPhase::None;
-        slice_queue_.clear();
-        if (board_->isOpen() && !telemetry_.simulator_mode) {
-            board_->configure(config_, false);
-        }
-        telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
-        telemetry_.state = ControllerState::Idle;
-        if (!message.empty()) telemetry_.active_fault_message = message;
-    };
 
-    if (homing_axis_queue_.empty()) {
-        finishHoming("");
-        return;
-    }
-
-    active_homing_axis_ = homing_axis_queue_.front();
-    homing_axis_queue_.pop_front();
-    const size_t idx = static_cast<size_t>(active_homing_axis_);
-    const auto& ax = config_.axes[idx];
-
-    if (!telemetry_.simulator_mode && ax.home_pin == 0) {
-        finishHoming(std::string("Cannot home ") + kAxisNames[idx] + ": no home switch input is configured");
-        return;
-    }
-
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->configure(config_, true);
-        board_->armHomeSwitchStop(static_cast<Axis>(idx));
-    }
-
-    telemetry_.axis_homed[idx] = false;
-    homing_switch_event_ = false;
-    const double dir = ax.homing_dir_negative ? -1.0 : 1.0;
-    std::array<double, 4> end_w = telemetry_.work_pos_mm;
-    double feed = ax.homing_feed_mm_min;
-    if (homeSwitchActiveLocked(idx)) {
-        // Already on the switch: back off first so the switch edge is found from the correct side
-        homing_phase_ = HomingPhase::BackOff;
-        end_w[idx] -= dir * std::min(25.0, ax.home_pulloff_mm * 2.0 + 5.0);
-        feed = std::max(60.0, ax.homing_feed_mm_min * 0.5);
-    } else {
-        homing_phase_ = HomingPhase::Seek;
-        end_w[idx] += dir * ax.homing_max_travel_mm;
-    }
-    slice_queue_ = planner::TrajectoryPlanner::sliceLinearMove(telemetry_.work_pos_mm, end_w, feed, config_, 0);
-    telemetry_.state = ControllerState::Homing;
-}
-
-void MachineController::homingTickLocked() {
-    const size_t idx = static_cast<size_t>(active_homing_axis_);
-    const auto& ax = config_.axes[idx];
-    const bool sw = homeSwitchActiveLocked(idx);
-
-    if (!homing_switch_event_) {
-        if ((homing_phase_ == HomingPhase::BackOff && !sw) || (homing_phase_ == HomingPhase::Seek && sw)) {
-            homing_switch_event_ = true;
-            stopMotionForEventLocked();
-        }
-    }
-    if (!slice_queue_.empty()) return;
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        if (settle_active_) {
-            if (!settledLocked()) return;
-            settle_active_ = false;
-            if (feedback_validated_) {
-                std::array<double, 4> m{};
-                for (size_t a = 0; a < 4; ++a) m[a] = static_cast<double>(hw_live_steps_[a]) / config_.axes[a].steps_per_mm;
-                telemetry_.machine_pos_mm = m;
-                for (size_t a = 0; a < 4; ++a) telemetry_.work_pos_mm[a] = m[a] - telemetry_.work_offset_mm[a];
-            }
-        } else if (!in_flight_seqs_.empty()) {
-            return;
-        }
-    }
-
-    auto abortHoming = [&](const std::string& msg) {
-        homing_axis_queue_.clear();
-        startNextHomingAxisLocked(); // Restores the board pinout and returns to Idle
-        telemetry_.active_fault_message = msg;
-    };
-
-    const double dir = ax.homing_dir_negative ? -1.0 : 1.0;
-    switch (homing_phase_) {
-        case HomingPhase::BackOff: {
-            if (!homing_switch_event_) {
-                abortHoming(std::string("Homing ") + kAxisNames[idx] + " failed: could not move off the home switch");
-                return;
-            }
-            homing_switch_event_ = false;
-            homing_phase_ = HomingPhase::Seek;
-            std::array<double, 4> end_w = telemetry_.work_pos_mm;
-            end_w[idx] += dir * ax.homing_max_travel_mm;
-            slice_queue_ = planner::TrajectoryPlanner::sliceLinearMove(telemetry_.work_pos_mm, end_w, ax.homing_feed_mm_min, config_, 0);
-            break;
-        }
-        case HomingPhase::Seek: {
-            if (!homing_switch_event_) {
-                char buf[160];
-                std::snprintf(buf, sizeof(buf), "Homing %s failed: home switch not found within %.0f mm", kAxisNames[idx], ax.homing_max_travel_mm);
-                abortHoming(buf);
-                return;
-            }
-            homing_switch_event_ = false;
-            if (idx == 2) {
-                // New machine Z frame: the tool-setter reference contact must be measured again
-                tool_ref_contact_valid_ = false;
-                telemetry_.tool_reference_measured = false;
-            }
-            // The switch position defines machine zero for this axis
-            std::array<double, 4> m = telemetry_.machine_pos_mm;
-            m[idx] = 0.0;
-            setMachinePositionLocked(m);
-            homing_phase_ = HomingPhase::PullOff;
-            if (ax.home_pulloff_mm > 1e-3) {
-                std::array<double, 4> end_w = telemetry_.work_pos_mm;
-                end_w[idx] -= dir * ax.home_pulloff_mm;
-                slice_queue_ = planner::TrajectoryPlanner::sliceLinearMove(
-                    telemetry_.work_pos_mm, end_w, std::max(60.0, ax.homing_feed_mm_min * 0.5), config_, 0);
-            }
-            break;
-        }
-        case HomingPhase::PullOff:
-            telemetry_.axis_homed[idx] = true;
-            startNextHomingAxisLocked();
-            break;
-        case HomingPhase::None:
-            startNextHomingAxisLocked();
-            break;
-    }
-}
 
 void MachineController::homeAxis(core::Axis axis) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -206,28 +46,7 @@ void MachineController::homeAllAxesBuiltIn() {
 
 void MachineController::startBuiltInHomingLocked(int axis) {
     if (!readyForCommandLocked(false, "Homing")) return;
-    if (fwActiveLocked()) {
-        // The board runs its own homing cycle with its own settings ($22..$27)
-        const uint8_t mask = axis < 0 ? 0 : static_cast<uint8_t>(1U << axis);
-        std::string err;
-        if (!fw_->startHoming(mask, &err)) {
-            telemetry_.active_fault_message = "Homing rejected: " + err;
-            return;
-        }
-        fw_homing_mask_ = mask;
-        telemetry_.state = ControllerState::Homing;
-        return;
-    }
-    homing_axis_queue_.clear();
-    if (axis >= 0) {
-        homing_axis_queue_.push_back(static_cast<core::Axis>(axis));
-    } else {
-        // Safe CNC Homing Order: Z Up first, then Y, then X
-        homing_axis_queue_.push_back(core::Axis::Z);
-        homing_axis_queue_.push_back(core::Axis::Y);
-        homing_axis_queue_.push_back(core::Axis::X);
-    }
-    startNextHomingAxisLocked();
+    motionLocked().startHoming(axis);
 }
 
 // ============================================================================
@@ -257,74 +76,14 @@ bool MachineController::beginProbeMoveLocked(core::Axis axis, double signed_trav
     }
     if (!checkLinearMoveLocked(start_w, end_w)) return false;
 
-    if (fwActiveLocked()) {
-        motion::ProbeRequest req;
-        req.target_mm = workToMachineLocked(end_w);
-        req.feed_mm_min = std::max(5.0, feed_mm_min);
-        std::string err;
-        if (!fw_->startProbe(req, &err)) {
-            telemetry_.active_fault_message = "Probing rejected: " + err;
-            return false;
-        }
-        probe_contact_captured_ = false;
-        probe_move_is_search_   = true;
-        active_probe_axis_      = axis;
-        active_probe_pos_dir_   = (signed_travel_mm >= 0.0);
-        telemetry_.last_probe_hit = false;
-        telemetry_.state = ControllerState::Probing;
-        return true;
-    }
-
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->armProbe(static_cast<Axis>(idx));
-    }
-    probe_latched_at_arm_   = hw_latched_steps_;
+    if (!motionLocked().startProbeMove(idx, start_w, end_w, feed_mm_min)) return false;
     probe_contact_captured_ = false;
     probe_move_is_search_   = true;
     active_probe_axis_      = axis;
     active_probe_pos_dir_   = (signed_travel_mm >= 0.0);
     telemetry_.last_probe_hit = false;
-    slice_queue_ = planner::TrajectoryPlanner::sliceLinearMove(start_w, end_w, std::max(5.0, feed_mm_min), config_, 0);
     telemetry_.state = ControllerState::Probing;
     return true;
-}
-
-void MachineController::probingTickLocked() {
-    const bool hw = board_->isOpen() && !telemetry_.simulator_mode;
-    if (probe_move_is_search_ && !probe_contact_captured_ && telemetry_.probe_contact_active) {
-        probe_contact_captured_ = true;
-        std::array<double, 4> m = telemetry_.machine_pos_mm;
-        if (hw && feedback_validated_) {
-            // Prefer the hardware-latched trigger position; fall back to the live step counters
-            const bool latched_new = (hw_latched_steps_ != probe_latched_at_arm_);
-            for (size_t a = 0; a < 4; ++a) {
-                const int32_t steps = latched_new ? hw_latched_steps_[a] : hw_live_steps_[a];
-                m[a] = static_cast<double>(steps) / config_.axes[a].steps_per_mm;
-            }
-        }
-        probe_contact_machine_ = m;
-        stopMotionForEventLocked();
-    }
-    if (!slice_queue_.empty()) return;
-    if (hw) {
-        if (settle_active_) {
-            if (!settledLocked()) return;
-            settle_active_ = false;
-            if (feedback_validated_) {
-                std::array<double, 4> m{};
-                for (size_t a = 0; a < 4; ++a) m[a] = static_cast<double>(hw_live_steps_[a]) / config_.axes[a].steps_per_mm;
-                telemetry_.machine_pos_mm = m;
-                for (size_t a = 0; a < 4; ++a) telemetry_.work_pos_mm[a] = m[a] - telemetry_.work_offset_mm[a];
-            }
-        } else if (!in_flight_seqs_.empty()) {
-            return;
-        }
-    }
-    if (probe_move_is_search_) {
-        onProbeMoveFinishedLocked(probe_contact_captured_ || telemetry_.simulator_mode);
-    } else {
-        continueHoleCenterLocked();
-    }
 }
 
 void MachineController::onProbeMoveFinishedLocked(bool hit) {
@@ -424,7 +183,7 @@ void MachineController::continueHoleCenterLocked() {
     const double feed = std::max(50.0, config_.probe.fast_feed_mm_min);
     auto fail = [&]() {
         active_probe_mode_ = ProbeMode::None;
-        slice_queue_.clear();
+        motionLocked().clearQueuedMotion();
         telemetry_.state = restStateLocked();
         if (telemetry_.active_fault_message.empty()) {
             telemetry_.active_fault_message = "Hole centre probing aborted";
@@ -441,8 +200,10 @@ void MachineController::continueHoleCenterLocked() {
         probe_move_is_search_ = false;
         if (!queueLinearMoveLocked(end_w, feed, ControllerState::Probing)) {
             fail();
-        } else if (slice_queue_.empty()) {
-            continueHoleCenterLocked(); // Already there
+        } else if (!motionLocked().motionQueued() && !motionLocked().boardBusy()) {
+            // Already there (no slices planned). A firmware board always runs the move and reports MoveDone, which
+            // continues the sequence: continuing here as well started the next probe while it still moved.
+            continueHoleCenterLocked();
         }
     };
 
@@ -607,7 +368,7 @@ void MachineController::startSurfaceProbing(double min_x, double max_x, double m
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (telemetry_.state == ControllerState::EStop || telemetry_.state == ControllerState::Disconnected) return false;
-                    if (!motionActiveLocked() && slice_queue_.empty() && in_flight_seqs_.empty()) return true;
+                    if (!motionActiveLocked() && !motionLocked().motionPending()) return true;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -701,7 +462,7 @@ void MachineController::cancelSurfaceProbing() {
     if (telemetry_.surface_probing_active &&
         (telemetry_.state == ControllerState::Probing || telemetry_.state == ControllerState::Jogging))
     {
-        stopMotionForEventLocked();
+        motionLocked().stopForEvent();
         active_probe_mode_ = ProbeMode::None;
         telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
         telemetry_.state = restStateLocked();

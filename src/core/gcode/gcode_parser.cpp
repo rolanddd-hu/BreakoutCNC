@@ -218,8 +218,12 @@ private:
     void addError(size_t line, const std::string& text);
     void addWarning(size_t line, const std::string& text);
     core::ToolpathSegment baseSegment(core::SegmentType seg_type, size_t line_idx);
-    void emitLinearSegment(const std::array<double, 4>& p0,                                  const std::array<double, 4>& p1,                                  core::SegmentType seg_type,                                  size_t line_idx,                                  double seg_feed);
-    void emitMachineMove(const std::array<double, 4>& machine_target, uint8_t machine_axes,                                bool rapid, size_t line_idx);
+    void emitLinearSegment(const std::array<double, 4>& p0, const std::array<double, 4>& p1, core::SegmentType seg_type,
+                           size_t line_idx, double seg_feed, bool keep_zero_length = false);
+    void emitBlockMove(core::SegmentType seg_type);
+    void releaseHeld(uint8_t axes);
+    uint32_t heldTarget();
+    void emitMachineMove(const std::array<double, 4>& machine_target, uint8_t machine_axes, bool rapid, size_t line_idx);
 
     const double arc_chord_tolerance_mm;
     const std::array<double, 4> work_offset_mm;
@@ -260,6 +264,12 @@ private:
     uint16_t tlo_tool          = core::kTloInherit; // G43 H<n> in effect (0 = G49)
     bool   rot_active = false;
     double rot_cx = 0.0, rot_cy = 0.0, rot_deg = 0.0;
+    // Axes a G53 / G28 / G30 left at a machine coordinate, until the program names them again in work coordinates.
+    // Their work position is only known when the job runs (offsets and tool lengths may change after loading), so
+    // the moves in between carry a MachineTarget that keeps them there instead of the parse-time preview.
+    uint8_t               held_axes = 0;
+    std::array<double, 4> held_mm{};
+    uint32_t              held_target = core::kNoMachineTarget; // Table entry of the current held state (on first use)
     double rot_cos = 1.0, rot_sin = 0.0;
     bool     exact_stop        = false; // G61 / G61.1 in effect (G64 = constant velocity)
     double   corner_tolerance_mm = 0.0; // G64 P in effect, 0 = the machine setting
@@ -304,9 +314,45 @@ core::ToolpathSegment Parser::baseSegment(core::SegmentType seg_type, size_t lin
     return seg;
 }
 
-void Parser::emitLinearSegment(const std::array<double, 4>& p0,                                  const std::array<double, 4>& p1,                                  core::SegmentType seg_type,                                  size_t line_idx,                                  double seg_feed) {
+void Parser::releaseHeld(uint8_t axes) {
+    if ((held_axes & axes) == 0) return;
+    held_axes = static_cast<uint8_t>(held_axes & ~axes);
+    held_target = core::kNoMachineTarget;
+}
+
+uint32_t Parser::heldTarget() {
+    if (held_axes == 0) return core::kNoMachineTarget;
+    if (held_target == core::kNoMachineTarget) {
+        held_target = static_cast<uint32_t>(result.machine_targets.size());
+        result.machine_targets.push_back(core::MachineTarget{held_mm, held_axes});
+    }
+    return held_target;
+}
+
+// G0 / G1 of this block to target_pos. A held axis named in G90 is back in work coordinates; in G91 it moves by the
+// increment from where the machine move left it.
+void Parser::emitBlockMove(core::SegmentType seg_type) {
+    uint8_t released = 0;
+    for (size_t a = 0; a < 4; ++a) {
+        const uint8_t bit = static_cast<uint8_t>(1U << a);
+        if (!(axes_given & bit) || !(held_axes & bit)) continue;
+        if (absolute_xyz || rot_active) {
+            released |= bit;
+        } else {
+            held_mm[a] += raw_axis[a];
+            held_target = core::kNoMachineTarget;
+        }
+    }
+    releaseHeld(released);
+    // Kept even when zero length at parse time: from the machine position the move may be long when the job runs
+    emitLinearSegment(cur_pos, target_pos, seg_type, line_idx, feed_mm_min, released != 0);
+    cur_pos = target_pos;
+}
+
+void Parser::emitLinearSegment(const std::array<double, 4>& p0, const std::array<double, 4>& p1,
+                               core::SegmentType seg_type, size_t line_idx, double seg_feed, bool keep_zero_length) {
     double len = calcDist4D(p0, p1);
-    if (len <= 1e-6) return;
+    if (len <= 1e-6 && !keep_zero_length) return;
 
     core::ToolpathSegment seg = baseSegment(seg_type, line_idx);
     seg.start_xyza_mm = p0;
@@ -314,6 +360,7 @@ void Parser::emitLinearSegment(const std::array<double, 4>& p0,                 
     seg.feed_mm_min   = seg_feed;
     seg.length_mm     = len;
     seg.torch_active  = (seg_type != core::SegmentType::RapidMove) && torch_on;
+    seg.machine_target = heldTarget();
 
     if (seg_type == core::SegmentType::RapidMove) {
         result.total_rapid_length_mm += len;
@@ -327,7 +374,7 @@ void Parser::emitLinearSegment(const std::array<double, 4>& p0,                 
     result.segments.push_back(seg);
 }
 
-void Parser::emitMachineMove(const std::array<double, 4>& machine_target, uint8_t machine_axes,                                bool rapid, size_t line_idx) {
+void Parser::emitMachineMove(const std::array<double, 4>& machine_target, uint8_t machine_axes, bool rapid, size_t line_idx) {
     std::array<double, 4> preview = cur_pos;
     for (size_t a = 0; a < 4; ++a) {
         if ((machine_axes >> a) & 1U) preview[a] = machine_target[a] - work_offset_mm[a];
@@ -338,8 +385,13 @@ void Parser::emitMachineMove(const std::array<double, 4>& machine_target, uint8_
     seg.length_mm         = calcDist4D(cur_pos, preview);
     seg.torch_active      = false;
     seg.outputs_mask      = out_mask & ~(core::OutputBit::OUT1_TorchOrSpindle | core::OutputBit::OUT2_SpindleDir);
-    seg.machine_axes_mask = machine_axes;
-    seg.machine_target_mm = machine_target;
+    // Axes held by an earlier machine move and not named here stay held: they are part of this target too
+    for (size_t a = 0; a < 4; ++a) {
+        if ((machine_axes >> a) & 1U) held_mm[a] = machine_target[a];
+    }
+    held_axes = static_cast<uint8_t>(held_axes | machine_axes);
+    held_target = core::kNoMachineTarget;
+    seg.machine_target    = heldTarget();
     result.machine_axes_used |= machine_axes;
     // Kept even when zero length at parse time: the live offsets may differ when the job runs
     result.segments.push_back(seg);
@@ -803,8 +855,7 @@ bool Parser::handleCoordinateCommands() {
         if (home_axes == 0) {
             home_axes = 0x07; // No axis words: X, Y and Z return home
         } else {
-            emitLinearSegment(cur_pos, target_pos, core::SegmentType::RapidMove, line_idx, feed_mm_min);
-            cur_pos = target_pos;
+            emitBlockMove(core::SegmentType::RapidMove);
         }
         emitMachineMove({0.0, 0.0, 0.0, 0.0}, home_axes, true, line_idx);
         return true;
@@ -848,8 +899,13 @@ bool Parser::emitCannedCycle() {
     const double drill_z   = canned_z_mm;
     const double retract_z = canned_return_r ? canned_r_mm : std::max(canned_init_z, canned_r_mm);
 
+    // Z held at a machine coordinate (after G53 / G28): its work height is not known here. The XY move stays at
+    // that height, then Z goes to the R plane.
+    const bool z_held = (held_axes & 0x04U) != 0;
+    releaseHeld(static_cast<uint8_t>(axes_given & ~0x04U));
+
     // If below the R-plane, rapid up to R first so the XY move cannot drag through the part
-    if (cur_pos[2] < canned_r_mm) {
+    if (!z_held && cur_pos[2] < canned_r_mm) {
         std::array<double, 4> up_pos = {cur_pos[0], cur_pos[1], canned_r_mm, cur_pos[3]};
         emitLinearSegment(cur_pos, up_pos, core::SegmentType::RapidMove, line_idx, feed_mm_min);
         cur_pos = up_pos;
@@ -861,7 +917,12 @@ bool Parser::emitCannedCycle() {
     cur_pos = xy_pos;
 
     // Rapid Z to R-plane if above R-plane
-    if (cur_pos[2] > canned_r_mm) {
+    if (z_held) {
+        releaseHeld(0x04U);
+        std::array<double, 4> r_pos = {cur_pos[0], cur_pos[1], canned_r_mm, cur_pos[3]};
+        emitLinearSegment(cur_pos, r_pos, core::SegmentType::RapidMove, line_idx, feed_mm_min, true);
+        cur_pos = r_pos;
+    } else if (cur_pos[2] > canned_r_mm) {
         std::array<double, 4> r_pos = {cur_pos[0], cur_pos[1], canned_r_mm, cur_pos[3]};
         emitLinearSegment(cur_pos, r_pos, core::SegmentType::RapidMove, line_idx, feed_mm_min);
         cur_pos = r_pos;
@@ -924,6 +985,10 @@ void Parser::emitArc() {
         u_ax = 1; v_ax = 2; w_ax = 0; // YZ plane
         off_u = arc_j; off_v = arc_k;
     }
+
+    // The arc is drawn in work coordinates: its plane axes (and the helix axis and A when named) leave a held
+    // machine position; a held helix axis that is not named stays where it is
+    releaseHeld(static_cast<uint8_t>((1U << u_ax) | (1U << v_ax) | (axes_given & ((1U << w_ax) | 0x08U))));
 
     // In G18 (XZ), standard G2/G3 CW/CCW around +Y flips the 2D (X,Z) angle orientation
     bool cw = (active_g_motion == 2);
@@ -1043,6 +1108,7 @@ void Parser::emitArc() {
             seg.length_mm     = calcDist4D(prev_pt, next_pt);
             seg.exact_stop    = exact_stop && (s == steps); // G61: stop at the end of the arc, not at its chords
             seg.arc_index     = arc_idx;
+            seg.machine_target = heldTarget();
 
             result.total_cut_length_mm += seg.length_mm;
             expandBBox(cut_bmin, cut_bmax, prev_pt, first_cut_pt);
@@ -1074,9 +1140,7 @@ bool Parser::handleMotion() {
             emitArc();
         } else if (active_g_motion == 0 || active_g_motion == 1) {
             // Linear move (G0 Rapid or G1 Linear Cut)
-            core::SegmentType st = (active_g_motion == 0) ? core::SegmentType::RapidMove : core::SegmentType::CutLinear;
-            emitLinearSegment(cur_pos, target_pos, st, line_idx, feed_mm_min);
-            cur_pos = target_pos;
+            emitBlockMove((active_g_motion == 0) ? core::SegmentType::RapidMove : core::SegmentType::CutLinear);
         }
     }
 

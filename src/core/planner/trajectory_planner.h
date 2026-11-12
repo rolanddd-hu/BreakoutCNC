@@ -40,6 +40,10 @@ struct FrameContext {
     bool                                 apply_tool_lengths = false; // Tool table mode
     std::array<double, 256>              tool_lengths{};             // Indexed by tool number
     double                               inherit_tlo_mm = 0.0;       // Offset active when the job started
+    // The program's G53 / G28 / G30 end points (ParseResult::machine_targets). A frame for a program with machine
+    // moves must carry them: the program check refuses to start a job with a machine move it cannot resolve
+    // (TrajectoryPlanner::resolvable), so a missing table can never move the machine to the parse-time preview.
+    std::shared_ptr<const std::vector<core::MachineTarget>> machine_targets;
 };
 
 struct PlannerOptions {
@@ -172,6 +176,12 @@ public:
 
     // Planning-frame target of a segment (see FrameContext)
     static std::array<double, 4> transformTarget(const core::ToolpathSegment& seg, const FrameContext& frame);
+
+    // The machine-coordinate end point of a G53 / G28 / G30 segment in this frame (nullptr: none, or not found)
+    static const core::MachineTarget* machineTargetFor(const core::ToolpathSegment& seg, const FrameContext& frame);
+
+    // false: a machine-coordinate segment whose target the (enabled) frame does not carry: the job must not run
+    static bool resolvable(const core::ToolpathSegment& seg, const FrameContext& frame);
 
     // Tool length offset applied to a segment (0 unless the frame applies tool lengths)
     static double toolLengthFor(const core::ToolpathSegment& seg, const FrameContext& frame);

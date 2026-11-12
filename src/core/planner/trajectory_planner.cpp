@@ -661,16 +661,28 @@ std::array<double, 4> TrajectoryPlanner::transformTarget(const core::ToolpathSeg
     }
     const uint8_t pw = std::min<uint8_t>(frame.plan_workspace, 5);
     const uint8_t sw = std::min<uint8_t>(seg.workspace_index, 5);
+    const core::MachineTarget* mt = machineTargetFor(seg, frame);
+    const uint8_t machine_axes = mt ? mt->axes_mask : 0;
     for (size_t a = 0; a < 4; ++a) {
-        if ((seg.machine_axes_mask >> a) & 1U) {
+        if ((machine_axes >> a) & 1U) {
             // Machine coordinates (G53 / G28) address the spindle: no tool length offset
-            t[a] = seg.machine_target_mm[a] - frame.workspace_offsets[pw][a];
+            t[a] = mt->mm[a] - frame.workspace_offsets[pw][a];
         } else {
             t[a] = seg.end_xyza_mm[a] + frame.workspace_offsets[sw][a] - frame.workspace_offsets[pw][a];
             if (a == 2) t[a] += toolLengthFor(seg, frame);
         }
     }
     return t;
+}
+
+const core::MachineTarget* TrajectoryPlanner::machineTargetFor(const core::ToolpathSegment& seg, const FrameContext& frame) {
+    if (!seg.hasMachineTarget() || !frame.machine_targets) return nullptr;
+    const auto& table = *frame.machine_targets;
+    return seg.machine_target < table.size() ? &table[seg.machine_target] : nullptr;
+}
+
+bool TrajectoryPlanner::resolvable(const core::ToolpathSegment& seg, const FrameContext& frame) {
+    return !frame.enabled || !seg.hasMachineTarget() || machineTargetFor(seg, frame) != nullptr;
 }
 
 double TrajectoryPlanner::toolLengthFor(const core::ToolpathSegment& seg, const FrameContext& frame) {
@@ -851,7 +863,7 @@ std::vector<core::ToolpathSegment> TrajectoryPlanner::warpToolpathWithHeightMap(
 
     for (const auto& seg : original_segments) {
         if (seg.type == core::SegmentType::ToolChange || seg.type == core::SegmentType::Dwell ||
-            seg.type == core::SegmentType::ProgramStop || seg.machine_axes_mask != 0)
+            seg.type == core::SegmentType::ProgramStop || seg.hasMachineTarget())
         {
             // Non-motion and machine-coordinate (G53/G28) moves are never warped
             core::ToolpathSegment copy = seg;

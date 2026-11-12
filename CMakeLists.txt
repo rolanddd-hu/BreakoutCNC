@@ -120,6 +120,8 @@ add_library(rnr_core STATIC
     src/core/controller/machine_controller_program.cpp
     src/core/controller/machine_controller_worker.cpp
     src/core/controller/machine_controller_boards.cpp
+    src/core/controller/slice_backend.cpp
+    src/core/controller/firmware_backend.cpp
     src/core/io/io_map.cpp
     src/core/board/rnr_board_driver.cpp
     src/core/board/board_registry.cpp

@@ -448,6 +448,77 @@ void testP2SharedProgram() {
     c.stopJob();
 }
 
+// P2: G53 / G28 end points live in ParseResult::machine_targets. A job resolves them through its frame when it runs
+// (the work offset changed after loading must not move the machine target), and a frame without the table refuses
+// the job instead of running to the parse-time preview.
+void testP2MachineTargetTable() {
+    std::cout << "[P2] Machine-coordinate targets in a side table\n";
+    using namespace rnr::core;
+    CHECK(sizeof(ToolpathSegment) <= 136);
+    const auto r = rnr::gcode::GCodeParser::parse("G21 G90\nG0 X5\nG53 G0 Z-3\nG28 G91 X0\nG90\nG0 X1\n");
+    CHECK(!r.hasErrors());
+    // G53 Z-3: Z held. G28 X0: X and Z held. G0 X1 names X again: only Z held.
+    CHECK(r.machine_targets.size() == 3);
+    size_t with_target = 0;
+    for (const auto& s : r.segments) {
+        if (!s.hasMachineTarget()) continue;
+        ++with_target;
+        CHECK(s.machine_target < r.machine_targets.size());
+    }
+    CHECK(with_target == 3);
+    CHECK(r.machine_targets[0].axes_mask == 0x04 && r.machine_targets[0].mm[2] == -3.0);
+    CHECK(r.machine_targets[1].axes_mask == 0x05 && r.machine_targets[1].mm[0] == 0.0 && r.machine_targets[1].mm[2] == -3.0);
+    CHECK(r.machine_targets[2].axes_mask == 0x04 && r.machine_targets[2].mm[2] == -3.0);
+    CHECK(r.segments.back().machine_target == 2);
+    // Z named again (even at the parse-time preview height): back in work coordinates, the move is kept
+    const auto named = rnr::gcode::GCodeParser::parse("G21 G90\nG53 G0 Z0\nG0 X5\nG0 Z0\nG1 X6 F100\n");
+    CHECK(!named.hasErrors() && named.machine_targets.size() == 1);
+    size_t held_moves = 0;
+    for (const auto& s : named.segments) held_moves += s.hasMachineTarget() ? 1 : 0;
+    CHECK(held_moves == 2);                                // G53 Z0 and G0 X5
+    CHECK(named.segments.size() == 4);                     // G0 Z0 has no length at parse time but is kept
+    CHECK(!named.segments.back().hasMachineTarget());
+    // G91 on a held axis: moves by the increment from the machine position
+    const auto inc = rnr::gcode::GCodeParser::parse("G21\nG53 G0 Z-10\nG91 G0 Z2 X1\nG90\n");
+    CHECK(!inc.hasErrors() && inc.machine_targets.size() == 2);
+    CHECK(inc.machine_targets[1].axes_mask == 0x04 && inc.machine_targets[1].mm[2] == -8.0);
+    // A drilling cycle after G28 Z0: the XY move stays at the machine height, then Z goes to R
+    const auto drill = rnr::gcode::GCodeParser::parse("G21 G90\nG28 G91 Z0\nG90\nG81 X10 Y10 Z-2 R1 F100\nG80\n");
+    CHECK(!drill.hasErrors());
+    CHECK(drill.segments.size() >= 4);
+    CHECK(drill.segments[1].hasMachineTarget() && drill.segments[1].end_xyza_mm[0] == 10.0); // XY at machine Z0
+    CHECK(!drill.segments[2].hasMachineTarget() && drill.segments[2].end_xyza_mm[2] == 1.0); // to the R plane
+
+    // A frame that does not carry the table: not resolvable, the program check blocks the start
+    auto prog = std::make_shared<const rnr::gcode::ParseResult>(r);
+    MachineCheckInput in;
+    in.frame.enabled = true;
+    in.simulator = true;
+    const auto& g53 = prog->segments[2];
+    CHECK(g53.hasMachineTarget());
+    CHECK(!rnr::planner::TrajectoryPlanner::resolvable(g53, in.frame));
+    MachineConfig cfg;
+    CHECK(checkProgramAgainstMachine(*prog, cfg, in).start_refusal.find("internal error") != std::string::npos);
+    in.frame.machine_targets = std::shared_ptr<const std::vector<MachineTarget>>(prog, &prog->machine_targets);
+    CHECK(rnr::planner::TrajectoryPlanner::resolvable(g53, in.frame));
+    CHECK(checkProgramAgainstMachine(*prog, cfg, in).start_refusal.empty());
+    // Disabled frame (segment coordinates as they are): nothing to resolve
+    CHECK(rnr::planner::TrajectoryPlanner::resolvable(g53, rnr::planner::FrameContext{}));
+
+    // A job: the work offset changes after loading, G53 Z-3 still ends at machine Z-3
+    RnRController c;
+    CHECK(c.resetFromEStop());
+    c.setWorkspaceOffset(0, {0.0, 0.0, 10.0, 0.0});
+    CHECK(c.loadGCodeString("G21 G90\nG0 X5 Z2\nG53 G0 Z-3\nG0 X8\nM30\n"));
+    c.setWorkspaceOffset(0, {0.0, 0.0, 20.0, 0.0});
+    c.startJob();
+    CHECK(waitUntil([&] { return c.getTelemetry().state == ControllerState::RunningGCode; }, 3000));
+    CHECK(waitUntil([&] { return c.getTelemetry().state == ControllerState::Idle; }, 15000));
+    const auto t = c.getTelemetry();
+    CHECK(std::abs(t.machine_pos_mm[2] - (-3.0)) < 1e-3);
+    CHECK(std::abs(t.machine_pos_mm[0] - 8.0) < 1e-3);
+}
+
 // M5: every setting that is written is also read back. The defaults are saved, every value in the file is changed
 // (booleans flipped, numbers moved, texts extended), loaded and saved again: a line that comes back different
 // belongs to a key that is not read (or is limited when it is read).
@@ -619,6 +690,8 @@ void testRnrCountersAreNotMachinePositions() {
     CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(150)); // 8 mm at 50 mm/s: ~160 ms + run-out
 }
 
+
+
 } // namespace
 
 int main() {
@@ -638,6 +711,7 @@ int main() {
     testA5Utf8Paths();
     testA11ModalArc();
     testP2SharedProgram();
+    testP2MachineTargetTable();
     testM5SettingsRoundTrip();
     testRnrCountersAreNotMachinePositions();
 

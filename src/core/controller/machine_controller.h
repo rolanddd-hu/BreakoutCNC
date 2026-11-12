@@ -20,6 +20,10 @@ class ScriptRunner;
 
 namespace rnr::core {
 
+class IMotionBackend;
+class SliceBackend;
+class FirmwareBackend;
+
 // Board-independent machine core: jobs, planning, work offsets, tool table, homing & probing sequences,
 // spindle / VFD, THC, laser rules and scripting. All hardware access goes through an IBoardDriver.
 class MachineController : public IMotionController {
@@ -127,10 +131,7 @@ public:
     void setFeedOverride(float percent) override;
     void setPierceDelayOverride(float seconds) override;
     // Test accessor: copies the whole queue under the lock (never call it from the UI)
-    std::deque<planner::PlannedSlice> getSliceQueue() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return slice_queue_;
-    }
+    std::deque<planner::PlannedSlice> getSliceQueue() const;
 
     // Scripting & Automation (Lua 5.4 Engine)
     bool runScriptString(const std::string& code, bool async = true) override;
@@ -161,7 +162,17 @@ public:
     static bool hardwareAccessEnabled() noexcept { return hardware_access_enabled_.load(); }
 
 private:
+    // The motion of each kind of board (see motion_backend.h). They use the controller's state directly.
+    friend class SliceBackend;
+    friend class FirmwareBackend;
+
     using Clock = std::chrono::steady_clock;
+
+    // The backend that moves the active board: a connected firmware board, else the slice path (RNR or simulator)
+    IMotionBackend& motionLocked() noexcept;
+    const IMotionBackend& motionLocked() const noexcept;
+    // The backend that reads the attached board in the worker tick (a firmware board also while it connects)
+    IMotionBackend& boardLinkLocked() noexcept;
 
     void workerLoop();
 
@@ -175,31 +186,10 @@ private:
     // Outputs go to a board: the RNR board or a connected firmware board (not in the simulator)
     bool outputsLiveLocked() const noexcept { return !telemetry_.simulator_mode && (board_->isOpen() || fwActiveLocked()); }
     void closeFirmwarePathLocked();
-    void fwTickLocked();
-    void fwHandleEventLocked(const motion::PathEvent& e);
-    // Manual moves (work coordinates, like the slice planner's input) on a firmware board
-    bool fwStartManualMovesLocked(const std::vector<ToolpathSegment>& moves, ControllerState state,
-                                  const motion::OutputRequest* during = nullptr);
-    void fwApplyOutputsLocked(uint8_t logical_mask);
-    void fwSpindleSpeedChangedLocked();
-    void fwToolChangeLocked(const ToolpathSegment& seg);
-    bool fwStartJobLocked(size_t start_seg, bool resume_in_place);
-    double fwAxisMaxVelocityLocked(size_t axis) const;
     bool probeInputMissingLocked() const noexcept;
     // Safe approach moves before a job starts (shared by the slice planner and firmware boards)
     std::vector<ToolpathSegment> buildJobPrefixLocked(size_t start_from_segment, bool resume_in_place,
                                                       size_t& program_first, std::array<double, 4>& plan_start);
-    void processBoardReportLocked(bool got_report, const board::BoardStatus& rep, bool usb_open_now);
-    void runMotionTickLocked(bool gcode_running);
-    bool sendQueuedSliceLocked();
-    // Program motion runs on the board like an MDI move: outputs set while the board is at rest, Start
-    // Continuous Jog, slices, and End of Motion when the board runs out of slices. Returns true when a program
-    // slice with these outputs may be sent now; false = wait (the board must come to rest first). With
-    // arm = false it only sets the outputs if possible (spindle spin-up wait).
-    bool prepareProgramRunLocked(uint8_t outputs_mask, bool arm);
-    bool boardBufferFullLocked() const;
-    void closeProgramRunLocked();
-    void finishQueueLocked();
     void updateSpindleLocked(bool gcode_running);
     // Spindle speed: the range without a VFD is 0..kDefaultSpindleMaxRpm
     uint32_t spindleMaxRpmLocked() const noexcept;
@@ -214,14 +204,10 @@ private:
     void faultLocked(const std::string& message, ControllerState state = ControllerState::EStop);
     void stopJobLocked(bool is_estop = false);
     void pauseJobLocked();
-    void beginHoldDecelLocked(bool stop_after);
     void applyConfigLocked(const MachineConfig& cfg);
     // Board output writes: translate the logical outputs mask to OUT1..OUT4 with the pin assignment (config_.io)
     void setBoardOutputsLocked(uint8_t logical_mask, bool limit_override);
     void setBoardOutputsAfterMotionLocked(uint8_t logical_mask, bool limit_override);
-    bool sendBoardSliceLocked(board::SliceStream stream, const core::StepSlice& slice, bool limit_override,
-                              uint16_t* out_seq = nullptr);
-    void syncBoardPositionLocked();
     void setMachinePositionLocked(const std::array<double, 4>& machine_pos_mm);
     void bumpWorkspaceRevisionLocked() noexcept { config_.workspace_revision++; }
 
@@ -234,8 +220,6 @@ private:
     ControllerState restStateLocked() const noexcept;
     // Door closed, chiller flowing and no PSU fault (inputs that are not configured count as fine)
     bool laserInterlocksOkLocked() const noexcept;
-    // Manual moves (go to zero, retracts, tool change park): planned as plain machine moves, no laser rules
-    std::deque<planner::PlannedSlice> planManualMovesLocked(const std::vector<ToolpathSegment>& moves) const;
     // M6: runs the M6 script when it is enabled and found (it continues the job itself); false = not started
     bool runM6ScriptLocked();
     // Description of a tool from the program's comments ("(T2 D=6 flat end mill)"), empty if none
@@ -267,16 +251,10 @@ private:
     // Motion helpers
     bool queueLinearMoveLocked(const std::array<double, 4>& end_work, double feed_mm_min, ControllerState state,
                                bool rapid = false);
-    void beginSettleLocked();
-    bool settledLocked() const;
-    void stopMotionForEventLocked();
 
     // Job planning
     planner::FrameContext jobFrameLocked() const;
     bool validateProgramForRunLocked(size_t start_seg);
-    void rebuildPlannedSlicesLocked(size_t start_from_segment, bool resume_in_place);
-    void refillJobQueueLocked();
-    void replanFromQueueTailLocked();
     void setProgramLocked(std::shared_ptr<const gcode::ParseResult> program);
     // Takes the lock itself; parses outside it. wait = false (worker tick): skip if another re-parse is running
     void reparseLoadedProgramIfNeeded(bool wait = true);
@@ -284,15 +262,11 @@ private:
     // Homing
     // axis < 0: all axes (Z, Y, X). Never runs the home script.
     void startBuiltInHomingLocked(int axis);
-    void startNextHomingAxisLocked();
-    void homingTickLocked();
-    bool homeSwitchActiveLocked(size_t axis) const;
 
     // Probing
     // `sim_contact_work`: simulator only - work coordinate where the emulated contact happens
     bool beginProbeMoveLocked(core::Axis axis, double signed_travel_mm, double feed_mm_min,
                               const double* sim_contact_work = nullptr);
-    void probingTickLocked();
     void onProbeMoveFinishedLocked(bool hit);
     void continueHoleCenterLocked();
 
@@ -304,11 +278,9 @@ private:
     MachineConfig pending_config_{};
     bool          has_pending_config_ = false;
     std::unique_ptr<board::IBoardDriver> board_;
-    size_t max_slices_in_flight_ = 3; // Unacknowledged slices kept on the board (from its capabilities)
     HuanyangVfdController vfd_controller_{};
     std::atomic<bool>     vfd_sync_needed_{false};   // config_.vfd changed: syncVfd() after releasing mutex_
     std::mutex            vfd_lifecycle_mutex_;      // Serializes syncVfd() (UI thread and worker)
-    float                 queued_feed_override_pct_ = 100.0f; // Override the queued slices were planned with
     TelemetrySnapshot telemetry_{};
     uint16_t hw_inputs_bitmask_ = 0;
 
@@ -335,72 +307,20 @@ private:
     SurfaceHeightMap   surface_height_map_{};
     std::thread        surface_probing_thread_{};
     std::atomic<bool>  surface_probing_cancel_requested_{false};
-    std::deque<planner::PlannedSlice> slice_queue_{};
-    std::unique_ptr<planner::StreamingPlanner> job_planner_;
     planner::FrameContext job_frame_{};
     double mdi_feed_mm_min_ = 0.0;
 
-    struct SeqProgressInfo {
-        size_t segment_index    = 0;
-        size_t gcode_line       = 0;
-        float  segment_progress = 0.0f;
-        bool   is_gcode_stream  = false;
-        Clock::time_point sent_at{};
-    };
-    std::unordered_map<uint16_t, SeqProgressInfo> in_flight_seqs_{};
-    // Program slices go to the board as internal motion slices in MDI-style runs (prepareProgramRunLocked)
-    bool     program_run_open_     = false;  // Start Continuous Jog sent, End of Motion not yet
-    uint16_t program_outputs_sent_ = 0xFFFF; // Logical outputs last set for the program, 0xFFFF = unknown
-    // When the board will have run every slice sent so far (each slice is 25 ms of motion). Slices are paced by
-    // this, not only by acknowledgements: the board acknowledges a slice when it is buffered, not when it has run.
-    Clock::time_point board_busy_until_{};
 
-    // Board feedback & watchdogs
-    bool                   board_report_seen_   = false;
-    Clock::time_point      connect_time_{};
-    Clock::time_point      last_report_time_{};
-    bool                   hw_estop_fault_      = false;
-    bool                   hw_limit_fault_      = false;
-    bool                   hw_motion_active_    = false;
-    std::array<int32_t, 4> hw_live_steps_{};
-    std::array<int32_t, 4> hw_latched_steps_{};
-    bool                   feedback_validated_  = false; // Board step counters proven to track commanded position
 
-    // Settle wait after a hardware stop (probe contact, home switch, cancel)
-    bool              settle_active_ = false;
-    bool              settle_board_idle_seen_ = false;
-    Clock::time_point settle_deadline_{};
 
-    // Last slice handed to the hardware (planning frame) - used for feed hold deceleration
-    std::array<double, 4> last_sent_target_{};
-    bool                  last_sent_target_valid_ = false;
-    double                last_sent_speed_mm_s_   = 0.0;
-    // Program segment of the last slice SENT (acknowledgements lag behind) - resume point after a hold
-    size_t                last_sent_program_segment_       = 0;
-    bool                  last_sent_program_segment_valid_ = false;
-    bool                  last_sent_from_program_          = false; // false = inside a safe-approach prefix
 
-    // Feed hold / stop deceleration
-    bool hold_decel_active_   = false;
-    bool hold_needs_replan_   = false;
-    bool resume_after_hold_   = false;
-    bool stop_after_hold_     = false;
 
     // Continuous jog state (with simultaneous multi-axis smooth accel & decel ramps)
     bool cont_jog_active_ = false;
     std::array<bool, 4>   cont_jog_held_{false, false, false, false};
     std::array<Clock::time_point, 4> cont_jog_refresh_{};
     std::array<double, 4> cont_jog_target_vel_mm_s_{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> cont_jog_current_vel_mm_s_{0.0, 0.0, 0.0, 0.0};
-    std::array<int32_t, 4> cont_jog_accum_steps_{0, 0, 0, 0};
-    std::array<double, 4> cont_jog_ideal_pos_mm_{0.0, 0.0, 0.0, 0.0};
 
-    // Multi-axis Homing state machine
-    enum class HomingPhase : uint8_t { None, BackOff, Seek, PullOff };
-    std::deque<core::Axis> homing_axis_queue_{};
-    core::Axis active_homing_axis_ = core::Axis::Z;
-    HomingPhase    homing_phase_       = HomingPhase::None;
-    bool           homing_switch_event_ = false; // Switch transition seen; waiting for the stop to settle
 
     // Active Probing state machine
     enum class ProbeMode : uint8_t {
@@ -422,7 +342,6 @@ private:
     bool probe_move_is_search_     = false; // false = repositioning move inside a probe sequence
     bool probe_contact_captured_   = false;
     std::array<double, 4> probe_contact_machine_{};
-    std::array<int32_t, 4> probe_latched_at_arm_{};
     // Hole-center sequence
     int    hole_step_ = 0;
     double hole_search_mm_ = 0.0;
@@ -455,20 +374,11 @@ private:
     std::mutex fw_ptr_mutex_;              // Guards fw_ replacement against triggerEStop() (taken after mutex_)
     std::string board_id_ = board::kRnrBoardId;
     uint64_t caps_revision_ = 1;
-    uint8_t  fw_outputs_applied_ = 0xFF;   // Logical outputs last applied to the firmware board
-    bool     fw_job_spindle_on_ = false, fw_job_spindle_ccw_ = false; // App-driven spindle during a firmware job
-    bool     fw_sync_wait_ = false;        // Waiting for the spindle before continuing the job
-    Clock::time_point fw_sync_continue_at_{};
-    size_t   fw_resume_segment_ = 0;       // After M0 / M1 on a firmware board
-    bool     fw_program_stop_ = false;
-    uint8_t  fw_homing_mask_ = 0;
-    uint32_t fw_arc_failed_seen_ = 0;      // PathFeedback::arc_failed_count already reported
-    uint64_t fw_thc_mode_rev_ = ~0ULL;     // Capabilities revision the board THC mode was read at
-    bool     fw_seen_held_ = false;        // The board reported its feed hold (resume from its own button)
-    bool     suppress_fw_estop_ = false;   // Fault from the board itself: no extra reset
-    Clock::time_point fw_state_grace_until_{};
-    std::array<double, 4> fw_vel_pos_{};    // Position at the last velocity sample (per-axis velocity readout)
-    Clock::time_point fw_vel_time_{};
+
+    // Host-planned boards (RNR) and the simulator: slice queue, planner, board feedback, app-driven homing
+    std::unique_ptr<SliceBackend> slice_;
+    // Firmware-planned boards (GRBL family): drives fw_ while one is connected
+    std::unique_ptr<FirmwareBackend> firmware_;
 
     static inline std::atomic<bool> hardware_access_enabled_{true};
 };

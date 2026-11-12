@@ -107,71 +107,16 @@ void MachineController::setPhysicalOutput(uint8_t out_1_to_4, bool enabled) {
 }
 
 void MachineController::setBoardOutputsLocked(uint8_t logical_mask, bool limit_override) {
-    if (fwActiveLocked()) {
-        fwApplyOutputsLocked(logical_mask);
-        return;
-    }
-    board_->setOutputs(io::physicalOutputs(config_.io, logical_mask), limit_override);
+    motionLocked().setOutputs(logical_mask, limit_override);
 }
 
 void MachineController::setBoardOutputsAfterMotionLocked(uint8_t logical_mask, bool limit_override) {
-    if (fwActiveLocked()) {
-        fwApplyOutputsLocked(logical_mask);
-        return;
-    }
-    board_->setOutputsAfterMotion(io::physicalOutputs(config_.io, logical_mask), limit_override);
+    motionLocked().setOutputsAfterMotion(logical_mask, limit_override);
 }
 
-bool MachineController::sendBoardSliceLocked(board::SliceStream stream, const core::StepSlice& slice,
-                                             bool limit_override, uint16_t* out_seq) {
-    core::StepSlice phys = slice;
-    phys.outputs_mask = io::physicalOutputs(config_.io, slice.outputs_mask);
-    if (!board_->sendSlice(stream, phys, limit_override, out_seq)) return false;
-    const auto now = Clock::now();
-    board_busy_until_ = std::max(now, board_busy_until_) + kTickInterval;
-    return true;
-}
 
-bool MachineController::boardBufferFullLocked() const {
-    // Keep at most max_slices_in_flight_ slices (75 ms) of motion ahead of the board. An acknowledgement only
-    // means the board has buffered a slice: pacing by acknowledgements alone let the app run up to 3x real time
-    // ahead until the board's buffer was full, so programs and feed holds ran 3-4 s behind the app.
-    const auto lead = kTickInterval * static_cast<int>(max_slices_in_flight_);
-    return board_busy_until_ > Clock::now() + lead - kTickInterval / 2;
-}
 
-bool MachineController::prepareProgramRunLocked(uint8_t outputs_mask, bool arm) {
-    // The board is at rest: every slice acknowledged, and the board has had time to run every slice sent
-    // (plus 50 ms). The motion flag is not used: it may stay set while a run is open.
-    const bool at_rest = in_flight_seqs_.empty() && (Clock::now() > board_busy_until_ + 2 * kTickInterval);
-    // Ran out of slices (spindle wait, pause, tool change): end that run like a finished MDI move
-    if (program_run_open_ && at_rest) {
-        closeProgramRunLocked();
-    }
-    if (program_outputs_sent_ != outputs_mask) {
-        // The planner stops at every outputs change, so this only waits for the last slices to run
-        if (!at_rest) return false;
-        setBoardOutputsLocked(outputs_mask, config_.limit_override);
-        program_outputs_sent_ = outputs_mask;
-    }
-    if (!arm) return false;
-    if (!program_run_open_) {
-        if (!at_rest) return false;
-        board_->beginJog(Axis::X, config_.limit_override);
-        program_run_open_ = true;
-    }
-    return true;
-}
 
-void MachineController::closeProgramRunLocked() {
-    if (!program_run_open_) return;
-    program_run_open_ = false;
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        const uint8_t mask = (program_outputs_sent_ <= 0xFF) ? static_cast<uint8_t>(program_outputs_sent_)
-                                                            : telemetry_.outputs_bitmask;
-        setBoardOutputsAfterMotionLocked(mask, config_.limit_override);
-    }
-}
 
 void MachineController::setSpindlePwm(uint16_t duty) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -181,11 +126,7 @@ void MachineController::setSpindlePwm(uint16_t duty) {
     telemetry_.commanded_spindle_rpm   = clampRpm((static_cast<uint32_t>(target_spindle_pwm_duty_) * spindleMaxRpmLocked()) / 1000);
     telemetry_.spindle_override_active = (telemetry_.commanded_spindle_rpm != telemetry_.program_spindle_rpm);
 
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
-    } else if (fwActiveLocked()) {
-        fwSpindleSpeedChangedLocked();
-    }
+    motionLocked().spindleSpeedChanged();
     if (config_.vfd.enabled) {
         vfd_controller_.setRpm(telemetry_.commanded_spindle_rpm);
     }
@@ -203,11 +144,7 @@ void MachineController::applyCommandedRpmLocked(uint32_t rpm, bool send_pwm) {
     if (config_.is_mill) {
         telemetry_.spindle_pwm_duty = target_spindle_pwm_duty_;
         if (send_pwm) {
-            if (board_->isOpen() && !telemetry_.simulator_mode) {
-                board_->setSpindlePwm(telemetry_.spindle_pwm_duty, config_.limit_override);
-            } else if (fwActiveLocked()) {
-                fwSpindleSpeedChangedLocked();
-            }
+            motionLocked().spindleSpeedChanged();
         }
     }
     if (config_.vfd.enabled) {
@@ -310,35 +247,7 @@ void MachineController::testFireLaserPulse(float duration_ms, float power_pct) {
         telemetry_.active_fault_message = "Laser test pulse blocked: safety interlock not satisfied (door / chiller / PSU)";
         return;
     }
-    if (fwActiveLocked()) {
-        // Firmware board: constant power (M3) for the pulse time, at standstill
-        const double secs = std::clamp(static_cast<double>(duration_ms) / 1000.0, 0.01, 2.0);
-        const float pct = std::clamp(power_pct, 1.0f, 100.0f);
-        const double duty = config_.laser.min_duty_pct + (pct / 100.0) * (config_.laser.max_duty_pct - config_.laser.min_duty_pct);
-        const double s_val = std::clamp(duty, 0.0, 100.0) / 100.0 * fw_->firmware().max_spindle_rpm;
-        std::string err;
-        if (!fw_->runLines({"M3S" + motion::GcodeEmitter::num(s_val, 0), "G4P" + motion::GcodeEmitter::num(secs, 3), "M5"}, &err)) {
-            telemetry_.active_fault_message = "Laser test pulse rejected: " + err;
-        }
-        return;
-    }
-    pulse_active_ = true;
-    pulse_timer_s_ = 0.0;
-    pulse_duration_s_ = std::clamp(static_cast<double>(duration_ms) / 1000.0, 0.01, 2.0);
-    pulse_power_pct_ = std::clamp(power_pct, 1.0f, 100.0f);
-
-    float duty_fraction = config_.laser.min_duty_pct + (pulse_power_pct_ / 100.0f) * (config_.laser.max_duty_pct - config_.laser.min_duty_pct);
-    uint16_t duty = static_cast<uint16_t>(std::clamp(duty_fraction * 10.0f, 0.0f, 1000.0f));
-
-    telemetry_.outputs_bitmask |= core::OutputBit::OUT1_TorchOrSpindle;
-    telemetry_.torch_or_spindle_on = true;
-    telemetry_.spindle_pwm_duty = duty;
-    telemetry_.live_laser_power_pct = pulse_power_pct_;
-
-    if (board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->setSpindlePwm(duty, config_.limit_override);
-        setBoardOutputsLocked(telemetry_.outputs_bitmask, config_.limit_override);
-    }
+    motionLocked().testFireLaserPulse(duration_ms, power_pct);
 }
 
 void MachineController::frameBoundingBox() {
@@ -396,44 +305,7 @@ void MachineController::frameBoundingBox() {
         if (!checkLinearMoveLocked(telemetry_.work_pos_mm, p)) return;
     }
 
-    if (fwActiveLocked()) {
-        std::vector<ToolpathSegment> moves;
-        std::array<double, 4> from = telemetry_.work_pos_mm;
-        for (const auto& p : pts) {
-            ToolpathSegment seg{};
-            seg.type = SegmentType::CutLinear;
-            seg.start_xyza_mm = from;
-            seg.end_xyza_mm = p;
-            seg.feed_mm_min = speed;
-            moves.push_back(seg);
-            from = p;
-        }
-        motion::OutputRequest beam;
-        if ((out_mask & core::OutputBit::OUT1_TorchOrSpindle) != 0 && framing_duty > 0) {
-            beam.spindle_on = true;
-            beam.laser = true;
-            beam.laser_dynamic = false;
-            beam.s_value = framing_duty / 1000.0 * fw_->firmware().max_spindle_rpm;
-        }
-        fwStartManualMovesLocked(moves, ControllerState::Jogging, beam.spindle_on ? &beam : nullptr);
-        return;
-    }
-    MachineConfig manual_cfg = config_;
-    manual_cfg.is_mill = true; // Framing moves: no laser Z lock / output rewriting
-    slice_queue_.clear();
-    auto rapid_start = planner::TrajectoryPlanner::sliceLinearMove(telemetry_.work_pos_mm, pts[0], speed, manual_cfg, 0);
-    slice_queue_.insert(slice_queue_.end(), rapid_start.begin(), rapid_start.end());
-    for (size_t i = 0; i < 4; ++i) {
-        auto edge_slices = planner::TrajectoryPlanner::sliceLinearMove(pts[i], pts[i + 1], speed, manual_cfg, out_mask);
-        slice_queue_.insert(slice_queue_.end(), edge_slices.begin(), edge_slices.end());
-    }
-
-    if (framing_duty > 0 && board_->isOpen() && !telemetry_.simulator_mode) {
-        board_->setSpindlePwm(framing_duty, config_.limit_override);
-    }
-    telemetry_.spindle_pwm_duty = framing_duty;
-    // Framing runs as a manual move: job-only logic (dynamic laser power, THC) must not touch it
-    telemetry_.state = ControllerState::Jogging;
+    motionLocked().startFraming(pts, speed, out_mask, framing_duty);
 }
 
 } // namespace rnr::core

@@ -256,7 +256,7 @@ bool FirmwarePlannedPath::produceJobLines() {
         bool whole = pi == arc.first_segment && arc.segment_count > 0 && last < prog.segments.size() &&
                      !(job_.laser && job_.laser_lock_z && arc.plane != 17);
         for (size_t i = pi; whole && i <= last; ++i) {
-            if (prog.segments[i].arc_index != seg.arc_index || prog.segments[i].machine_axes_mask != 0) whole = false;
+            if (prog.segments[i].arc_index != seg.arc_index || prog.segments[i].hasMachineTarget()) whole = false;
         }
         if (whole) {
             const auto end = resolveSegment(prog.segments[last]);

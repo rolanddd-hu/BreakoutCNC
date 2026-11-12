@@ -52,6 +52,8 @@ public:
     size_t rx_size = 128;              // Receive buffer (bytes)
     size_t planner_blocks = 15;
     double probe_contact_z = NAN;      // Machine Z where a downward probe touches (NaN = never)
+    // A round hole in machine X / Y: the probe touches its wall at this radius from the centre (NaN = no hole)
+    double probe_hole_x = NAN, probe_hole_y = NAN, probe_hole_radius = NAN;
     std::string reject_substring;      // A line containing this is answered with reject_code
     int    reject_code = 20;
     bool   silent = false;             // Stop answering entirely
@@ -345,7 +347,12 @@ private:
     bool plasmaActive() const { return plasma_plugin && flavour_ == Flavour::GrblHal; }
     bool thcRunning() const { return plasmaActive() && plasma_mode != 0 && arc_ok && cutting_; }
 
-    bool probeTouching() const { return !std::isnan(probe_contact_z) && pos[2] <= probe_contact_z + 1e-9; }
+    bool probeTouchingZ() const { return !std::isnan(probe_contact_z) && pos[2] <= probe_contact_z + 1e-9; }
+    bool probeTouchingWall() const {
+        if (std::isnan(probe_hole_radius)) return false;
+        return std::hypot(pos[0] - probe_hole_x, pos[1] - probe_hole_y) >= probe_hole_radius - 1e-9;
+    }
+    bool probeTouching() const { return probeTouchingZ() || probeTouchingWall(); }
 
     // Simulated time
     void advance() {
@@ -440,7 +447,13 @@ private:
             for (size_t a = 0; a < 4; ++a) pos[a] += d[a] / len * step;
             dt = 0.0;
             if (b.probe && probeTouching()) {
-                pos[2] = probe_contact_z;
+                if (probeTouchingZ()) pos[2] = probe_contact_z;
+                if (probeTouchingWall()) {
+                    // Back onto the wall along the radius (the last step may have gone a little past it)
+                    const double r = std::hypot(pos[0] - probe_hole_x, pos[1] - probe_hole_y);
+                    pos[0] = probe_hole_x + (pos[0] - probe_hole_x) / r * probe_hole_radius;
+                    pos[1] = probe_hole_y + (pos[1] - probe_hole_y) / r * probe_hole_radius;
+                }
                 planner_.clear();
                 out("[PRB:" + values(pos) + ":1]");
                 state = "Idle";

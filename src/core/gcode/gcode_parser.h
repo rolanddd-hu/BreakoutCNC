@@ -46,6 +46,8 @@ struct ParseResult {
     SharedLines                        lines;
     std::vector<core::ToolpathSegment> segments;
     std::vector<ArcInfo>               arcs;
+    // End points of the G53 / G28 / G30 moves (ToolpathSegment::machine_target)
+    std::vector<core::MachineTarget>   machine_targets;
     std::array<double, 3>              bbox_min_mm           = {0.0, 0.0, 0.0};
     std::array<double, 3>              bbox_max_mm           = {0.0, 0.0, 0.0};
     double                             total_cut_length_mm   = 0.0;

@@ -9,8 +9,10 @@ using namespace mc_detail;
 // Construction / connection
 // ============================================================================
 MachineController::MachineController(std::unique_ptr<board::IBoardDriver> board, bool connect_now)
-    : board_(board ? std::move(board) : board::createBoardDriver(board::BoardType::RnrEcoMotion)) {
-    max_slices_in_flight_ = std::max<size_t>(1, board_->capabilities().max_slices_in_flight);
+    : board_(board ? std::move(board) : board::createBoardDriver(board::BoardType::RnrEcoMotion)),
+      slice_(std::make_unique<SliceBackend>(*this)),
+      firmware_(std::make_unique<FirmwareBackend>(*this)) {
+    slice_->setMaxSlicesInFlight(board_->capabilities().max_slices_in_flight);
     script_runner_ = std::make_unique<scripting::ScriptRunner>(this);
 
     for (size_t i = 0; i < 4; ++i) {
@@ -82,7 +84,7 @@ void MachineController::closeFirmwarePathLocked() {
     telemetry_.thc_on_board = telemetry_.thc_board_active = telemetry_.thc_torch_on = false;
     telemetry_.thc_arc_voltage = 0.0;
     telemetry_.thc_board_mode.clear();
-    fw_arc_failed_seen_ = 0;
+    firmware_->onBoardClosedLocked();
 }
 
 bool MachineController::connectLocked() {
@@ -124,7 +126,7 @@ bool MachineController::connectLocked() {
         telemetry_.serial_number   = fw_->connectionLabel();
         telemetry_.firmware_version.clear();
         telemetry_.board_status_text = fw_->feedback().status_text;
-        fw_outputs_applied_ = 0xFF;
+        firmware_->onBoardConnected();
         telemetry_.outputs_bitmask     = 0;
         telemetry_.torch_or_spindle_on = false;
         telemetry_.limit_switch_triggered = false;
@@ -156,17 +158,8 @@ bool MachineController::connectLocked() {
     telemetry_.torch_or_spindle_on = false;
 
     // Sync board hardware step accumulators to the current machine coordinates
-    syncBoardPositionLocked();
-
-    board_report_seen_    = false;
-    feedback_validated_   = false;
-    connect_time_         = Clock::now();
-    last_report_time_     = connect_time_;
-    hw_estop_fault_       = false;
-    hw_limit_fault_       = false;
-    in_flight_seqs_.clear();
-    program_run_open_     = false;
-    program_outputs_sent_ = 0xFFFF;
+    slice_->syncBoardPositionLocked();
+    slice_->onBoardConnected();
 
     telemetry_.limit_switch_triggered = false;
     telemetry_.soft_limit_triggered   = false;
@@ -235,10 +228,8 @@ void MachineController::setSimulatorMode(bool enabled) {
         telemetry_.serial_number = info.serial_number;
         // Leaving the simulator: the simulated position is meaningless for the real machine
         telemetry_.axis_homed = {false, false, false, false};
-        syncBoardPositionLocked();
-        feedback_validated_ = false;
-        board_report_seen_  = false;
-        connect_time_       = Clock::now();
+        slice_->syncBoardPositionLocked();
+        slice_->restartFeedbackLocked();
         telemetry_.state    = ControllerState::EStop;
     } else {
         telemetry_.state = ControllerState::Disconnected;
@@ -429,7 +420,7 @@ void MachineController::applyConfigLocked(const MachineConfig& cfg_in) {
         if (outputs_remapped) setBoardOutputsLocked(0, cfg.limit_override);
         if (steps_changed) {
             // Board step counters are in steps: re-express the current position with the new scale
-            syncBoardPositionLocked();
+            slice_->syncBoardPositionLocked();
         }
     }
 
@@ -553,13 +544,13 @@ void MachineController::triggerEStop() {
 }
 
 void MachineController::faultLocked(const std::string& message, ControllerState state) {
-    const bool was_moving = motionActiveLocked() || hold_decel_active_;
+    const bool was_moving = motionActiveLocked() || motionLocked().decelerating();
     stopJobLocked(true);
     telemetry_.state = state;
     telemetry_.active_fault_message = message;
     config_.limit_override = false;
     telemetry_.limit_override_active = false;
-    if (was_moving && !telemetry_.simulator_mode && !feedback_validated_) {
+    if (was_moving && !telemetry_.simulator_mode && !motionLocked().positionKnownAfterStop()) {
         // The board was stopped mid-motion and we cannot read back where it actually stopped
         telemetry_.axis_homed = {false, false, false, false};
         telemetry_.active_fault_message += " - position uncertain, re-home the machine";
@@ -568,106 +559,9 @@ void MachineController::faultLocked(const std::string& message, ControllerState 
 
 bool MachineController::resetFromEStop() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!telemetry_.simulator_mode && firmwareBoardSelectedLocked()) {
-        if (!fwActiveLocked()) {
-            telemetry_.active_fault_message = "Cannot reset: the board is not connected";
-            return false;
-        }
-        if (!fw_->ready()) {
-            telemetry_.active_fault_message = "Cannot reset: the board is still connecting";
-            return false;
-        }
-        evaluateInputsAndEndStopsLocked();
-        if (fw_->feedback().estop_active) {
-            telemetry_.active_fault_message = "Cannot reset: the board's E-stop input is still active";
-            return false;
-        }
-        if (config_.vfd.enabled) {
-            const auto vt = vfd_controller_.getTelemetry();
-            if (vt.anyAlarm()) {
-                telemetry_.active_fault_message = "Cannot reset: clear the VFD alarm first (" + vt.last_error_msg + ")";
-                return false;
-            }
-        }
-        if (fw_->inAlarm()) {
-            std::string err;
-            if (!fw_->unlock(&err)) {
-                telemetry_.active_fault_message = "Cannot reset: " + err;
-                return false;
-            }
-        }
-        fw_outputs_applied_ = 0xFF;
-        telemetry_.limit_switch_triggered = false;
-        telemetry_.soft_limit_triggered   = false;
-        telemetry_.active_fault_message.clear();
-        if (config_.require_homing) {
-            for (size_t a = 0; a < 3; ++a) {
-                if (!telemetry_.axis_homed[a]) {
-                    telemetry_.active_fault_message = "Machine not homed: home it before running programs in machine coordinates";
-                    break;
-                }
-            }
-        }
-        telemetry_.state = ControllerState::Idle;
-        return true;
-    }
-    const bool hw = !telemetry_.simulator_mode;
-    if (hw && !board_->isOpen()) {
-        telemetry_.active_fault_message = "Cannot reset: motion board is not connected";
-        return false;
-    }
-    evaluateInputsAndEndStopsLocked();
-    if (estopInputActiveLocked()) {
-        telemetry_.active_fault_message = "Cannot reset: E-Stop input is still active";
-        return false;
-    }
-    if (hw && hw_estop_fault_) {
-        telemetry_.active_fault_message = "Cannot reset: board reports hardware E-Stop";
-        return false;
-    }
-    std::string limit_desc;
-    if (!config_.limit_override && anyLimitActiveLocked(&limit_desc)) {
-        telemetry_.active_fault_message = "Cannot reset: " + limit_desc + " is active - enable Limit Override to jog off";
-        return false;
-    }
-    if (config_.operation_mode == OperationMode::Laser && !config_.is_mill) {
-        if (config_.laser.chiller_flow_pin >= 1 && !telemetry_.laser_chiller_flow_ok) {
-            telemetry_.active_fault_message = "Cannot reset: laser chiller flow interlock not satisfied";
-            return false;
-        }
-        if (config_.laser.laser_fault_pin >= 1 && telemetry_.laser_fault_active) {
-            telemetry_.active_fault_message = "Cannot reset: laser PSU fault input is active";
-            return false;
-        }
-    }
-    if (config_.vfd.enabled) {
-        const auto vt = vfd_controller_.getTelemetry();
-        if (vt.anyAlarm()) {
-            telemetry_.active_fault_message = "Cannot reset: clear the VFD alarm first (" + vt.last_error_msg + ")";
-            return false;
-        }
-    }
-
-    if (board_->isOpen() && hw) {
-        board_->clearEmergencyStop();
-        // The Pre-Reset in clearEmergencyStop() puts the board back on its default timing: without a new
-        // configuration it ran our 25 ms slices jerkily until any setting (such as the pulse rate) was changed.
-        // The Mach3 plugin also re-sends its configuration after the clear.
-        board_->configure(config_, false);
-        // The reset clears the board's step counters (measured on an RNR Eco Motion 2.0, which also ignores Set Axis
-        // Positions): from now on they count from zero, not from the machine position
-        feedback_validated_     = false;
-        last_sent_target_valid_ = false;
-    }
-    program_run_open_     = false;
-    program_outputs_sent_ = 0xFFFF;
-    telemetry_.limit_switch_triggered = false;
-    telemetry_.soft_limit_triggered   = false;
-    telemetry_.active_fault_message.clear();
-    telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
-    telemetry_.current_feed_mm_min = 0.0;
-    telemetry_.state = ControllerState::Idle;
-    return true;
+    // A firmware board selected (connected or not) answers for itself; the RNR board and the simulator otherwise
+    if (!telemetry_.simulator_mode && firmwareBoardSelectedLocked()) return firmware_->resetFromEStop();
+    return slice_->resetFromEStop();
 }
 
 bool MachineController::jobActiveLocked(bool include_tool_change) const noexcept {
@@ -687,27 +581,22 @@ bool MachineController::laserInterlocksOkLocked() const noexcept {
            !(lz.laser_fault_pin >= 1 && telemetry_.laser_fault_active);
 }
 
-std::deque<planner::PlannedSlice> MachineController::planManualMovesLocked(const std::vector<ToolpathSegment>& moves) const {
-    MachineConfig manual_cfg = config_;
-    manual_cfg.is_mill = true; // Manual moves: no laser Z lock / output rules
-    return planner::TrajectoryPlanner::sliceProgram(moves, manual_cfg);
-}
 
 bool MachineController::motionActiveLocked() const noexcept {
     const auto s = telemetry_.state;
     return s == ControllerState::RunningGCode || s == ControllerState::DwellPierce ||
            s == ControllerState::Jogging || s == ControllerState::Homing || s == ControllerState::Probing ||
-           cont_jog_active_ || hold_decel_active_;
+           cont_jog_active_ || motionLocked().decelerating();
 }
 
 bool MachineController::readyForCommandLocked(bool allow_tool_change_hold, const char* what) {
     const auto s = telemetry_.state;
     const bool ok_state = (s == ControllerState::Idle) ||
                           (allow_tool_change_hold && s == ControllerState::ToolChangeHold);
-    if (!ok_state || cont_jog_active_ || hold_decel_active_) {
+    if (!ok_state || cont_jog_active_ || motionLocked().decelerating()) {
         return false;
     }
-    if (fwActiveLocked() && (fw_->busyWithMotion() || !fw_->ready())) {
+    if (motionLocked().boardBusy()) {
         telemetry_.active_fault_message = std::string(what) + " rejected: the board is busy";
         return false;
     }

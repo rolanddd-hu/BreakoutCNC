@@ -106,6 +106,7 @@ void SmokeTest::frame(AppWindow& window, core::IMotionController& controller) {
         failed = (t.active_segment_index == 0);
         std::printf("Smoke test %s: %d frames, demo job at segment %zu\n", failed ? "FAILED" : "passed", frames,
                     t.active_segment_index);
+        if (failed) std::printf("  state %d, message: %s\n", static_cast<int>(t.state), t.active_fault_message.c_str());
         std::fflush(stdout);
         window.closeWindow();
     }

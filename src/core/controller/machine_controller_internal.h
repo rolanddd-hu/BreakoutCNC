@@ -1,6 +1,8 @@
 #pragma once
 // Shared by the machine_controller*.cpp files (one class, split by topic). Not for other code.
 #include "core/controller/machine_controller.h"
+#include "core/controller/firmware_backend.h"
+#include "core/controller/slice_backend.h"
 #include "core/diagnostics.h"
 #include "core/io/io_map.h"
 #include "core/scripting/script_runner.h"
@@ -27,7 +29,7 @@ inline std::shared_ptr<const gcode::ParseResult> warpProgram(const gcode::ParseR
     warped->segments = planner::TrajectoryPlanner::warpToolpathWithHeightMap(base.segments, map, 2.0);
     bool first = true;
     for (const auto& seg : warped->segments) {
-        if (seg.type == SegmentType::RapidMove && seg.machine_axes_mask != 0) continue;
+        if (seg.type == SegmentType::RapidMove && seg.hasMachineTarget()) continue;
         if (first) {
             warped->bbox_min_mm = {seg.start_xyza_mm[0], seg.start_xyza_mm[1], seg.start_xyza_mm[2]};
             warped->bbox_max_mm = warped->bbox_min_mm;

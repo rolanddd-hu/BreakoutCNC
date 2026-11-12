@@ -94,13 +94,23 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
         out.blockers.push_back({ProgramIssueKind::StartBlocker, line, std::move(text)});
     };
 
+    // A machine-coordinate move whose end point the job frame cannot find would run to its parse-time preview
+    // instead (an internal error: every job frame carries the program's MachineTarget table)
+    for (size_t i = in.start_segment; i < segs.size(); ++i) {
+        if (planner::TrajectoryPlanner::resolvable(segs[i], in.frame)) continue;
+        block(segs[i].gcode_line, "Internal error: the machine-coordinate target of this move (G53 / G28 / G30) is missing.",
+              "internal error: a machine-coordinate move (G53/G28/G30) has no target. Reload the program.");
+        break;
+    }
+
     // Homing: machine coordinates (G53 / G28 / G30) mean nothing on an axis that is not homed
     if (!in.simulator && cfg.require_homing) {
         for (size_t a = 0; a < 4; ++a) {
             if (!((prog.machine_axes_used >> a) & 1U) || in.homed[a]) continue;
             size_t line = 0;
             for (const auto& s : segs) {
-                if ((s.machine_axes_mask >> a) & 1U) {
+                if (s.hasMachineTarget() && s.machine_target < prog.machine_targets.size() &&
+                    ((prog.machine_targets[s.machine_target].axes_mask >> a) & 1U)) {
                     line = s.gcode_line;
                     break;
                 }
@@ -152,7 +162,7 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
                 change_line = seg.gcode_line;
                 continue;
             }
-            if (expect_tlo_after_change && isMotion(seg) && seg.machine_axes_mask == 0) {
+            if (expect_tlo_after_change && isMotion(seg) && !seg.hasMachineTarget()) {
                 if (seg.tlo_tool != changed_to) {
                     const std::string t = std::to_string(changed_to);
                     block(change_line, "The tool change to T" + t + " is not followed by G43 H" + t +
@@ -223,7 +233,7 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
         double first_feed = 0.0, first_reach = 0.0;
         for (size_t i = in.start_segment; i < segs.size(); ++i) {
             const auto& s = segs[i];
-            if (!isFeedMove(s) || s.machine_axes_mask != 0 || s.feed_mm_min <= 0.0) continue;
+            if (!isFeedMove(s) || s.hasMachineTarget() || s.feed_mm_min <= 0.0) continue;
             std::array<double, 4> d{};
             double len2 = 0.0;
             for (size_t a = 0; a < 4; ++a) {
@@ -313,7 +323,7 @@ MachineCheckResult checkProgramAgainstMachine(const gcode::ParseResult& prog, co
             const auto& s = segs[i];
             if (s.type == SegmentType::ToolChange) continue;
             const bool below_z0 = std::min(s.start_xyza_mm[2], s.end_xyza_mm[2]) < kBelowZ0;
-            if (isFeedMove(s) && below_z0 && s.machine_axes_mask == 0 &&
+            if (isFeedMove(s) && below_z0 && !s.hasMachineTarget() &&
                 !(s.outputs_mask & OutputBit::OUT1_TorchOrSpindle)) {
                 out.warnings.push_back({ProgramIssueKind::Warning, s.gcode_line,
                                         "Feed move below Z0 while the spindle is off (no M3 / M4 in effect). Start "
