@@ -51,6 +51,13 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   input for a second), and wakes at once on any input.
 
 ### Fixed
+- **RNR Eco Motion 2.0** (found with a board on the bench):
+  - After homing or a restored position, an E-stop could move the machine position (and every work offset) by the
+    homing distance: the board's step counters do not follow a new machine zero, and the app adopted them.
+  - An MDI move or jog started right after the previous one ended could be lost (the board was still running it);
+    a move now ends when the board has run it.
+  - Right after connecting, the board could be reported as lost although it worked.
+  - A controlled stop could leave the board a few hundredths of a millimetre off.
 - **Laser `S0` cut at full power** on the RNR board and kept the previous power on GRBL-family boards. `S0` is now 0 %
   (beam off).
 - **Huanyang VFD:** switching the VFD off in the settings (or closing the application) while the spindle ran could
@@ -73,6 +80,8 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   machine, whatever has the focus).
 - Program file names in the remote upload folder are no longer kept forever (cleaned at startup).
 - COM ports above COM128 are listed, in numeric order.
+- A settings backup that had become read-only was never updated again.
+- Long explanations in the camera, probing, Mach3 import and VFD panels wrap instead of being cut off.
 - Remote monitoring web server security:
   - Another web page opened on the shop network can no longer upload G-code or press the remote E-stop through the
     browser, and a web site cannot read the camera or the job state by pointing its own name at the PC (DNS

@@ -229,6 +229,11 @@ void MachineController::updateContinuousJogLocked() {
             faultLocked("USB write failed while jogging");
         }
     } else {
+        // The board still runs the last jog slices: stay in Jogging until it has had the time (see finishQueueLocked)
+        if (board_->isOpen() && !telemetry_.simulator_mode && now < board_busy_until_ + 2 * kTickInterval) {
+            telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
+            return;
+        }
         cont_jog_active_           = false;
         telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
         if (telemetry_.state == ControllerState::Jogging) {

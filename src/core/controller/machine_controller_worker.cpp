@@ -630,7 +630,9 @@ void MachineController::finishQueueLocked() {
     const bool hw = board_->isOpen() && !telemetry_.simulator_mode;
 
     if (hold_decel_active_) {
-        if (stop_after_hold_ && hw && !in_flight_seqs_.empty()) return; // Let the last decel slices execute
+        // Let the last decel slices run on the board before the stop cancels its buffer
+        if (stop_after_hold_ && hw && !in_flight_seqs_.empty()) return;
+        if (stop_after_hold_ && hw && Clock::now() < board_busy_until_ + 2 * kTickInterval) return;
         hold_decel_active_ = false;
         telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
         last_sent_speed_mm_s_ = 0.0;
@@ -649,8 +651,12 @@ void MachineController::finishQueueLocked() {
 
     if (telemetry_.state == ControllerState::PausedHold) return;
 
-    // In real hardware mode, wait until the board has acknowledged every slice
+    // In real hardware mode, wait until the board has acknowledged every slice, and until it has had the time to run
+    // them: it acknowledges a slice when it buffers it. A move started before the board has finished the previous one
+    // is ignored by the board (seen on the RNR Eco Motion 2.0: an MDI move right after another one was lost), and Idle
+    // must mean the machine has stopped.
     if (hw && !in_flight_seqs_.empty()) return;
+    if (hw && Clock::now() < board_busy_until_ + 2 * kTickInterval) return;
 
     telemetry_.axis_vel_mm_min = {0.0, 0.0, 0.0, 0.0};
     last_sent_speed_mm_s_ = 0.0;
@@ -778,10 +784,12 @@ void MachineController::workerLoop() {
         // Read the newest board status WITHOUT holding the controller lock (board reads can block for a few ms)
         board::BoardStatus rep{};
         const bool got_any = board_->isOpen() && board_->readStatus(rep, 2);
-        const bool usb_open_now = board_->isOpen();
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            // Read under the lock: connect() may have opened the board since the status read above, and an open state
+            // read before it would report the fresh connection as lost
+            const bool usb_open_now = board_->isOpen();
             const auto lock_start = Clock::now();
             struct HoldTimer {
                 Clock::time_point start;

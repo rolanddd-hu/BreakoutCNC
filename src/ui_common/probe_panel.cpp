@@ -421,11 +421,15 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
         if (is_imperial) {
             double span_w_in = span_w * u_scale;
             double span_h_in = span_h * u_scale;
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Area: %.2f in (W) x %.2f in (H)  |  %.2f sq in",
                                 span_w_in, span_h_in, span_w_in * span_h_in);
+            ImGui::PopTextWrapPos();
         } else {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Area: %.1f mm (W) x %.1f mm (H)  |  %.1f cm2",
                                 span_w, span_h, span_w * span_h / 100.0);
+            ImGui::PopTextWrapPos();
         }
 
         ImGui::Spacing();
@@ -551,11 +555,15 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
 
         ImGui::Spacing();
         if (is_imperial) {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Total Points: %d (%d x %d)  |  dX: %.3f in, dY: %.3f in",
                                 total_pts, surface_points_x_, surface_points_y_, dx * u_scale, dy * u_scale);
+            ImGui::PopTextWrapPos();
         } else {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Total Points: %d (%d x %d)  |  dX: %.1f mm, dY: %.1f mm",
                                 total_pts, surface_points_x_, surface_points_y_, dx, dy);
+            ImGui::PopTextWrapPos();
         }
     }
     ImGui::EndChild();

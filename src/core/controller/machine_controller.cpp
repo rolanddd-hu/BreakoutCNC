@@ -652,10 +652,12 @@ bool MachineController::resetFromEStop() {
         board_->clearEmergencyStop();
         // The Pre-Reset in clearEmergencyStop() puts the board back on its default timing: without a new
         // configuration it ran our 25 ms slices jerkily until any setting (such as the pulse rate) was changed.
-        // The Mach3 plugin also re-sends its configuration after the clear. The step counters survive a reset,
-        // and after an E-stop mid-move the board's counters are more accurate than our commanded position, so
-        // they are not overwritten here.
+        // The Mach3 plugin also re-sends its configuration after the clear.
         board_->configure(config_, false);
+        // The reset clears the board's step counters (measured on an RNR Eco Motion 2.0, which also ignores Set Axis
+        // Positions): from now on they count from zero, not from the machine position
+        feedback_validated_     = false;
+        last_sent_target_valid_ = false;
     }
     program_run_open_     = false;
     program_outputs_sent_ = 0xFFFF;

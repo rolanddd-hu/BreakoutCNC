@@ -112,7 +112,9 @@ bool CameraPanel::render(
                     }
                 }
             } else {
+                ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextDisabled("Select a top-down camera above to enable optical XY positioning.");
+                ImGui::PopTextWrapPos();
             }
         }
         ImGui::EndChild();
@@ -144,8 +146,10 @@ bool CameraPanel::render(
                     if (cam.is_calibrated) {
                         double cam_wx = (telemetry.work_pos_mm[0] - cam.offset_x_mm) * u_scale;
                         double cam_wy = (telemetry.work_pos_mm[1] - cam.offset_y_mm) * u_scale;
+                        ImGui::PushTextWrapPos(0.0f);
                         ImGui::Text("Crosshair Target:  X: %+.3f %s   Y: %+.3f %s",
                                     cam_wx, u_lbl, cam_wy, u_lbl);
+                        ImGui::PopTextWrapPos();
                         ImGui::Spacing();
 
                         ImGui::BeginDisabled(telemetry.state == core::ControllerState::RunningGCode);
@@ -183,9 +187,11 @@ bool CameraPanel::render(
                         ImGui::Spacing();
                         ImGui::Separator();
                         ImGui::Spacing();
+                        ImGui::PushTextWrapPos(0.0f);
                         ImGui::TextDisabled("Offset: X %+.2f, Y %+.2f %s  |  FOV: %.1f x %.1f %s",
                                             cam.offset_x_mm * u_scale, cam.offset_y_mm * u_scale, u_lbl,
                                             cam.fov_x_mm * u_scale, cam.fov_y_mm * u_scale, u_lbl);
+                        ImGui::PopTextWrapPos();
                         if (ImGui::Button("Recalibrate Camera...", ImVec2(-1.0f, 28.0f)) && viewport != nullptr) {
                             cal_step_ = 0;
                             viewport->startCameraCalibration();
@@ -291,7 +297,9 @@ bool CameraPanel::render(
                         // -----------------------------------------------------
                         // STEP 2 ONLY: Field of View (Move & Click OR Tape Measure)
                         // -----------------------------------------------------
+                        ImGui::PushTextWrapPos(0.0f);
                         ImGui::TextDisabled("Select how you want to measure the camera Field of View:");
+                        ImGui::PopTextWrapPos();
                         if (fov_method_ == 0) ImGui::PushStyleColor(ImGuiCol_Button, theme::pal().btn_primary);
                         if (fov_method_ == 0) ImGui::PushStyleColor(ImGuiCol_Text, theme::contrastText(theme::pal().btn_primary));
                         if (ImGui::Button("Method A: Move +X & Click", ImVec2(half_w, 28.0f))) {

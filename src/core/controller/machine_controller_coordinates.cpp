@@ -19,6 +19,11 @@ void MachineController::setMachinePositionLocked(const std::array<double, 4>& ma
 
 void MachineController::syncBoardPositionLocked() {
     if (!board_->isOpen() || telemetry_.simulator_mode) return;
+    // The machine position was redefined (connect, homing, restored position, new steps/mm). The RNR Eco Motion 2.0
+    // ignores Set Axis Positions, so its counters keep their own zero: they are no longer proven to be machine
+    // coordinates until they match the commanded position again. Adopting them anyway moved the machine position
+    // (and every work offset) by the homing distance at the next E-stop.
+    feedback_validated_ = false;
     std::array<int32_t, 4> steps{};
     for (size_t i = 0; i < 4; ++i) {
         steps[i] = static_cast<int32_t>(std::llround(telemetry_.machine_pos_mm[i] * config_.axes[i].steps_per_mm));

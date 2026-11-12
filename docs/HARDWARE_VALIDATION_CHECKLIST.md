@@ -25,6 +25,26 @@ themselves through that message.
 
 ---
 
+## Automated bench check (RNR Eco Motion 2.0)
+
+`build\Release\rnr_hardware_check.exe --yes-the-board-is-on-the-bench` drives a board on the bench through the
+machine controller (motors may turn, OUT1..OUT4 switch; nothing must be connected that can cut, burn or crash). It
+runs jogs, MDI moves, a job with arcs and short moves, feed hold and resume, feed override steps, a controlled stop,
+an E-stop mid-job, outputs, spindle PWM, a laser job with `S0`, reconnects and position changes, and after each one
+compares the board's own step counters with the position the application commanded (103 checks). It uses default
+settings and never reads or writes a settings file. `--set-position-experiment` checks whether the board takes
+Set Axis Positions.
+
+Measured on the bench (firmware of the board used for development):
+- The status byte read as "sequence active" is 1 whenever the board is armed (after RESET E-STOP), also at rest,
+  and 0 in E-stop. It does not say whether the board is moving.
+- **Set Axis Positions is ignored**: the step counters only count the steps the board runs.
+- **RESET E-STOP clears the step counters** to 0 (the E-stop itself keeps them).
+- So after homing, a restored position or a reset, the counters do not show machine coordinates: the application
+  no longer adopts them then (before, an E-stop after homing could move the machine position by the homing distance).
+
+---
+
 ## Phase 1 - Board communication & watchdogs
 
 **[ASSUMPTION] The board sends status reports continuously, at least every 500 ms.**

@@ -1,5 +1,8 @@
 #include "ui_common/app_shell.h"
 #include "ui_common/theme.h"
+#include "ui_common/app_window.h"
+#include "ui_common/toolpath_viewport.h"
+#include <cstdio>
 #include <imgui.h>
 #include <imgui_internal.h> // ClosePopupsExceptModals
 #include <algorithm>
@@ -48,6 +51,64 @@ void renderSettingsSaveWarning(std::string& message) {
     }
     ImGui::End();
     ImGui::PopStyleColor();
+}
+
+void connectWindowSettings(AppWindow& window, ToolpathViewport& viewport, config::AppUiSettings& ui_settings,
+                           const std::function<void()>& mark_dirty, bool* minimal_layout) {
+    // FULL / MINIMAL layout switcher in the custom title bar
+    window.setMinimalLayout(minimal_layout, [&ui_settings, mark_dirty](bool is_min) {
+        ui_settings.minimal_layout = is_min;
+        mark_dirty();
+    });
+    // Light / dark theme buttons: restore the theme chosen in each family, then the active one
+    theme::setTheme(theme::findTheme(theme::Mode::Dark, ui_settings.dark_theme_id.c_str()));
+    theme::setTheme(theme::findTheme(theme::Mode::Light, ui_settings.light_theme_id.c_str()));
+    theme::setMode(ui_settings.light_theme ? theme::Mode::Light : theme::Mode::Dark);
+    window.setOnThemeChanged([&ui_settings, mark_dirty](bool light) {
+        ui_settings.light_theme    = light;
+        ui_settings.dark_theme_id  = theme::themeInfo(theme::familyTheme(theme::Mode::Dark)).id;
+        ui_settings.light_theme_id = theme::themeInfo(theme::familyTheme(theme::Mode::Light)).id;
+        mark_dirty();
+    });
+    // Viewport options are saved when toggled
+    viewport.setOnViewChanged([&ui_settings, &viewport, mark_dirty]() {
+        ui_settings.isometric_3d         = viewport.isIsometric3D();
+        ui_settings.show_rapids          = viewport.getShowRapids();
+        ui_settings.toolpath_simplify_px = viewport.getSimplifyPx();
+        ui_settings.show_pierces         = viewport.getShowPierces();
+        ui_settings.follow_torch         = viewport.getFollowTorch();
+        mark_dirty();
+    });
+}
+
+void installCloseHandling(AppWindow& window, core::IMotionController& controller, bool& force_close, bool& show_confirm,
+                          std::function<void()> save_settings) {
+    window.setCloseInterceptor(
+        [&controller, &force_close]() {
+            if (force_close) return true;
+            const auto s = controller.getTelemetry().state;
+            return !(s == core::ControllerState::RunningGCode || s == core::ControllerState::DwellPierce ||
+                     s == core::ControllerState::Jogging);
+        },
+        [&show_confirm]() { show_confirm = true; });
+    window.setOnCloseCallback([&controller, save_settings]() {
+        controller.triggerEStop();
+        save_settings();
+    });
+}
+
+void SmokeTest::frame(AppWindow& window, core::IMotionController& controller) {
+    if (!enabled) return;
+    ++frames;
+    if (frames == 10 && controller.resetFromEStop()) controller.startJob();
+    if (frames == 240) { // ~4 s at 60 FPS
+        const auto t = controller.getTelemetry();
+        failed = (t.active_segment_index == 0);
+        std::printf("Smoke test %s: %d frames, demo job at segment %zu\n", failed ? "FAILED" : "passed", frames,
+                    t.active_segment_index);
+        std::fflush(stdout);
+        window.closeWindow();
+    }
 }
 
 } // namespace rnr::ui

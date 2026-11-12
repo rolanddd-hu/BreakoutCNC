@@ -988,7 +988,9 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
                 ImGui::PopStyleColor(2);
             }
             if (tel.simulator_mode) {
+                ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextDisabled("(Simulator Mode active: click any IN1..IN12 button above to simulate a switch press)");
+                ImGui::PopTextWrapPos();
             }
 
             ImGui::Spacing();
@@ -1038,7 +1040,9 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
                 ImGui::Separator();
                 ImGui::Spacing();
                 ImGui::TextColored(theme::pal().text_info, "Spindle Dry-Run Speed Check:");
+                ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextDisabled("Select or type the safe test speed for your spindle (minimum RPM depends on spindle type/cooling):");
+                ImGui::PopTextWrapPos();
 
                 ImGui::SetNextItemWidth(130.0f);
                 if (ImGui::InputInt("Test RPM##SpindleTestInput", &test_spindle_rpm_, 500, 2000)) {

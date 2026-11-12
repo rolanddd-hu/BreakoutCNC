@@ -29,28 +29,43 @@ listed was done, the rest is open; **Open** = not done, with the reason. Regress
 | A15 | Done | The board stream opens on the protocol's reader thread; `poll()` on POSIX; `[v6]:port` addresses | Regression test (slow stream) |
 | A16 | Done | VFD driver started / stopped outside the controller lock (`syncVfd()`) | All suites |
 | A17 | Done | One prompt snapshot; empty program refused without replacing; leftover removed; `exists()` without throw; COM ports above 128, numeric order; IPv6 | Regression tests |
-| A18 | Partly | All listed buttons are 28 px. The ~50 long text literals were not audited one by one | Screenshots |
+| A18 | Done | All listed buttons are 28 px. Audit of every long single-line text: 11 wrapped; 3 left on purpose (the program row next to the cycle buttons, the performance overlay, a label followed by its value on the same line) | Audit script, screenshots |
 | P1 | Done | `getConfigShared()`: a cached, shared snapshot (compared, copied only after a change); every UI read uses it | All suites, both apps |
-| P2 | Partly | `tool_description` left the segment (looked up by tool number), source lines shared between program copies, segment is plain data (`static_assert`). Machine targets are still in every segment (a side table would need the planner to see the program) | Regression test |
+| P2 | Partly | `tool_description` left the segment (looked up by tool number), source lines shared between program copies, segment is plain data (`static_assert`). Not done on purpose: moving machine targets to a side table. Every path that maps segments to the machine (planner, program check, firmware path, MDI) would have to find the table, and a missed one would silently send G53 / G28 moves to the wrong place, a crash risk for ~15 % of segment memory | Regression test |
 | P3 | Done | Parser reuses its buffers; `strchr` | All suites |
 | P4 | Done | Planner buffers are members | All suites |
 | P5 | Done | One read and one write event per serial port | Board tests (fake stream); real ports not tested |
 | P6 | Done | Idle frame rate ~15 FPS (perf log: 42, 26, 17, 15, 15 ...); `imgui_demo.cpp` removed; `getSliceQueue()` marked as a test accessor | BreakoutMill perf log |
-| M1 | Partly | Stage 1: `machine_controller.cpp` split into 8 topic files with a private `machine_controller_internal.h`. Stage 2 (backend seam) not done: it rewires the RNR timing paths, which need the real board to validate | Build with warnings as errors, all suites |
-| M2 | Partly | Shared: remote upload, ESC rule, save warning, idle rule, Limits & Homing and Motors sections (`machine_settings_sections.cpp`, ~430 lines less per app). Each `main()` is still ~1 800 lines | Both apps, Limits / Motors edited and saved |
+| M1 | Partly | Stage 1: `machine_controller.cpp` split into 8 topic files. Stage 2 (a backend seam between the RNR slice path and the firmware path) not done: it is a redesign of the motion core, best done on its own branch. The new `rnr_hardware_check` (103 checks on a real board) and the board tests are the safety net it needs | Build with warnings as errors, all suites, RNR hardware check |
+| M2 | Partly | Shared in `ui_common`: remote upload (load and hand-over to the UI), ESC rule, save warning, idle rule, window settings (layout, themes, viewport), close confirmation, smoke test, Limits & Homing and Motors sections. Each `main()` is still ~1 700 lines: the rest is the app-specific settings sections (spindle / VFD / tool table in Mill, THC / laser in Cut) and layout | Both apps: upload, theme, close dialog, Limits / Motors |
 | M3 | Done | Helpers: spindle speed (3), `jobActiveLocked`, `restStateLocked`, `laserInterlocksOkLocked`, `planManualMovesLocked`, M6 script and tool change moves, `warpProgram` (also fixes the bounding box after load / re-parse), `syncVfd` | All suites |
 | M4 | Done | `machine_config.h`, `surface_height_map.h`, `toolpath_segment.h`, `telemetry.h`; the parser includes only what it needs | Build |
-| M5 | Partly | Round-trip test (every saved key changed, loaded, saved, compared): no key is lost today. The descriptor table was not written | Regression test |
-| M6 | Partly | Samples and machine detection moved to their own files. `parse()` itself was not restructured | All suites |
+| M5 | Done | One table drives loading and saving of the ~150 plain settings; list entries and old key names are explicit code. Round-trip test: no key lost. Re-saving the existing test settings files gave identical keys and values. A read-only backup file is made writable before it is replaced | Regression test, re-save comparison |
+| M6 | Done | `parse()` is a `Parser` class: program state as members, per-line state reset for each block, one function per step (line, modal words, tool change, axis words and G68, G92 / G53 / G28, dwell, motion, canned cycle, arc, end of block). Old and new parser output compared on 16 049 dump lines (samples, tricky blocks, errors, options): identical | Parse dump comparison, all suites |
 | M7 | Done | `firmware_planned_path.cpp` split into 4 topic files | Board tests |
 | M8 | Done | Script engine test split into 4 files (same executable, 51/51); regression tests added; CTest | CTest |
 | M9 | Done | `core/util/app_paths` used by the app and the script lookup (now cross-platform) | All suites |
 | M10 | Done | `winmm` linked in CMake, old names in scripts, `kPi` | Build |
 | B1 | Done | CTest for all 4 suites; both workflows run `ctest` | Local `ctest` |
-| B2 | Done | `/W4` on own targets (clean, `/WX` in Windows CI); `-Wall -Wextra` on GCC / Clang (not errors yet: not built here); ASan + UBSan job (reports without blocking until its first clean run) | Local strict build; CI not run |
+| B2 | Done | `/W4` on own targets (clean, `/WX` in Windows CI); `-Wall -Wextra` on GCC / Clang (not errors); ASan + UBSan job, blocking since its first clean run | CI run of b5e000a: Windows, Linux, macOS, sanitizers all passed |
 | B3 | Done | GLFW, Lua, hidapi pinned to commits | Configure + build |
 | B4 | Done | One script / resource copy, `copy_directory_if_different` on CMake 3.26+; `.editorconfig` and `.clang-format`. Version bump left for the release | Build |
 | D1-D3 | Done | User guide homing and laser S text, historical note on the scripting spec, changelog | - |
+
+
+### Found with the RNR board on the bench (after the first fix round)
+
+The new `tests/rnr_hardware_check.cpp` drives a real RNR Eco Motion 2.0 through the controller. Built against the code
+from before this review (0c911d1), it showed the same problems as against the reviewed code, so none of them came
+from the refactors. All four are fixed and covered by the check (103/103, twice) and by a regression test with an
+RNR-like fake board.
+
+| ID | Problem | Fix |
+|---|---|---|
+| R1 | Connecting reported "USB CONNECTION TO MOTION BOARD LOST" right away: the worker read whether the board was open before taking the lock, and the connect landed in between | Read under the lock |
+| R2 | An MDI move (or jog) started right after another one was lost: the app went Idle when the board had buffered the last slices, and the board ignores a new start while it still runs | Idle only once the board has had the time to run every slice (moves, jogs, the stop after a feed hold) |
+| R3 | A controlled stop could leave the board a few hundredths of a millimetre from the app's position: the cancel reached the board while it still ran the last slow-down slices | Same wait before the cancel |
+| R4 | After homing (or a restored position) and an E-stop, the app could replace its machine position with the board's counters, moving every work offset by the homing distance. The board ignores Set Axis Positions and clears its counters on reset, so they are not machine coordinates | The counters count as proven only after they match again; the same flag guards probing's latched contact position |
 
 ## How to read this
 

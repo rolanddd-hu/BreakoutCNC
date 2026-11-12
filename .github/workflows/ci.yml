@@ -89,8 +89,6 @@ jobs:
   sanitizers:
     name: Linux (ASan + UBSan)
     runs-on: ubuntu-22.04
-    # Reports without blocking until its first clean run; then remove this line
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 

@@ -9,6 +9,7 @@
 #include "ui_common/lua_guide_examples.h"
 #include "core/board/board_registry.h"
 #include "core/transport/byte_stream.h"
+#include "core/board/board_driver.h"
 #include "core/util/utf8_path.h"
 #include "core/config/settings_manager.h"
 #include "core/scripting/script_path_helper.h"
@@ -538,6 +539,86 @@ void testM5SettingsRoundTrip() {
     for (const auto& f : {f1, f2, f1 + ".bak", f2 + ".bak"}) std::filesystem::remove(f, ec);
 }
 
+// RNR board on the bench (rnr_hardware_check): the RNR Eco Motion 2.0 ignores Set Axis Positions, clears its step
+// counters when the E-stop is reset and reports "sequence active" whenever it is armed. This fake board does the same.
+class RnrLikeBoard final : public rnr::board::IBoardDriver {
+public:
+    rnr::board::BoardCapabilities capabilities() const override {
+        rnr::board::BoardCapabilities c;
+        c.accesses_real_hardware = false;
+        return c;
+    }
+    bool open() override { open_ = true; return true; }
+    void close() override { open_ = false; }
+    bool isOpen() const override { return open_; }
+    rnr::board::BoardInfo info() const override { return {"RNR-like test board", "TEST"}; }
+    bool readStatus(rnr::board::BoardStatus& out, uint32_t timeout_ms) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min<uint32_t>(timeout_ms, 2)));
+        std::lock_guard<std::mutex> lock(m_);
+        out = {};
+        out.motion_active = armed_;            // Like the real board: set whenever it is armed, not only while moving
+        out.ack_seq = seq_;
+        out.live_steps = steps_;
+        out.latched_steps = steps_;
+        return true;
+    }
+    void configure(const rnr::core::MachineConfig&, bool) override {}
+    void emergencyStop() override { std::lock_guard<std::mutex> lock(m_); armed_ = false; }
+    void clearEmergencyStop() override { std::lock_guard<std::mutex> lock(m_); armed_ = true; steps_ = {}; }
+    void cancelMotion() override {}
+    void setOutputs(uint8_t, bool) override {}
+    void setOutputsAfterMotion(uint8_t, bool) override {}
+    void setSpindlePwm(uint16_t, bool) override {}
+    void setAxisPositions(const std::array<int32_t, 4>&) override {} // Ignored, as on the real board
+    void beginJog(rnr::core::Axis, bool) override {}
+    void armHomeSwitchStop(rnr::core::Axis) override {}
+    void armProbe(rnr::core::Axis) override {}
+    bool sendSlice(rnr::board::SliceStream, const rnr::core::StepSlice& slice, bool, uint16_t* out_seq) override {
+        std::lock_guard<std::mutex> lock(m_);
+        for (int a = 0; a < 4; ++a) steps_[a] += slice.delta_steps[a];
+        ++seq_;
+        if (out_seq) *out_seq = seq_;
+        return true;
+    }
+private:
+    std::mutex m_;
+    bool open_ = false, armed_ = false;
+    uint16_t seq_ = 0;
+    std::array<int32_t, 4> steps_{};
+};
+
+void testRnrCountersAreNotMachinePositions() {
+    std::cout << "[RNR] A new machine position survives an E-stop although the board's counters keep their own zero\n";
+    auto board = std::make_unique<RnrLikeBoard>();
+    rnr::core::MachineController c(std::move(board), false);
+    auto cfg = c.getConfig();
+    cfg.is_mill = true;
+    cfg.require_homing = false;
+    cfg.probe.probe_pin = 0;
+    c.applyConfig(cfg);
+    CHECK(c.connect());
+    CHECK(waitUntil([&] { return c.getTelemetry().usb_connected; }, 2000));
+    CHECK(c.resetFromEStop());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    c.triggerEStop();                                  // Counters == position here: the feedback counts as proven
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(c.resetFromEStop());
+    c.restoreSavedPositions({100.0, 50.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0}); // New machine zero (as homing sets)
+    c.jogStep(rnr::core::Axis::X, 2.0, 1200.0);
+    CHECK(waitUntil([&] { return c.getTelemetry().state == ControllerState::Idle; }, 5000));
+    c.triggerEStop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto t = c.getTelemetry();
+    CHECK(std::abs(t.machine_pos_mm[0] - 102.0) < 1e-6); // Before the fix: 2.0 (the board's own count)
+    CHECK(std::abs(t.machine_pos_mm[1] - 50.0) < 1e-6);
+    // A move right after another one ends only when the board has had the time to run it
+    CHECK(c.resetFromEStop());
+    CHECK(c.executeMdiCommand("G1 X110 F3000"));
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(waitUntil([&] { return c.getTelemetry().state == ControllerState::Idle; }, 5000));
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(150)); // 8 mm at 50 mm/s: ~160 ms + run-out
+}
+
 } // namespace
 
 int main() {
@@ -558,6 +639,7 @@ int main() {
     testA11ModalArc();
     testP2SharedProgram();
     testM5SettingsRoundTrip();
+    testRnrCountersAreNotMachinePositions();
 
     std::cout << "\n" << (g_checks - g_failures) << " of " << g_checks << " checks passed\n";
     if (g_failures) {

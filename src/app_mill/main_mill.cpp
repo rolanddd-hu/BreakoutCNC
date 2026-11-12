@@ -101,18 +101,12 @@ int main(int argc, char** argv) {
     core::CameraStreamServer stream_server(camera_mgr);
     stream_server.setEStopCallback([&controller]() { controller.triggerEStop(); });
 
-    std::mutex  remote_upload_mtx;
-    std::string remote_loaded_path;
-    bool        remote_viewport_fit_needed = false;
+    ui::RemoteUploadInbox remote_upload; // Filled by the web server thread, read by the frame loop
 
     stream_server.setLoadGCodeCallback([&](const std::string& filename, const std::string& content) -> core::LoadGCodeResult {
         std::string path;
         auto result = ui::loadRemoteUpload(controller, filename, content, path);
-        if (result.success) {
-            std::lock_guard<std::mutex> lock(remote_upload_mtx);
-            remote_loaded_path = path;
-            remote_viewport_fit_needed = true;
-        }
+        if (result.success) remote_upload.post(path);
         return result;
     });
 
@@ -268,32 +262,7 @@ int main(int argc, char** argv) {
         }
     };
 
-    // Connect FULL / MINIMAL layout switcher to the custom title bar
-    window.setMinimalLayout(&minimal_layout, [&](bool is_min) {
-        saved_settings.ui.minimal_layout = is_min;
-        markSettingsDirty();
-    });
-
-    // Light / dark theme buttons in the custom title bar: restore the theme chosen in each family, then the active one
-    ui::theme::setTheme(ui::theme::findTheme(ui::theme::Mode::Dark, saved_settings.ui.dark_theme_id.c_str()));
-    ui::theme::setTheme(ui::theme::findTheme(ui::theme::Mode::Light, saved_settings.ui.light_theme_id.c_str()));
-    ui::theme::setMode(saved_settings.ui.light_theme ? ui::theme::Mode::Light : ui::theme::Mode::Dark);
-    window.setOnThemeChanged([&](bool light) {
-        saved_settings.ui.light_theme    = light;
-        saved_settings.ui.dark_theme_id  = ui::theme::themeInfo(ui::theme::familyTheme(ui::theme::Mode::Dark)).id;
-        saved_settings.ui.light_theme_id = ui::theme::themeInfo(ui::theme::familyTheme(ui::theme::Mode::Light)).id;
-        markSettingsDirty();
-    });
-
-    // Auto-save viewport settings when toggled
-    viewport.setOnViewChanged([&]() {
-        saved_settings.ui.isometric_3d = viewport.isIsometric3D();
-        saved_settings.ui.show_rapids  = viewport.getShowRapids();
-        saved_settings.ui.toolpath_simplify_px = viewport.getSimplifyPx();
-        saved_settings.ui.show_pierces = viewport.getShowPierces();
-        saved_settings.ui.follow_torch = viewport.getFollowTorch();
-        markSettingsDirty();
-    });
+    ui::connectWindowSettings(window, viewport, saved_settings.ui, markSettingsDirty, &minimal_layout);
 
     // A G-code file given on the command line ("Open with" / double-click) or dropped onto the window
     if (!arg_file.empty()) {
@@ -306,42 +275,13 @@ int main(int argc, char** argv) {
 
     bool show_exit_confirm_modal = false;
     bool force_close = false;
-    window.setCloseInterceptor(
-        [&]() {
-            if (force_close) return true;
-            const auto tel = controller.getTelemetry();
-            bool is_running = (tel.state == core::ControllerState::RunningGCode ||
-                               tel.state == core::ControllerState::DwellPierce ||
-                               tel.state == core::ControllerState::Jogging);
-            return !is_running;
-        },
-        [&]() {
-            show_exit_confirm_modal = true;
-        }
-    );
-
-    window.setOnCloseCallback([&]() {
-        controller.triggerEStop();
-        saveCurrentSettings();
-    });
+    ui::installCloseHandling(window, controller, force_close, show_exit_confirm_modal, saveCurrentSettings);
 
     if (smoke_test) ImGui::GetIO().IniFilename = nullptr; // No imgui.ini either
-    int  smoke_frames = 0;
-    bool smoke_failed = false;
+    ui::SmokeTest smoke{smoke_test};
 
     int exit_code = window.runLoop([&]() {
-        if (smoke_test) {
-            ++smoke_frames;
-            if (smoke_frames == 10 && controller.resetFromEStop()) controller.startJob();
-            if (smoke_frames == 240) { // ~4 s at 60 FPS
-                const auto t = controller.getTelemetry();
-                smoke_failed = (t.active_segment_index == 0);
-                std::printf("Smoke test %s: %d frames, demo job at segment %zu\n", smoke_failed ? "FAILED" : "passed",
-                            smoke_frames, t.active_segment_index);
-                std::fflush(stdout);
-                window.closeWindow();
-            }
-        }
+        smoke.frame(window, controller);
         // Global keyboard E-Stop: ESC halts a moving machine whatever has keyboard focus (at rest it closes a popup)
         if (ui::escapeTriggersEStop(controller.getTelemetry())) {
             controller.triggerEStop();
@@ -350,19 +290,17 @@ int main(int argc, char** argv) {
 
         // Process any pending remote G-Code upload from the web server
         {
-            std::lock_guard<std::mutex> lock(remote_upload_mtx);
-            if (!remote_loaded_path.empty()) {
-                loaded_filename     = remote_loaded_path;
-                persisted_file_path = remote_loaded_path;
+            std::string upload_path;
+            bool fit = false;
+            if (remote_upload.take(upload_path, fit)) {
+                loaded_filename     = upload_path;
+                persisted_file_path = upload_path;
                 saved_settings.ui.last_gcode_file_path = persisted_file_path;
                 markSettingsDirty();
-                if (remote_viewport_fit_needed) {
+                if (fit) {
                     const auto pr_ptr = controller.getProgram();
-                    const auto& pr = *pr_ptr;
-                    viewport.fitToBounds(pr.bbox_min_mm, pr.bbox_max_mm);
-                    remote_viewport_fit_needed = false;
+                    viewport.fitToBounds(pr_ptr->bbox_min_mm, pr_ptr->bbox_max_mm);
                 }
-                remote_loaded_path.clear();
             }
         }
 
@@ -1295,8 +1233,10 @@ int main(int argc, char** argv) {
                         ImGui::Spacing();
                         ImGui::Separator();
                         ImGui::Spacing();
+                        ImGui::PushTextWrapPos(0.0f);
                         ImGui::TextDisabled("Packets: %u TX | %u RX | %u Errors",
                                             vt.packets_sent, vt.packets_received, vt.comm_errors);
+                        ImGui::PopTextWrapPos();
                     }
                     ImGui::EndChild();
 
@@ -1816,5 +1756,5 @@ int main(int argc, char** argv) {
     // Ensure E-Stop is engaged and automatically persist all settings on exit
     controller.triggerEStop();
     saveCurrentSettings();
-    return smoke_failed ? 2 : exit_code;
+    return smoke.failed ? 2 : exit_code;
 }
