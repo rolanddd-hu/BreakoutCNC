@@ -371,13 +371,13 @@ void testProbingSequences() {
     r.g->probe_hole_radius = NAN;
     cfg = r.c->getConfig();
     cfg.probe.fast_feed_mm_min = 20.0;
-    cfg.probe.surface_max_depth_below_zero_mm = 50.0;
+    cfg.probe.surface_max_depth_below_zero_mm = 200.0;
     r.c->applyConfig(cfg);
     r.c->startSurfaceProbing(-5.0, 5.0, -5.0, 5.0, 2, 2);
     CHECK(waitFor([&] { return r.t().state == core::ControllerState::Probing && r.g->currentState() == "Run"; }, 8000));
     r.c->cancelSurfaceProbing();
-    CHECK(waitFor([&] { return !r.t().surface_probing_active; }, 5000));
-    CHECK(waitFor([&] { return r.g->currentState() == "Idle"; }, 3000)); // Before the fix: kept probing for seconds
+    CHECK(waitFor([&] { return !r.t().surface_probing_active; }, 8000));
+    CHECK(waitFor([&] { return r.g->currentState() == "Idle"; }, 5000)); // Before the fix: kept probing (~30 s)
     const double z_stopped = r.g->position()[2];
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     CHECK(near(r.g->position()[2], z_stopped));
@@ -533,9 +533,8 @@ void testArcs() {
     CHECK(waitFor([&] { const auto q = r.g->position(); return q[0] > 44.0 && q[1] > 11.0; }, 8000));
     p = r.g->position();
     CHECK(std::abs(std::hypot(p[0] - 40.0, p[1] - 20.0) - 10.0) < 0.05);
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    t = r.t();
-    CHECK(t.active_gcode_line_index == 3);
+    // The highlight reaches the quarter arc's line (waited for: a fixed pause let a stalled test see the next line)
+    CHECK(waitFor([&] { return r.t().active_gcode_line_index == 3; }, 3000));
     const bool g2_sent = r.g->sawLineContaining("G2") && r.g->sawLineContaining("I-10J0");
     CHECK(g2_sent);
     if (!g2_sent) {
@@ -628,7 +627,7 @@ void testBoardThc() {
     r.c->startJob();
     size_t samples = 0;
     CHECK(segmentNeverGoesBack(r, 20000, &samples));
-    CHECK(samples > 20);
+    CHECK(samples >= 5); // Watched while the job ran (a busy machine samples less often than every 5 ms)
     CHECK(r.idle(5000));
     CHECK(r.g->torch_starts == 2);
     CHECK(r.c->loadGCodeString(kPlasmaJob));
@@ -848,9 +847,11 @@ void testHoldStopEstop() {
     // E-stop while moving: the board resets with ALARM:3, the app goes to E-stop; Reset unlocks
     r.c->startJob();
     CHECK(waitFor([&] { return r.t().state == core::ControllerState::RunningGCode; }, 2000));
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // The board must really be moving: a reset at rest gives no ALARM:3 (a fixed wait failed on a busy CI machine)
+    const double estop_from_x = r.g->position()[0];
+    CHECK(waitFor([&] { return r.g->currentState() == "Run" && std::abs(r.g->position()[0] - estop_from_x) > 0.5; }, 5000));
     r.c->triggerEStop();
-    CHECK(waitFor([&] { return r.g->currentState() == "Alarm"; }, 2000));
+    CHECK(waitFor([&] { return r.g->currentState() == "Alarm"; }, 5000));
     CHECK(r.t().state == core::ControllerState::EStop);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     CHECK(r.c->resetFromEStop());
@@ -878,8 +879,16 @@ void testErrorsAndRestart() {
         CHECK(r.c->resetFromEStop());
         CHECK(r.idle(3000));
         r.g->restart();
-        CHECK(waitFor([&] { return r.t().active_fault_message.find("restarted") != std::string::npos; }, 3000));
-        CHECK(r.t().state == core::ControllerState::EStop);
+        // The fault message is replaced once the board is identified again ("Connected to ..."): a busy machine
+        // polls too rarely to see it, so look for the restart in the board log, which keeps it
+        const auto restart_logged = [&] {
+            for (const auto& e : r.c->getBoardLog(0)) {
+                if (e.text.find("The board restarted") != std::string::npos) return true;
+            }
+            return false;
+        };
+        CHECK(waitFor(restart_logged, 8000));
+        CHECK(waitFor([&] { return r.t().state == core::ControllerState::EStop; }, 2000));
     }
     {
         Rig r(FakeGrbl::Flavour::FluidNC, board::kFluidNcBoardId);

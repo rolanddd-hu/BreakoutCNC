@@ -919,12 +919,22 @@ void test32() {
         assert(controller.resetFromEStop());
         assert(controller.loadGCodeString("G21 G90\nG1 X200 F3000\n"));
         controller.startJob();
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // Wait for conditions, not fixed times: a busy CI machine (macOS runners) can stall the worker thread
+        for (int i = 0; i < 500 && controller.getTelemetry().machine_pos_mm[0] < 5.0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         const double x_at_pause = controller.getTelemetry().machine_pos_mm[0];
+        assert(x_at_pause >= 5.0);
         controller.pauseJob();
         assert(controller.getTelemetry().state == rnr::core::ControllerState::PausedHold);
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-        const double x_stopped = controller.getTelemetry().machine_pos_mm[0];
+        // Braking has ended once the position stays the same for 150 ms
+        double x_stopped = controller.getTelemetry().machine_pos_mm[0];
+        for (int stable = 0, i = 0; i < 300 && stable < 3; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const double x = controller.getTelemetry().machine_pos_mm[0];
+            stable = (x == x_stopped) ? stable + 1 : 0;
+            x_stopped = x;
+        }
         assert(x_stopped > x_at_pause);               // Kept moving while decelerating (no instant stop)
         assert(x_stopped - x_at_pause < 10.0);        // ...but only for the braking distance
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
