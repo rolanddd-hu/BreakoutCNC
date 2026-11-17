@@ -6,7 +6,9 @@
 #include "ui_common/board_panels.h"
 #include "core/board/io_model.h"
 #include "imgui.h"
+#include <cmath>
 #include <cstdio>
+#include <string>
 #include <algorithm>
 
 namespace rnr::ui {
@@ -490,6 +492,35 @@ void IoStatusBar::renderPulseRateSetting(
     ImGui::EndChild();
 }
 
+namespace {
+// E-stop banner: the message wraps in the space left of the RESET button (the button sat on top of long messages),
+// and the banner grows to fit it
+struct BannerLayout {
+    std::string text;
+    float  text_w = 0.0f, height = 40.0f;
+    ImVec2 text_pos{}, button_pos{};
+};
+
+BannerLayout bannerLayout(const core::TelemetrySnapshot& t, float width, float btn_w, float btn_h) {
+    constexpr float kPadX = 10.0f, kPadY = 6.0f;
+    BannerLayout l;
+    l.text = "E-STOP: " + (t.active_fault_message.empty() ? std::string("Emergency Stop Active") : t.active_fault_message);
+    l.text_w = std::max(80.0f, width - btn_w - kPadX * 3.0f);
+    const float text_h = ImGui::CalcTextSize(l.text.c_str(), nullptr, false, l.text_w).y;
+    l.height = std::max(40.0f, std::max(text_h, btn_h) + kPadY * 2.0f);
+    l.text_pos = ImVec2(kPadX, std::floor((l.height - text_h) * 0.5f));
+    l.button_pos = ImVec2(width - btn_w - kPadX, std::floor((l.height - btn_h) * 0.5f));
+    return l;
+}
+
+void drawBannerText(const BannerLayout& l) {
+    ImGui::SetCursorPos(l.text_pos);
+    ImGui::PushTextWrapPos(l.text_pos.x + l.text_w);
+    ImGui::TextColored(theme::pal().alarm_text, "%s", l.text.c_str());
+    ImGui::PopTextWrapPos();
+}
+} // namespace
+
 void IoStatusBar::renderGlobalAlarmBanner(
     core::IMotionController& controller,
     const core::TelemetrySnapshot& telemetry)
@@ -504,15 +535,10 @@ void IoStatusBar::renderGlobalAlarmBanner(
         ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
 
-        ImGui::BeginChild("##GlobalAlarmBanner", ImVec2(0.0f, 40.0f), true, ImGuiWindowFlags_NoScrollbar);
-        ImGui::AlignTextToFramePadding();
-        const char* msg = telemetry.active_fault_message.empty()
-                              ? "Emergency Stop Active"
-                              : telemetry.active_fault_message.c_str();
-        ImGui::TextColored(theme::pal().alarm_text, "  E-STOP: %s", msg);
-
-        const float right_x = ImGui::GetWindowWidth() - btn_w - 10.0f;
-        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 10.0f, right_x));
+        const BannerLayout lay = bannerLayout(telemetry, ImGui::GetContentRegionAvail().x, btn_w, btn_h);
+        ImGui::BeginChild("##GlobalAlarmBanner", ImVec2(0.0f, lay.height), true, ImGuiWindowFlags_NoScrollbar);
+        drawBannerText(lay);
+        ImGui::SetCursorPos(lay.button_pos);
 
         ImGui::PushStyleColor(ImGuiCol_Button,        theme::pal().alarm_btn);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pal().alarm_btn_hov);
@@ -540,8 +566,9 @@ void IoStatusBar::renderFloatingAlarmBanner(
         const float btn_w = 140.0f;
         const float btn_h = 28.0f;
 
+        const BannerLayout lay = bannerLayout(telemetry, width, btn_w, btn_h);
         ImGui::SetNextWindowPos(screen_pos);
-        ImGui::SetNextWindowSize(ImVec2(width, 40.0f));
+        ImGui::SetNextWindowSize(ImVec2(width, lay.height));
 
         // 85 % like the other toolpath view overlays, so the toolpath stays faintly visible behind the banner
         ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::pal().alarm_bg);
@@ -558,15 +585,8 @@ void IoStatusBar::renderFloatingAlarmBanner(
                          ImGuiWindowFlags_NoFocusOnAppearing |
                          ImGuiWindowFlags_NoNav))
         {
-            ImGui::AlignTextToFramePadding();
-            const char* msg = telemetry.active_fault_message.empty()
-                                  ? "Emergency Stop Active"
-                                  : telemetry.active_fault_message.c_str();
-            ImGui::TextColored(theme::pal().alarm_text, "  E-STOP: %s", msg);
-
-            const float right_x    = width - btn_w - 10.0f;
-            const float after_tx_x = ImGui::GetCursorPosX() + 10.0f;
-            ImGui::SameLine(std::max(after_tx_x, right_x));
+            drawBannerText(lay);
+            ImGui::SetCursorPos(lay.button_pos);
 
             ImGui::PushStyleColor(ImGuiCol_Button,        theme::pal().alarm_btn);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pal().alarm_btn_hov);

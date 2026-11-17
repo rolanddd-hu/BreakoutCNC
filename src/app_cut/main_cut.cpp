@@ -1,4 +1,5 @@
 #include "breakout_version.h"
+#include "ui_common/imgui_text_helpers.h"
 #include "core/controller/rnr_controller.h"
 #include "core/config/settings_manager.h"
 #include "ui_common/app_window.h"
@@ -871,7 +872,7 @@ int main(int argc, char** argv) {
                                 cfg.thc.arc_ok_pin = static_cast<uint8_t>(arc_pin);
                                 thc_changed = true;
                             }
-                            ImGui::SameLine();
+                            ui::sameLineIfFits(ui::checkboxWidth("Active Low##Arc"));
                             if (ImGui::Checkbox("Active Low##Arc", &cfg.thc.arc_ok_invert)) thc_changed = true;
                             if (ImGui::IsItemHovered()) {
                                 ImGui::SetTooltip("Active Low: Checked = Arc OK / Transfer signal pulls to COM/GND when arc establishes.\nUnchecked = Active High.");
@@ -883,7 +884,7 @@ int main(int argc, char** argv) {
                                 cfg.thc.thc_up_pin = static_cast<uint8_t>(up_pin);
                                 thc_changed = true;
                             }
-                            ImGui::SameLine();
+                            ui::sameLineIfFits(ui::checkboxWidth("Active Low##Up"));
                             if (ImGui::Checkbox("Active Low##Up", &cfg.thc.thc_up_invert)) thc_changed = true;
                             if (ImGui::IsItemHovered()) {
                                 ImGui::SetTooltip("Active Low: Checked = THC UP signal pulls to COM/GND.\nUnchecked = Active High.");
@@ -895,7 +896,7 @@ int main(int argc, char** argv) {
                                 cfg.thc.thc_down_pin = static_cast<uint8_t>(dn_pin);
                                 thc_changed = true;
                             }
-                            ImGui::SameLine();
+                            ui::sameLineIfFits(ui::checkboxWidth("Active Low##Dn"));
                             if (ImGui::Checkbox("Active Low##Dn", &cfg.thc.thc_down_invert)) thc_changed = true;
                             if (ImGui::IsItemHovered()) {
                                 ImGui::SetTooltip("Active Low: Checked = THC DN signal pulls to COM/GND.\nUnchecked = Active High.");
@@ -959,7 +960,7 @@ int main(int argc, char** argv) {
                                 cfg.probe.probe_pin = static_cast<uint8_t>(p_pin);
                                 probe_changed = true;
                             }
-                            ImGui::SameLine();
+                            ui::sameLineIfFits(ui::checkboxWidth("Active Low (Grounded to COM)##PlasmaProbe"));
                             if (ImGui::Checkbox("Active Low (Grounded to COM)##PlasmaProbe", &cfg.probe.probe_invert)) {
                                 probe_changed = true;
                             }
@@ -1166,7 +1167,7 @@ int main(int argc, char** argv) {
                                     changed = true;
                                 }
                                 if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Minimum threshold needed to ignite laser (typically 8-12% for CO2 glass tubes, 0% for diodes).");
+                                    ImGui::SetTooltip("Minimum threshold needed to ignite laser (typically 8-12%% for CO2 glass tubes, 0%% for diodes).");
                                 }
 
                                 float max_d = cfg.laser.max_duty_pct;
@@ -1176,7 +1177,7 @@ int main(int argc, char** argv) {
                                     changed = true;
                                 }
                                 if (ImGui::IsItemHovered()) {
-                                    ImGui::SetTooltip("Ceiling power cap (typically 85-90% to extend CO2 glass tube longevity, 100% for diodes).");
+                                    ImGui::SetTooltip("Ceiling power cap (typically 85-90%% to extend CO2 glass tube longevity, 100%% for diodes).");
                                 }
 
                                 int s_max = cfg.laser.s_max;
@@ -1511,7 +1512,7 @@ int main(int argc, char** argv) {
                                     cfg.laser.chiller_flow_pin = static_cast<uint8_t>(chill_pin);
                                     changed = true;
                                 }
-                                ImGui::SameLine();
+                                ui::sameLineIfFits(ui::checkboxWidth("Active Low##Chill"));
                                 if (ImGui::Checkbox("Active Low##Chill", &cfg.laser.chiller_flow_invert)) changed = true;
                                 if (ImGui::IsItemHovered()) {
                                     ImGui::SetTooltip("Active Low: Checked = flow sensor closes to COM/GND when cooling water is flowing normally.");
@@ -1523,7 +1524,7 @@ int main(int argc, char** argv) {
                                     cfg.laser.door_interlock_pin = static_cast<uint8_t>(door_pin);
                                     changed = true;
                                 }
-                                ImGui::SameLine();
+                                ui::sameLineIfFits(ui::checkboxWidth("Active Low##Door"));
                                 if (ImGui::Checkbox("Active Low##Door", &cfg.laser.door_interlock_invert)) changed = true;
                                 if (ImGui::IsItemHovered()) {
                                     ImGui::SetTooltip("Active Low: Checked = switch closes to COM/GND when enclosure door is closed.");
@@ -1535,7 +1536,7 @@ int main(int argc, char** argv) {
                                     cfg.laser.laser_fault_pin = static_cast<uint8_t>(fault_pin);
                                     changed = true;
                                 }
-                                ImGui::SameLine();
+                                ui::sameLineIfFits(ui::checkboxWidth("Active Low##Fault"));
                                 if (ImGui::Checkbox("Active Low##Fault", &cfg.laser.laser_fault_invert)) changed = true;
                             }
                             ImGui::EndChild();

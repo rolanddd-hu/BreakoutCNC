@@ -45,6 +45,21 @@ Measured on the bench (firmware of the board used for development):
 
 ---
 
+## Automated bench check (GRBL family)
+
+`build\Release\grbl_hardware_check.exe --yes-the-board-is-on-the-bench --port COM3` (also `--baud`, `--board grbl`
+/ `grblhal` / `fluidnc`) drives a GRBL-family board on a serial port through the machine controller: connect, reading
+its settings, MDI moves and a work offset, step and continuous jog, a job with an arc, spindle and coolant, feed hold,
+resume and controlled stop, a G53 job after the work offset changed, outputs by hand, a probe move that touches
+nothing, homing, E-stop and reset, the console. After each move it compares the position the board reports with the
+commanded one. The board's settings are read, never written; moves stay within 20 mm of the start.
+
+The board must be enabled first: it stops after RESET E-STOP with the application's reason when it cannot be (for
+example an ESP32-S3 grblHAL board with nothing wired reported every input active, `Pn:XYZAHSEP`, until `$5`, `$14`
+and `$6` inverted the limit, control and probe inputs). Homing is expected to be refused when `$22` is 0.
+
+---
+
 ## Phase 1 - Board communication & watchdogs
 
 **[ASSUMPTION] The board sends status reports continuously, at least every 500 ms.**

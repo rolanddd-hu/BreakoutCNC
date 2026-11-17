@@ -166,11 +166,16 @@ void GCodeProgramPanel::render(
     } else if (!load_notice_.empty()) {
         ImGui::TextColored(theme::pal().text_danger, "%s", load_notice_.c_str());
     } else {
-        ImGui::TextDisabled("Next:#%04zu | %s (%zu pierces, %.0fmm)",
-                            telemetry.active_gcode_line_index + 1,
-                            display_filename.empty() ? "(none)" : display_filename.c_str(),
-                            pierce_count,
-                            total_cut_length_mm);
+        char next_txt[512];
+        std::snprintf(next_txt, sizeof(next_txt), "Next:#%04zu | %s (%zu pierces, %.0fmm)",
+                      telemetry.active_gcode_line_index + 1,
+                      display_filename.empty() ? "(none)" : display_filename.c_str(),
+                      pierce_count,
+                      total_cut_length_mm);
+        // One line next to the buttons: when the panel is too narrow for all of it, the whole text is in a tooltip
+        const bool cut_off = ImGui::CalcTextSize(next_txt).x > ImGui::GetContentRegionAvail().x;
+        ImGui::TextDisabled("%s", next_txt);
+        if (cut_off && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", next_txt);
     }
 
     // Prominent Manual Tool Change (M6) Prompt Banner when waiting for operator tool change

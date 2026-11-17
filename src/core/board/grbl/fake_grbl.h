@@ -34,6 +34,10 @@ public:
                      {100, "250.000"}, {101, "250.000"}, {102, "250.000"}, {110, "3000.000"}, {111, "3000.000"},
                      {112, "1500.000"}, {120, "500.000"}, {121, "500.000"}, {122, "300.000"}, {130, "300.000"},
                      {131, "300.000"}, {132, "100.000"}};
+        if (f == Flavour::GrblHal) {
+            settings_.insert({{17, "0"}, {18, "0"}, {19, "0"}, {341, "0"}, {342, "30.0"}, {343, "25.0"},
+                              {344, "200.0"}, {345, "200.0"}});
+        }
     }
     // Call before connecting: adds the A axis settings when axes == 4
     void useAxes(int n) {
@@ -175,6 +179,75 @@ public:
     }
 
 private:
+    static constexpr const char* kHalGroups[] = {
+        "[SETTINGGROUP:0|0|Root]",
+        "[SETTINGGROUP:1|0|General]",
+        "[SETTINGGROUP:2|0|Control signals]",
+        "[SETTINGGROUP:3|0|Limits]",
+        "[SETTINGGROUP:5|0|Coolant]",
+        "[SETTINGGROUP:6|0|Spindle]",
+        "[SETTINGGROUP:9|0|Tool change]",
+        "[SETTINGGROUP:11|0|Homing]",
+        "[SETTINGGROUP:12|0|Probing]",
+        "[SETTINGGROUP:13|0|Parking/Safety door]",
+        "[SETTINGGROUP:14|0|Jogging]",
+        "[SETTINGGROUP:18|0|Aux ports]",
+        "[SETTINGGROUP:35|0|Stepper]",
+        "[SETTINGGROUP:42|0|MPG/Pendant]",
+        "[SETTINGGROUP:43|0|Axis]",
+        "[SETTINGGROUP:44|43|X-axis]",
+        "[SETTINGGROUP:45|43|Y-axis]",
+        "[SETTINGGROUP:46|43|Z-axis]",
+        "[SETTINGGROUP:47|43|A-axis]",
+    };
+    static constexpr const char* kHalSettings[] = {
+        "[SETTING:0|35|Step pulse time|microseconds|6|#0.0|2.0||0|0]",
+        "[SETTING:1|35|Step idle delay|milliseconds|5|####0||65535|0|0]",
+        "[SETTING:2|35|Step pulse invert||4||||0|0]",
+        "[SETTING:3|35|Step direction invert||4||||0|0]",
+        "[SETTING:4|35|Invert stepper enable output(s)||4||||0|0]",
+        "[SETTING:5|3|Invert limit inputs||4||||0|0]",
+        "[SETTING:6|12|Invert probe inputs||1|Probe|||0|0]",
+        "[SETTING:10|1|Status report options||1|Position in machine coordinate,Buffer state,Line numbers,Feed & speed,Pin state,Work coordinate offset,Overrides,Probe coordinates,Buffer sync on WCO change,Parser state,Alarm substatus,Run substatus,Enable when homing,Distance-to-go,Extended|||0|0]",
+        "[SETTING:11|1|Junction deviation|mm|6|#####0.000|||0|0]",
+        "[SETTING:12|1|Arc tolerance|mm|6|#####0.000|||0|0]",
+        "[SETTING:13|1|Report in inches||0||||0|0]",
+        "[SETTING:17|2|Pullup disable control inputs||1|N/A,Feed hold,Cycle start,N/A,N/A,N/A,EStop|||0|0]",
+        "[SETTING:18|3|Pullup disable limit inputs||4||||0|0]",
+        "[SETTING:19|12|Pullup disable probe inputs||1|Probe|||0|0]",
+        "[SETTING:20|3|Soft limits enable||0||||0|0]",
+        "[SETTING:21|3|Hard limits enable||2|Enable,Strict mode,Disable for rotary axes|||0|0]",
+        "[SETTING:22|11|Homing cycle||2|Enable,Enable single axis commands,Homing on startup required,Set machine origin to 0,Two switches shares one input,Allow manual,Override locks,N/A,N/A,Per axis feedrates,Run startup scripts only on homing completed|||0|0]",
+        "[SETTING:23|11|Homing direction invert||4||||0|0]",
+        "[SETTING:24|11|Homing locate feed rate|mm/min|6|#####0.0|||0|0]",
+        "[SETTING:25|11|Homing search seek rate|mm/min|6|#####0.0|||0|0]",
+        "[SETTING:26|11|Homing switch debounce delay|milliseconds|5|##0|||0|0]",
+        "[SETTING:27|11|Homing switch pull-off distance|mm|6|#####0.000|||0|0]",
+        "[SETTING:30|6|Maximum spindle speed|RPM|6|#####0.000|||0|0]",
+        "[SETTING:31|6|Minimum spindle speed|RPM|6|#####0.000|||0|0]",
+        "[SETTING:32|1|Mode of operation||3|Normal,Laser mode,Lathe mode|||0|0]",
+        "[SETTING:100|44|X-axis travel resolution|step/mm|6|#####0.000##|||0|0]",
+        "[SETTING:101|45|Y-axis travel resolution|step/mm|6|#####0.000##|||0|0]",
+        "[SETTING:102|46|Z-axis travel resolution|step/mm|6|#####0.000##|||0|0]",
+        "[SETTING:103|47|A-axis travel resolution|step/deg|6|#####0.000##|||0|0]",
+        "[SETTING:110|44|X-axis maximum rate|mm/min|6|#####0.000|||0|0]",
+        "[SETTING:111|45|Y-axis maximum rate|mm/min|6|#####0.000|||0|0]",
+        "[SETTING:112|46|Z-axis maximum rate|mm/min|6|#####0.000|||0|0]",
+        "[SETTING:113|47|A-axis maximum rate|deg/min|6|#####0.000|||0|0]",
+        "[SETTING:120|44|X-axis acceleration|mm/sec^2|6|#####0.000|||0|0]",
+        "[SETTING:121|45|Y-axis acceleration|mm/sec^2|6|#####0.000|||0|0]",
+        "[SETTING:122|46|Z-axis acceleration|mm/sec^2|6|#####0.000|||0|0]",
+        "[SETTING:123|47|A-axis acceleration|deg/sec^2|6|#####0.000|||0|0]",
+        "[SETTING:130|44|X-axis maximum travel|mm|6|#####0.000|||0|0]",
+        "[SETTING:131|45|Y-axis maximum travel|mm|6|#####0.000|||0|0]",
+        "[SETTING:132|46|Z-axis maximum travel|mm|6|#####0.000|||0|0]",
+        "[SETTING:133|47|A-axis maximum travel|deg|6|#####0.000|||0|0]",
+        "[SETTING:341|9|Tool change mode||3|Normal,Manual touch off,Manual touch off @ G59.3,Automatic touch off @ G59.3,Ignore M6|||0|0]",
+        "[SETTING:342|9|Tool change probing distance|mm|6|#####0.0|||0|0]",
+        "[SETTING:343|9|Tool change locate feed rate|mm/min|6|#####0.0|||0|0]",
+        "[SETTING:344|9|Tool change search seek rate|mm/min|6|#####0.0|||0|0]",
+        "[SETTING:345|9|Tool change probe pull-off rate|mm/min|6|#####0.0|||0|0]",
+    };
     struct Block {
         std::array<double, 4> target{};
         double feed = 0.0;   // mm/min
@@ -785,16 +858,18 @@ private:
             ok();
             return true;
         }
+        // Groups and descriptions as a grblHAL 1.1f ESP32-S3 board reports them (group "Probing" and long names are
+        // what the Board Settings panel must handle); settings this emulator has no value for are left out
         if (line == "$EG") {
-            out("[SETTINGGROUP:0|0|Root]");
-            out("[SETTINGGROUP:1|0|General]");
-            out("[SETTINGGROUP:10|0|X-axis]");
+            for (const char* g : kHalGroups) out(g);
             ok();
             return true;
         }
         if (line == "$ES") {
-            out("[SETTING:0|1|Step pulse time|microseconds|6|#0.0|2.0||0|0]");
-            out("[SETTING:100|10|X-axis travel resolution|step/mm|6|###0.000|||0|0]");
+            for (const char* d : kHalSettings) {
+                const int id = std::atoi(d + 9); // "[SETTING:<id>|..."
+                if (settings_.count(id)) out(d);
+            }
             ok();
             return true;
         }

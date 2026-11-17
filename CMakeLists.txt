@@ -247,6 +247,10 @@ target_link_libraries(board_tests PRIVATE rnr_core)
 add_executable(rnr_hardware_check tests/rnr_hardware_check.cpp)
 target_link_libraries(rnr_hardware_check PRIVATE rnr_core)
 
+# 6d. Manual check of a real GRBL-family board on a serial port (not a CTest test: run it by hand)
+add_executable(grbl_hardware_check tests/grbl_hardware_check.cpp)
+target_link_libraries(grbl_hardware_check PRIVATE rnr_core)
+
 # 6e. Regression tests for the code review findings (docs/CODE_REVIEW_FINDINGS.md)
 add_executable(regression_tests tests/regression_tests.cpp)
 target_link_libraries(regression_tests PRIVATE rnr_core)
@@ -299,7 +303,7 @@ add_dependencies(BreakoutMill deploy_scripts deploy_resources)
 add_dependencies(BreakoutCut deploy_scripts deploy_resources)
 
 # Warnings for BreakoutCNC's own targets
-foreach(t rnr_core rnr_ui_common rnr_hid_test rnr_hardware_check huanyang_vfd_test script_engine_test board_tests regression_tests
+foreach(t rnr_core rnr_ui_common rnr_hid_test rnr_hardware_check grbl_hardware_check huanyang_vfd_test script_engine_test board_tests regression_tests
           BreakoutCut BreakoutMill)
     target_link_libraries(${t} PRIVATE breakoutcnc_warnings)
 endforeach()

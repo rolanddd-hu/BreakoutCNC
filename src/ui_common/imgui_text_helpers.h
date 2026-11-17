@@ -17,4 +17,17 @@ inline void BulletTextWrapped(const char* fmt, ...) {
     va_end(args);
 }
 
+// Width of a check box with this label (the part after "##" is not shown)
+inline float checkboxWidth(const char* label) {
+    return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label, nullptr, true).x;
+}
+
+// SameLine() when an item next_w wide still fits to the right of the last one, else the next item starts a new line
+// (a check box after a slider with a long label was cut off at the right edge)
+inline void sameLineIfFits(float next_w) {
+    // After an item the cursor is at the start of the next line: from there the region reaches the right edge
+    const float right_edge = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+    if (ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + next_w <= right_edge) ImGui::SameLine();
+}
+
 } // namespace rnr::ui

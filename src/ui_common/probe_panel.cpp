@@ -393,25 +393,23 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
 
         ImGui::BeginDisabled(telemetry.surface_probing_active);
 
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_xmin, &f_xmin, step_slow, step_fast, val_fmt)) {
-            surface_min_x_ = f_xmin * u_unscale;
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_xmax, &f_xmax, step_slow, step_fast, val_fmt)) {
-            surface_max_x_ = f_xmax * u_unscale;
-        }
-
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_ymin, &f_ymin, step_slow, step_fast, val_fmt)) {
-            surface_min_y_ = f_ymin * u_unscale;
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_ymax, &f_ymax, step_slow, step_fast, val_fmt)) {
-            surface_max_y_ = f_ymax * u_unscale;
-        }
+        // Min and max side by side when both fields still have room next to their labels (AGENTS.md rule 3: the
+        // width set for an input excludes its label, so each column is budgeted for it), else one per line
+        const float grid_gap   = 12.0f;
+        const float grid_col_w = (ImGui::GetContentRegionAvail().x - grid_gap) * 0.5f;
+        const float label_sp   = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float label_w    = std::max(ImGui::CalcTextSize(lbl_xmax).x, ImGui::CalcTextSize(lbl_ymax).x) + label_sp;
+        const bool  grid_2col  = grid_col_w - label_w >= 130.0f;
+        const float grid_field_w = grid_2col ? grid_col_w - label_w : std::max(130.0f, ImGui::GetContentRegionAvail().x - label_w);
+        auto gridField = [&](const char* lbl, float& v, double& target, bool second) {
+            if (second && grid_2col) ImGui::SameLine(0.0f, grid_gap);
+            ImGui::SetNextItemWidth(grid_field_w);
+            if (ImGui::InputFloat(lbl, &v, step_slow, step_fast, val_fmt)) target = v * u_unscale;
+        };
+        gridField(lbl_xmin, f_xmin, surface_min_x_, false);
+        gridField(lbl_xmax, f_xmax, surface_max_x_, true);
+        gridField(lbl_ymin, f_ymin, surface_min_y_, false);
+        gridField(lbl_ymax, f_ymax, surface_max_y_, true);
 
         ImGui::EndDisabled();
 

@@ -384,12 +384,27 @@ void ToolpathViewport::render(
     const float  tb_w  = std::max(100.0f, canvas_sz.x - 16.0f);
     const ImVec2 tb_frame_padding(7.0f, 2.5f);
     const float  tb_comp_h = std::round(ImGui::GetFontSize() + tb_frame_padding.y * 2.0f);
-    const float  tb_h      = tb_comp_h + 6.0f; // 1px border + 2px top clearance + item + 2px bottom clearance + 1px border
-    const ImVec2 tb_p1(tb_p0.x + tb_w, tb_p0.y + tb_h);
 
     // Check active Top-Down Camera state (BreakoutMill)
     const bool has_top_down_cam = (camera_mgr_ != nullptr && camera_mgr_->isRoleActive(core::CameraRole::TopDown));
     const core::CameraConfig cam_cfg = controller ? controller->getConfigShared()->camera : core::CameraConfig{};
+
+    // One toolbar row when everything fits, else two: the view buttons with Detail and the tool selector at the right
+    // end of the first row, the check boxes on the second (a narrow view cut off "Follow ..." and hid Detail)
+    auto tbButtonW = [&](const char* s) { return ImGui::CalcTextSize(s).x + tb_frame_padding.x * 2.0f; };
+    auto tbCheckW  = [&](const char* s) {
+        return tb_comp_h + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(s).x;
+    };
+    float tb_row1_w = tbButtonW("Fit View") + 6.0f + tbButtonW("View: 3D");
+    if (has_top_down_cam && !isometric_3d_) tb_row1_w += 6.0f + tbButtonW("Cam Overlay: OFF");
+    if (isometric_3d_) tb_row1_w += 6.0f + tbButtonW("Reset View");
+    const float tb_checks_w = tbCheckW("Rapids (G0)") + 6.0f + tbCheckW("Pierce Points") + 6.0f +
+                              tbCheckW(follow_tool_label_.c_str());
+    const float tb_right_w  = tbButtonW("Detail") + (path_cache_.tools_in_file.size() > 1 ? 16.0f + 125.0f : 0.0f);
+    const bool   tb_two_rows = tb_row1_w + 16.0f + tb_checks_w + 16.0f + tb_right_w > tb_w - 16.0f;
+    // 1px border + 2px top clearance + item(s) (2px between rows) + 2px bottom clearance + 1px border
+    const float  tb_h = tb_two_rows ? tb_comp_h * 2.0f + 8.0f : tb_comp_h + 6.0f;
+    const ImVec2 tb_p1(tb_p0.x + tb_w, tb_p0.y + tb_h);
 
     if (!has_top_down_cam) {
         camera_calibrating_     = false;
@@ -989,8 +1004,15 @@ void ToolpathViewport::render(
     const float hud_font_sz = 15.0f;
     const float box_h       = 26.0f;
     const float box_gap     = 6.0f;
-    const float hud_y       = canvas_p1.y - box_h - 8.0f;
+    float hud_y             = canvas_p1.y - box_h - 8.0f;
     float cur_x             = canvas_p0.x + 10.0f;
+    // A box that does not fit next to the previous one starts a new row above them (a narrow view cut "Elapsed")
+    auto hudPlace = [&](float w) {
+        if (cur_x > canvas_p0.x + 10.0f && cur_x + w > canvas_p1.x - 10.0f) {
+            cur_x = canvas_p0.x + 10.0f;
+            hud_y -= box_h + box_gap;
+        }
+    };
 
     // Label + value + 8 px padding each side + 12 px between them (matches drawHudTextbox)
     auto hudBoxWidth = [hud_font](float font_sz, const char* label, const char* value) {
@@ -1013,6 +1035,7 @@ void ToolpathViewport::render(
                       bbox_max_mm[1] - bbox_min_mm[1]);
     }
     const float bounds_w = hudBoxWidth(hud_font_sz, "Part Bounds:", bounds_val);
+    hudPlace(bounds_w);
     drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), bounds_w, box_h,
                    "Part Bounds:", bounds_val, IM_COL32(215, 228, 245, 255));
     cur_x += bounds_w + box_gap;
@@ -1021,6 +1044,7 @@ void ToolpathViewport::render(
     std::snprintf(prog_val, sizeof(prog_val), "%zu / %zu (%3.0f%%)",
                   cut_done_count, segments.size(), pct_done);
     const float prog_w = hudBoxWidth(hud_font_sz, "Progress:", prog_val);
+    hudPlace(prog_w);
     drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), prog_w, box_h,
                    "Progress:", prog_val, IM_COL32(0, 230, 140, 255));
     cur_x += prog_w + box_gap;
@@ -1029,6 +1053,7 @@ void ToolpathViewport::render(
     std::snprintf(elapsed_val, sizeof(elapsed_val), "%02d:%04.1f s",
                   elapsed_min, elapsed_sec);
     const float elapsed_w = hudBoxWidth(hud_font_sz, "Elapsed:", elapsed_val);
+    hudPlace(elapsed_w);
     drawHudTextbox(dl, hud_font, hud_font_sz, ImVec2(cur_x, hud_y), elapsed_w, box_h,
                    "Elapsed:", elapsed_val, IM_COL32(255, 210, 75, 255));
     cur_x += elapsed_w + box_gap;
@@ -1252,8 +1277,13 @@ void ToolpathViewport::render(
             }
         }
 
-        // Distinct spacing between the View buttons and the checkboxes
-        ImGui::SameLine(0.0f, 16.0f);
+        // Distinct spacing between the View buttons and the checkboxes (or the second row)
+        const float tb_row1_end_x = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+        if (tb_two_rows) {
+            ImGui::SetCursorPos(ImVec2(ImGui::GetStyle().WindowPadding.x, 2.0f + tb_comp_h + 2.0f));
+        } else {
+            ImGui::SameLine(0.0f, 16.0f);
+        }
         if (ImGui::Checkbox("Rapids (G0)", &show_rapids_)) {
             if (on_view_changed_) on_view_changed_();
         }
@@ -1274,7 +1304,10 @@ void ToolpathViewport::render(
         const float detail_w  = ImGui::CalcTextSize("Detail").x + ImGui::GetStyle().FramePadding.x * 2.0f;
         const float group_w   = detail_w + (show_tool_combo ? group_gap + combo_w : 0.0f);
         const float after_checkboxes_x = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + group_gap;
-        const float right_group_x = std::max(after_checkboxes_x, ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - group_w);
+        const float right_edge_x  = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+        const float right_group_x = std::max(tb_two_rows ? tb_row1_end_x + group_gap : after_checkboxes_x,
+                                             right_edge_x - group_w);
+        const float surface_limit_x = tb_two_rows ? right_edge_x : right_group_x;
 
         char surface_txt[64] = "";
         ImVec4 surface_col(0.0f, 0.90f, 0.46f, 1.0f);
@@ -1284,13 +1317,17 @@ void ToolpathViewport::render(
         } else if (telemetry.surface_compensation_active) {
             std::snprintf(surface_txt, sizeof(surface_txt), "Surface compensated: %.0f%%", telemetry.surface_height_map->smoothness * 100.0f);
         }
-        if (surface_txt[0] != '\0' && after_checkboxes_x + ImGui::CalcTextSize(surface_txt).x + group_gap <= right_group_x) {
+        if (surface_txt[0] != '\0' && after_checkboxes_x + ImGui::CalcTextSize(surface_txt).x + group_gap <= surface_limit_x) {
             ImGui::SameLine(0.0f, group_gap);
             ImGui::AlignTextToFramePadding();
             ImGui::TextColored(surface_col, "%s", surface_txt);
         }
 
-        ImGui::SameLine(right_group_x);
+        if (tb_two_rows) {
+            ImGui::SetCursorPos(ImVec2(right_group_x, 2.0f)); // First row, right end
+        } else {
+            ImGui::SameLine(right_group_x);
+        }
         if (ImGui::Button("Detail")) {
             ImGui::OpenPopup("##ToolpathDetailPopup");
         }

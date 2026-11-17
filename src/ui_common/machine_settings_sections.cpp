@@ -46,7 +46,7 @@ void renderLimitsHomingSection(const SettingsSectionContext& ctx) {
             cfg.estop_pin = static_cast<uint8_t>(estop_pin);
             changed = true;
         }
-        ImGui::SameLine();
+        ui::sameLineIfFits(ui::checkboxWidth("Active Low##EStop"));
         if (ImGui::Checkbox("Active Low##EStop", &cfg.estop_invert)) changed = true;
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Active Low: Checked = Normally-Closed (NC) switch connected to COM/GND.\nTriggers E-Stop when opened or pulled low. Unchecked = Active High (NO switch).");
@@ -124,7 +124,7 @@ void renderLimitsHomingSection(const SettingsSectionContext& ctx) {
                 cfg.axes[a].home_pin = static_cast<uint8_t>(home_pin);
                 changed = true;
             }
-            ImGui::SameLine();
+            ui::sameLineIfFits(ui::checkboxWidth("Active Low##H"));
             if (ImGui::Checkbox("Active Low##H", &cfg.axes[a].home_invert)) changed = true;
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Active Low: Checked = Switch connects to COM/GND when triggered.\nUnchecked = Active High.");
@@ -135,7 +135,7 @@ void renderLimitsHomingSection(const SettingsSectionContext& ctx) {
                 cfg.axes[a].limit_minus_pin = static_cast<uint8_t>(lim_m);
                 changed = true;
             }
-            ImGui::SameLine();
+            ui::sameLineIfFits(ui::checkboxWidth("Active Low##LM"));
             if (ImGui::Checkbox("Active Low##LM", &cfg.axes[a].limit_minus_invert)) changed = true;
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Active Low: Checked = Switch connects to COM/GND when triggered.\nUnchecked = Active High.");
@@ -146,7 +146,7 @@ void renderLimitsHomingSection(const SettingsSectionContext& ctx) {
                 cfg.axes[a].limit_plus_pin = static_cast<uint8_t>(lim_p);
                 changed = true;
             }
-            ImGui::SameLine();
+            ui::sameLineIfFits(ui::checkboxWidth("Active Low##LP"));
             if (ImGui::Checkbox("Active Low##LP", &cfg.axes[a].limit_plus_invert)) changed = true;
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Active Low: Checked = Switch connects to COM/GND when triggered.\nUnchecked = Active High.");

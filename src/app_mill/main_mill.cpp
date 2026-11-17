@@ -1,4 +1,5 @@
 #include "breakout_version.h"
+#include "ui_common/imgui_text_helpers.h"
 #include "core/controller/rnr_controller.h"
 #include "core/config/settings_manager.h"
 #include "ui_common/app_window.h"
@@ -1428,7 +1429,7 @@ int main(int argc, char** argv) {
                         cfg.probe.probe_pin = static_cast<uint8_t>(p_pin);
                         probe_changed = true;
                     }
-                    ImGui::SameLine();
+                    ui::sameLineIfFits(ui::checkboxWidth("Active Low##Probe"));
                     if (ImGui::Checkbox("Active Low##Probe", &cfg.probe.probe_invert)) {
                         probe_changed = true;
                     }

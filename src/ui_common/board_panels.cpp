@@ -6,8 +6,10 @@
 #include "ui_common/file_dialog.h"
 #include "ui_common/theme.h"
 #include "imgui.h"
+#include "imgui_internal.h" // TableGetHoveredRow()
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -380,6 +382,160 @@ void renderBoardConsole(core::IMotionController& controller, const core::Telemet
     ImGui::PopTextWrapPos();
 }
 
+namespace {
+// Short form of a unit the board reports, for the value field's suffix ("milliseconds" -> "ms")
+std::string shortUnit(const std::string& u) {
+    if (u == "microseconds") return "us";
+    if (u == "milliseconds") return "ms";
+    if (u == "seconds") return "s";
+    if (u == "mm/sec^2") return "mm/s^2";
+    if (u == "deg/sec^2") return "deg/s^2";
+    if (u == "percent") return "%";
+    return u;
+}
+
+// Board Settings, one card per group: a framed header with the number of settings, then a table without borders. Columns: the setting number (dimmed, so the names start in one column), the name (wraps), and the
+// value field with its unit attached on the right. The row under the mouse is highlighted; a changed value that is not
+// written yet is shown in the warning colour (name and field border).
+void renderSettingGroups(const board::grbl::SettingsSnapshot& st, std::map<std::string, std::string>& edits,
+                         bool at_rest) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float frame_h = ImGui::GetFrameHeight();
+    float unit_w = 0.0f;
+    float id_w = 0.0f;
+    std::map<std::string, size_t> group_counts;
+    for (const auto& it : st.items) {
+        unit_w = std::max(unit_w, ImGui::CalcTextSize(shortUnit(it.unit).c_str()).x);
+        if (!st.yaml) id_w = std::max(id_w, ImGui::CalcTextSize(("$" + it.id).c_str()).x);
+        ++group_counts[it.group];
+    }
+    if (unit_w > 0.0f) unit_w += style.FramePadding.x * 2.0f;
+    const float field_w = std::max(70.0f, ImGui::CalcTextSize("-00000.000").x + style.FramePadding.x * 2.0f);
+    const float value_w = field_w + unit_w;
+    const ImU32 hover_bg = ImGui::GetColorU32(ImGuiCol_HeaderHovered, 0.35f);
+    const ImU32 unit_bg = ImGui::GetColorU32(ImGuiCol_FrameBgHovered);
+    const ImU32 unit_line = ImGui::GetColorU32(ImGuiCol_Border);
+    const ImU32 unit_text = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+
+    constexpr float kGroupIndent = 8.0f;
+    ImGui::Indent(kGroupIndent);
+    std::string group;
+    bool first_group = true, table_open = false;
+    // The group's ID stays pushed while its table is open (BeginTable pushes an ID of its own on top of it)
+    auto closeGroup = [&] {
+        if (table_open) {
+            ImGui::EndTable();
+            ImGui::PopID();
+            ImGui::Spacing();
+        }
+        table_open = false;
+    };
+    for (const auto& it : st.items) {
+        if (first_group || it.group != group) {
+            closeGroup();
+            first_group = false;
+            group = it.group;
+            const char* title = group.empty() ? "Settings" : group.c_str();
+            ImGui::PushID(title);
+            // Quieter than the settings window's own section headers: these are sub-sections of Board Settings
+            ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+            const bool open = ImGui::TreeNodeEx("##Group", ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                                               ImGuiTreeNodeFlags_AllowOverlap |
+                                                               ImGuiTreeNodeFlags_NoTreePushOnOpen,
+                                                "%s", title);
+            ImGui::PopStyleColor(3);
+            // Number of settings, at the right end of the header
+            char count[32];
+            const size_t n = group_counts[group];
+            std::snprintf(count, sizeof(count), n == 1 ? "%zu setting" : "%zu settings", n);
+            const ImVec2 count_sz = ImGui::CalcTextSize(count);
+            const ImVec2 hmin = ImGui::GetItemRectMin(), hmax = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(hmax.x - count_sz.x - style.FramePadding.x * 2.0f, std::floor((hmin.y + hmax.y - count_sz.y) * 0.5f)),
+                ImGui::GetColorU32(ImGuiCol_TextDisabled), count);
+            ImGui::PopID();
+            if (!open) continue;
+            ImGui::PushID(title);
+            table_open = ImGui::BeginTable("##Rows", id_w > 0.0f ? 3 : 2,
+                                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX);
+            if (!table_open) ImGui::PopID();
+            if (table_open) {
+                if (id_w > 0.0f) ImGui::TableSetupColumn("Number", ImGuiTableColumnFlags_WidthFixed, id_w);
+                ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, value_w);
+            }
+        }
+        if (!table_open) continue;
+        ImGui::PushID(it.id.c_str());
+        const auto e = edits.find(it.id);
+        const bool changed = e != edits.end();
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%s", (changed ? e->second : it.value).c_str());
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, frame_h + style.CellPadding.y * 2.0f);
+        if (ImGui::TableGetHoveredRow() == ImGui::TableGetRowIndex()) {
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, hover_bg);
+        }
+        int col = 0;
+        if (id_w > 0.0f) {
+            ImGui::TableSetColumnIndex(col++);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("$%s", it.id.c_str());
+        }
+        ImGui::TableSetColumnIndex(col++);
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushTextWrapPos(0.0f);
+        if (changed) ImGui::TextColored(theme::pal().text_warn, "%s", it.name.c_str());
+        else ImGui::TextUnformatted(it.name.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::IsItemHovered() && (!it.description.empty() || it.needs_restart)) {
+            ImGui::SetTooltip("%s%s%s", it.description.c_str(), it.description.empty() ? "" : "\n",
+                              it.needs_restart ? "The board must be restarted for this change." : "");
+        }
+
+        // Value field with the unit as a suffix inside the same frame
+        ImGui::TableSetColumnIndex(col++);
+        const std::string unit = shortUnit(it.unit);
+        const ImVec2 field_pos = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemWidth(unit.empty() ? value_w : field_w);
+        if (changed) {
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Border, theme::pal().text_warn);
+        }
+        ImGui::BeginDisabled(!at_rest);
+        if (ImGui::InputText("##v", buf, sizeof(buf))) {
+            if (it.value == buf) edits.erase(it.id);
+            else edits[it.id] = buf;
+        }
+        ImGui::EndDisabled();
+        if (changed) {
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
+        }
+        if (!unit.empty()) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 u0(field_pos.x + field_w, field_pos.y);
+            const ImVec2 u1(field_pos.x + value_w, field_pos.y + frame_h);
+            dl->AddRectFilled(u0, u1, unit_bg, style.FrameRounding, ImDrawFlags_RoundCornersRight);
+            dl->AddLine(ImVec2(u0.x, u0.y + 3.0f), ImVec2(u0.x, u1.y - 3.0f), unit_line);
+            const ImVec2 ts = ImGui::CalcTextSize(unit.c_str());
+            dl->AddText(ImVec2(u0.x + (unit_w - ts.x) * 0.5f, u0.y + (frame_h - ts.y) * 0.5f), unit_text, unit.c_str());
+        }
+        if (!it.error.empty()) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(id_w > 0.0f ? 1 : 0);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(theme::pal().text_danger, "Not accepted: %s", it.error.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::PopID();
+    }
+    closeGroup();
+    ImGui::Unindent(kGroupIndent);
+}
+} // namespace
+
 void renderFirmwareSettings(core::IMotionController& controller, const core::TelemetrySnapshot& telemetry) {
     static std::map<std::string, std::string> edits;
     static uint64_t seen_revision = ~0ULL;
@@ -470,46 +626,11 @@ void renderFirmwareSettings(core::IMotionController& controller, const core::Tel
         if (ImGui::Button("Discard", ImVec2(ImGui::CalcTextSize("Discard").x + 32.0f, 32.0f))) edits.clear();
     }
 
-    std::string group;
-    bool group_open = false;
-    for (const auto& it : st.items) {
-        if (it.group != group) {
-            if (group_open) ImGui::TreePop();
-            group = it.group;
-            group_open = ImGui::TreeNodeEx(group.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
-        }
-        if (!group_open) continue;
-        ImGui::PushID(it.id.c_str());
-        const auto e = edits.find(it.id);
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "%s", (e != edits.end() ? e->second : it.value).c_str());
-        const float value_w = 120.0f;
-        const std::string label = st.yaml ? it.name : ("$" + it.id + "  " + it.name);
-        ImGui::AlignTextToFramePadding();
-        if (e != edits.end()) ImGui::TextColored(theme::pal().text_warn, "%s", label.c_str());
-        else ImGui::TextUnformatted(label.c_str());
-        if (ImGui::IsItemHovered() && (!it.description.empty() || it.needs_restart)) {
-            ImGui::SetTooltip("%s%s%s", it.description.c_str(), it.description.empty() ? "" : "\n",
-                              it.needs_restart ? "The board must be restarted for this change." : "");
-        }
-        ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - value_w - 110.0f));
-        ImGui::SetNextItemWidth(value_w);
-        ImGui::BeginDisabled(!at_rest);
-        if (ImGui::InputText("##v", buf, sizeof(buf))) {
-            if (it.value == buf) edits.erase(it.id);
-            else edits[it.id] = buf;
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", it.unit.c_str());
-        if (!it.error.empty()) {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextColored(theme::pal().text_danger, "Not accepted: %s", it.error.c_str());
-            ImGui::PopTextWrapPos();
-        }
-        ImGui::PopID();
-    }
-    if (group_open) ImGui::TreePop();
+    // The board's group names ("Probing", "Spindle", ...) are also section headers of the settings window: without
+    // an ID scope of their own their tree nodes had the same ID as those headers (ImGui "conflicting ID" error)
+    ImGui::PushID("##BoardSettingsList");
+    renderSettingGroups(st, edits, at_rest);
+    ImGui::PopID();
 }
 
 } // namespace rnr::ui

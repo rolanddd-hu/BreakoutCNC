@@ -51,6 +51,19 @@ All notable changes to BreakoutCNC are listed here. The version number is set on
   input for a second), and wakes at once on any input.
 
 ### Fixed
+- **Board Settings** (GRBL-family boards): long setting names ran under the value fields, and it was hard to see
+  which value belonged to which name. Each group is now a card: a header with the number of settings, then one row per
+  setting with its number in a column of its own, the name, and the value field with the unit inside it on the right,
+  and the row under the mouse highlighted. A changed value that is not written yet shows
+  in the warning colour. Long names wrap. A grblHAL board's "Probing" group no longer clashes with the app's own
+  Probing section (Dear ImGui showed "2 visible items with conflicting ID", and opening one opened the other).
+- Text that was cut off or covered: the E-stop message over the toolpath view ran under its RESET button (it now wraps
+  beside it); the toolpath toolbar lost "Follow ..." and the Detail button in a narrow view (two rows when needed); the
+  Elapsed box at the bottom of the view was cut off (it moves to a row above); the X Max / Y Max labels of the surface
+  probing grid were cut off; "Active Low" next to long pin labels (THC, initial height sensing, laser interlocks,
+  limits and homing) was cut off (it moves to the next line when it does not fit); the program line next to the
+  cycle buttons shows its full text in a tooltip when the panel is too narrow.
+- Laser settings: the Min Striking Duty and Max Duty tooltips showed "8-12 0.000000or" instead of "8-12% for".
 - **Hole centre probing on GRBL-family boards** failed at the first move back to the start: the next probe started
   while the board still moved (refused), and once that was fixed it was planned from a position read during the move,
   so it stopped short of the far wall. It now waits for the board to finish and starts from where it stopped.
