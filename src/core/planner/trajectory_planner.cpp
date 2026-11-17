@@ -242,6 +242,7 @@ PlannedSlice StreamingPlanner::makeSliceFromTarget(const std::array<double, 4>& 
     ps.slice.outputs_mask = out_mask;
     ps.tool_number        = meta.tool_number;
     ps.spindle_rpm        = meta.spindle_rpm;
+    ps.spindle_s_set      = meta.spindle_s_set;
     ps.workspace_index    = meta.workspace_index;
     ps.target_pos_mm      = target;
     ps.from_program       = isProgramSegment(&meta);
@@ -321,6 +322,7 @@ void StreamingPlanner::emitNonMotion(const core::ToolpathSegment& seg, std::dequ
         ps.target_pos_mm      = pos_;
         ps.tool_number        = seg.tool_number;
         ps.spindle_rpm        = seg.spindle_rpm;
+        ps.spindle_s_set      = seg.spindle_s_set;
         ps.workspace_index    = seg.workspace_index;
         ps.from_program       = isProgramSegment(&seg);
         ps.tlo_tool           = seg.tlo_tool;
@@ -336,7 +338,6 @@ void StreamingPlanner::emitNonMotion(const core::ToolpathSegment& seg, std::dequ
         if (cfg_.tool_change.mode == core::ToolChangeMode::ManualPrompt) {
             PlannedSlice ps = marker(1.0f);
             ps.is_tool_change   = true;
-            ps.tool_description = seg.tool_description;
             out.push_back(std::move(ps));
             ++count;
         } else if (cfg_.tool_change.mode == core::ToolChangeMode::AutoAtc) {
@@ -346,7 +347,6 @@ void StreamingPlanner::emitNonMotion(const core::ToolpathSegment& seg, std::dequ
             for (int i = 1; i <= num_slices; ++i) {
                 PlannedSlice ps = marker(static_cast<float>(i) / static_cast<float>(num_slices));
                 ps.is_dwell         = true;
-                ps.tool_description = seg.tool_description;
                 out.push_back(std::move(ps));
                 ++count;
             }
@@ -469,8 +469,9 @@ double StreamingPlanner::curveSpeedLimit(const std::vector<MotionItem>& win, siz
 size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) {
     size_t count = 0;
     const size_t total = sourceSize();
-    std::vector<MotionItem> win;
-    std::vector<double> junction;
+    // Buffers kept by the planner: plan() runs every motion tick under the machine lock
+    auto& win = win_buf_;
+    auto& junction = junction_buf_;
 
     while (count < max_slices && next_ < total) {
         const auto& seg = segAt(next_);
@@ -584,8 +585,10 @@ size_t StreamingPlanner::plan(std::deque<PlannedSlice>& out, size_t max_slices) 
         }
 
         // Backward pass: from standstill at the end of the window
-        std::vector<double> v_exit(n, 0.0);
-        std::vector<double> v_entry_max(n, 0.0);
+        auto& v_exit = v_exit_buf_;
+        auto& v_entry_max = v_entry_max_buf_;
+        v_exit.assign(n, 0.0);
+        v_entry_max.assign(n, 0.0);
         double next_entry = 0.0;
         for (size_t k = n; k-- > 0;) {
             v_exit[k] = next_entry;
@@ -658,16 +661,28 @@ std::array<double, 4> TrajectoryPlanner::transformTarget(const core::ToolpathSeg
     }
     const uint8_t pw = std::min<uint8_t>(frame.plan_workspace, 5);
     const uint8_t sw = std::min<uint8_t>(seg.workspace_index, 5);
+    const core::MachineTarget* mt = machineTargetFor(seg, frame);
+    const uint8_t machine_axes = mt ? mt->axes_mask : 0;
     for (size_t a = 0; a < 4; ++a) {
-        if ((seg.machine_axes_mask >> a) & 1U) {
+        if ((machine_axes >> a) & 1U) {
             // Machine coordinates (G53 / G28) address the spindle: no tool length offset
-            t[a] = seg.machine_target_mm[a] - frame.workspace_offsets[pw][a];
+            t[a] = mt->mm[a] - frame.workspace_offsets[pw][a];
         } else {
             t[a] = seg.end_xyza_mm[a] + frame.workspace_offsets[sw][a] - frame.workspace_offsets[pw][a];
             if (a == 2) t[a] += toolLengthFor(seg, frame);
         }
     }
     return t;
+}
+
+const core::MachineTarget* TrajectoryPlanner::machineTargetFor(const core::ToolpathSegment& seg, const FrameContext& frame) {
+    if (!seg.hasMachineTarget() || !frame.machine_targets) return nullptr;
+    const auto& table = *frame.machine_targets;
+    return seg.machine_target < table.size() ? &table[seg.machine_target] : nullptr;
+}
+
+bool TrajectoryPlanner::resolvable(const core::ToolpathSegment& seg, const FrameContext& frame) {
+    return !frame.enabled || !seg.hasMachineTarget() || machineTargetFor(seg, frame) != nullptr;
 }
 
 double TrajectoryPlanner::toolLengthFor(const core::ToolpathSegment& seg, const FrameContext& frame) {
@@ -848,7 +863,7 @@ std::vector<core::ToolpathSegment> TrajectoryPlanner::warpToolpathWithHeightMap(
 
     for (const auto& seg : original_segments) {
         if (seg.type == core::SegmentType::ToolChange || seg.type == core::SegmentType::Dwell ||
-            seg.type == core::SegmentType::ProgramStop || seg.machine_axes_mask != 0)
+            seg.type == core::SegmentType::ProgramStop || seg.hasMachineTarget())
         {
             // Non-motion and machine-coordinate (G53/G28) moves are never warped
             core::ToolpathSegment copy = seg;

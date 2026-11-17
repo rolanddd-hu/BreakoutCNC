@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Mill Tool Change Macro (M6.lua)
+-- BreakoutCNC - Mill Tool Change Macro (M6.lua)
 -- Executed automatically on M6 T<n> or manual tool swap
 -- ============================================================================
 

@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Park Machine Macro (park.lua)
+-- BreakoutCNC - Park Machine Macro (park.lua)
 -- Retracts Z to Machine Safe Z and moves XY to back-left park coordinate
 -- ============================================================================
 

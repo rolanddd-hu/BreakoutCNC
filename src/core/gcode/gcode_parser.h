@@ -1,8 +1,10 @@
 #pragma once
-#include "core/controller/motion_controller.h"
+#include "core/controller/machine_config.h"
+#include "core/controller/toolpath_segment.h"
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 
 namespace rnr::gcode {
 
@@ -11,9 +13,41 @@ struct ParseMessage {
     std::string text;
 };
 
+// One G2 / G3 block. Its chords are segments[first_segment .. first_segment + segment_count).
+struct ArcInfo {
+    std::array<double, 3> center_mm{};   // Work coordinates (after G68); the axis normal to the plane is unused
+    uint8_t               plane = 17;    // 17 (XY), 18 (XZ), 19 (YZ)
+    bool                  clockwise = true; // G2
+    uint32_t              first_segment = 0;
+    uint32_t              segment_count = 0;
+};
+
+// Source lines of a program. Copies of a ParseResult share them: a height-map warp or a re-parse copies the
+// segments, never the text again. Only the parser appends (copy-on-write if the lines are shared).
+class SharedLines {
+public:
+    size_t size() const noexcept { return v_->size(); }
+    bool empty() const noexcept { return v_->empty(); }
+    const std::string& operator[](size_t i) const { return (*v_)[i]; }
+    const std::string* data() const noexcept { return v_->data(); }
+    std::vector<std::string>::const_iterator begin() const { return v_->cbegin(); }
+    std::vector<std::string>::const_iterator end() const { return v_->cend(); }
+    // Read-only view as the vector (line lookup helpers take one)
+    operator const std::vector<std::string>&() const noexcept { return *v_; }
+    void push_back(std::string line) {
+        if (v_.use_count() > 1) v_ = std::make_shared<std::vector<std::string>>(*v_);
+        v_->push_back(std::move(line));
+    }
+private:
+    std::shared_ptr<std::vector<std::string>> v_ = std::make_shared<std::vector<std::string>>();
+};
+
 struct ParseResult {
-    std::vector<std::string>           lines;
+    SharedLines                        lines;
     std::vector<core::ToolpathSegment> segments;
+    std::vector<ArcInfo>               arcs;
+    // End points of the G53 / G28 / G30 moves (ToolpathSegment::machine_target)
+    std::vector<core::MachineTarget>   machine_targets;
     std::array<double, 3>              bbox_min_mm           = {0.0, 0.0, 0.0};
     std::array<double, 3>              bbox_max_mm           = {0.0, 0.0, 0.0};
     double                             total_cut_length_mm   = 0.0;

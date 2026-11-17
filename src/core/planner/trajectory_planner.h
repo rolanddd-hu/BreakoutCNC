@@ -22,7 +22,7 @@ struct PlannedSlice {
     double                tlo_mm            = 0.0;               // ...and its length (0 outside tool table mode)
     uint16_t              tool_number       = 1;
     uint16_t              spindle_rpm       = 0;
-    std::string           tool_description;
+    bool                  spindle_s_set     = false; // S word programmed (S0 = laser beam off)
     uint8_t               workspace_index   = 0;
 };
 
@@ -40,6 +40,10 @@ struct FrameContext {
     bool                                 apply_tool_lengths = false; // Tool table mode
     std::array<double, 256>              tool_lengths{};             // Indexed by tool number
     double                               inherit_tlo_mm = 0.0;       // Offset active when the job started
+    // The program's G53 / G28 / G30 end points (ParseResult::machine_targets). A frame for a program with machine
+    // moves must carry them: the program check refuses to start a job with a machine move it cannot resolve
+    // (TrajectoryPlanner::resolvable), so a missing table can never move the machine to the parse-time preview.
+    std::shared_ptr<const std::vector<core::MachineTarget>> machine_targets;
 };
 
 struct PlannerOptions {
@@ -140,6 +144,9 @@ private:
     };
     std::deque<RecentMove> recent_moves_;
     bool                   recent_moves_partial_ = false;
+    // plan() working buffers, kept between calls (no allocations in the motion tick once grown)
+    std::vector<MotionItem> win_buf_;
+    std::vector<double>     junction_buf_, v_exit_buf_, v_entry_max_buf_;
     std::array<double, 4>  prev_unit_{};
     const core::ToolpathSegment* last_motion_meta_ = nullptr;
     uint8_t                last_motion_mask_ = 0;
@@ -169,6 +176,12 @@ public:
 
     // Planning-frame target of a segment (see FrameContext)
     static std::array<double, 4> transformTarget(const core::ToolpathSegment& seg, const FrameContext& frame);
+
+    // The machine-coordinate end point of a G53 / G28 / G30 segment in this frame (nullptr: none, or not found)
+    static const core::MachineTarget* machineTargetFor(const core::ToolpathSegment& seg, const FrameContext& frame);
+
+    // false: a machine-coordinate segment whose target the (enabled) frame does not carry: the job must not run
+    static bool resolvable(const core::ToolpathSegment& seg, const FrameContext& frame);
 
     // Tool length offset applied to a segment (0 unless the frame applies tool lengths)
     static double toolLengthFor(const core::ToolpathSegment& seg, const FrameContext& frame);

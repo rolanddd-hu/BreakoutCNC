@@ -1,4 +1,5 @@
 #include "core/config/mach3_xml_importer.h"
+#include "core/util/utf8_path.h"
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -242,14 +243,15 @@ int Mach3XmlImporter::kernelSpeedKhz(int pulse_speed_index) noexcept {
 std::vector<std::string> Mach3XmlImporter::discoverLocalMach3Profiles(const std::string& search_dir) {
     std::vector<std::string> found;
     std::error_code ec;
-    if (!std::filesystem::exists(search_dir, ec) || !std::filesystem::is_directory(search_dir, ec)) {
+    const auto dir = util::pathFromUtf8(search_dir);
+    if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
         return found;
     }
-    for (const auto& entry : std::filesystem::directory_iterator(search_dir, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (entry.is_regular_file(ec)) {
             auto ext = toLowerAscii(entry.path().extension().string());
             if (ext == ".xml") {
-                found.push_back(entry.path().string());
+                found.push_back(util::pathToUtf8(entry.path()));
             }
         }
     }
@@ -262,7 +264,7 @@ Mach3MigrationReport Mach3XmlImporter::importFromFile(
     const core::MachineConfig& base_config,
     const Mach3ImportOptions& options)
 {
-    std::ifstream ifs(xml_file_path, std::ios::in | std::ios::binary);
+    std::ifstream ifs(util::pathFromUtf8(xml_file_path), std::ios::in | std::ios::binary);
     if (!ifs.is_open()) {
         Mach3MigrationReport rep;
         rep.success = false;
@@ -272,7 +274,7 @@ Mach3MigrationReport Mach3XmlImporter::importFromFile(
     }
     std::ostringstream oss;
     oss << ifs.rdbuf();
-    std::string fname = std::filesystem::path(xml_file_path).filename().string();
+    std::string fname = util::pathToUtf8(util::pathFromUtf8(xml_file_path).filename());
     auto rep = importFromString(oss.str(), base_config, options, fname);
     rep.source_file_path = xml_file_path;
     return rep;

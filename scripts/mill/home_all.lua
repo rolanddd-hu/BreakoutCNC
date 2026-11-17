@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Mill Safe Homing Sequence (home_all.lua)
+-- BreakoutCNC - Mill Safe Homing Sequence (home_all.lua)
 -- Safe CNC Homing Order: Z Up first, then Y, then X
 -- ============================================================================
 
@@ -12,16 +12,19 @@ cnc.set_spindle(false)
 cnc.log("Homing Z Axis (Safe Retract Up)...")
 cnc.home("Z")
 cnc.wait_idle()
+if not cnc.is_homed("Z") then error("Z axis was not homed") end
 
 -- 3. Home Y Axis
 cnc.log("Homing Y Axis...")
 cnc.home("Y")
 cnc.wait_idle()
+if not cnc.is_homed("Y") then error("Y axis was not homed") end
 
 -- 4. Home X Axis
 cnc.log("Homing X Axis...")
 cnc.home("X")
 cnc.wait_idle()
+if not cnc.is_homed("X") then error("X axis was not homed") end
 
 cnc.log("All axes homed successfully.")
 return true

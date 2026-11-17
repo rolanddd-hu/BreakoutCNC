@@ -69,6 +69,61 @@ void ScriptRunner::initLuaEnvironment() {
             return handleInputRequest(req, ok);
         }
     );
+
+    // Cancellation must not be catchable: pcall / xpcall / coroutine.resume re-raise it, and the debug library
+    // (debug.sethook could remove the cancellation hook) is reduced to debug.traceback. Chunks load as text only.
+    lua_pushlightuserdata(L, this);
+    lua_pushcclosure(L, [](lua_State* S) -> int {
+        auto* runner = static_cast<ScriptRunner*>(lua_touserdata(S, lua_upvalueindex(1)));
+        lua_pushboolean(S, runner && runner->isCancellationRequested());
+        return 1;
+    }, 1);
+    lua_setglobal(L, "__rnr_cancelled");
+    static const char* const kHardening = R"LUA(
+local cancelled = __rnr_cancelled
+__rnr_cancelled = nil
+local CANCEL = "Script execution aborted by operator / E-STOP"
+local pack, unpack = table.pack, table.unpack
+local function pass(r)
+    if cancelled() then error(CANCEL, 0) end
+    return unpack(r, 1, r.n)
+end
+local raw_pcall, raw_xpcall = pcall, xpcall
+pcall = function(...) return pass(pack(raw_pcall(...))) end
+xpcall = function(...) return pass(pack(raw_xpcall(...))) end
+local raw_resume = coroutine.resume
+coroutine.resume = function(...) return pass(pack(raw_resume(...))) end
+local raw_wrap = coroutine.wrap
+coroutine.wrap = function(f)
+    local co = coroutine.create(f)
+    return function(...)
+        local r = pack(raw_resume(co, ...))
+        if cancelled() then error(CANCEL, 0) end
+        if not r[1] then error(r[2], 0) end
+        return unpack(r, 2, r.n)
+    end
+end
+local traceback = debug and debug.traceback
+debug = { traceback = traceback }
+local raw_load, raw_loadfile = load, loadfile
+load = function(chunk, name, mode, ...)
+    if select("#", ...) > 0 then return raw_load(chunk, name, "t", ...) end -- An env given (even nil) is passed on
+    return raw_load(chunk, name, "t")
+end
+loadfile = function(file, mode, ...)
+    if select("#", ...) > 0 then return raw_loadfile(file, "t", ...) end
+    return raw_loadfile(file, "t")
+end
+dofile = function(file)
+    local f, err = raw_loadfile(file, "t")
+    if not f then error(err, 2) end
+    return f()
+end
+)LUA";
+    if (luaL_dostring(L, kHardening) != LUA_OK) {
+        engine_.log(std::string("Script sandbox setup failed: ") + lua_tostring(L, -1), true);
+        lua_pop(L, 1);
+    }
 }
 
 void ScriptRunner::cancel() {
@@ -98,6 +153,9 @@ bool ScriptRunner::executeClaimed(bool is_file, const std::string& source, std::
         active_script_name_ = is_file ? source : std::string("<inline_script>");
     }
 
+    // Every run starts from a fresh Lua state: globals (or a replaced cnc.* function) left by one script must never
+    // change how the next one (m6.lua, a macro) behaves
+    initLuaEnvironment();
     lua_State* L = engine_.getLuaState();
     if (L) {
         lua_sethook(L, luaCancellationHook, LUA_MASKCOUNT, 100);
@@ -221,6 +279,13 @@ std::string ScriptRunner::handleInputRequest(const InputRequest& req, bool& ok) 
 bool ScriptRunner::hasPendingPrompt() const {
     std::lock_guard<std::mutex> lock(prompt_mutex_);
     return has_pending_prompt_;
+}
+
+bool ScriptRunner::pendingPrompt(PromptRequest& out) const {
+    std::lock_guard<std::mutex> lock(prompt_mutex_);
+    if (!has_pending_prompt_) return false;
+    out = pending_prompt_;
+    return true;
 }
 
 PromptRequest ScriptRunner::getPendingPrompt() const {

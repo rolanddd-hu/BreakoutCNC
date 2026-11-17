@@ -30,6 +30,26 @@ struct MachineCheckInput {
     bool                  simulator = false;
     size_t                start_segment = 0;  // Run From Line: moves before this segment are not checked
     bool                  include_warnings = true;
+    bool                  board_thc = false;  // The connected board runs plasma THC itself (grblHAL plasma plugin)
+
+    // A connected firmware-planned board (GRBL family): what it reported about itself
+    struct BoardLimits {
+        bool        known = false;
+        std::string name;                              // "grblHAL"
+        uint8_t     axis_count = 4;
+        uint8_t     aux_outputs = 4;
+        bool        rates_known = false;               // $110-$113
+        std::array<double, 4> max_rate_mm_min{};
+        std::array<bool, 4>   travel_known{};          // $130-$133 with the homing direction (app machine frame)
+        std::array<double, 4> travel_min{}, travel_max{};
+        bool        soft_limits = false;               // $20
+        bool operator==(const BoardLimits& o) const {
+            return known == o.known && name == o.name && axis_count == o.axis_count && aux_outputs == o.aux_outputs &&
+                   rates_known == o.rates_known && max_rate_mm_min == o.max_rate_mm_min &&
+                   travel_known == o.travel_known && travel_min == o.travel_min && travel_max == o.travel_max &&
+                   soft_limits == o.soft_limits;
+        }
+    } board;
 };
 
 struct MachineCheckResult {

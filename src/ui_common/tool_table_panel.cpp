@@ -13,7 +13,7 @@ void ToolTablePanel::render(
     const core::TelemetrySnapshot& telemetry,
     const std::function<void()>& on_changed)
 {
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     bool changed = false;
     const float spacing = ImGui::GetStyle().ItemSpacing.x;
 

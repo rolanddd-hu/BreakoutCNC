@@ -57,6 +57,8 @@ public:
     // Interactive UI Prompt Mailbox (called by Dear ImGui render loop)
     bool hasPendingPrompt() const;
     PromptRequest getPendingPrompt() const;
+    // Both in one locked read: true and the prompt, or false when none is waiting
+    bool pendingPrompt(PromptRequest& out) const;
     // `input` carries the entered text for cnc.input / cnc.input_number dialogs
     void submitPromptResponse(const std::string& response, const std::string& input = {});
 

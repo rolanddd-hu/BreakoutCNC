@@ -172,7 +172,11 @@ void ProbePanel::render(core::IMotionController& controller,
         ImGui::SameLine();
         ImGui::TextColored(hit ? theme::pal().text_ok : theme::pal().text_info,
                            hit ? "CONTACT (G31 hit)" : "READY (open circuit)");
-        ImGui::TextDisabled("Input IN%d, %s", cfg.probe.probe_pin, cfg.probe.probe_invert ? "active low" : "active high");
+        if (telemetry.board_firmware_planned) {
+            ImGui::TextDisabled("The board's probe input (polarity in its settings, $6 on GRBL)");
+        } else {
+            ImGui::TextDisabled("Input IN%d, %s", cfg.probe.probe_pin, cfg.probe.probe_invert ? "active low" : "active high");
+        }
         ImGui::PopTextWrapPos();
         ImGui::EndGroup();
         const float text_h = ImGui::GetItemRectSize().y;
@@ -365,7 +369,7 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
         ImGui::TextColored(theme::pal().heading, "GRID AREA");
         ImGui::Spacing();
 
-        const bool is_imperial = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+        const bool is_imperial = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
         const double u_scale = is_imperial ? (1.0 / 25.4) : 1.0;
         const double u_unscale = is_imperial ? 25.4 : 1.0;
         const char* u_str = is_imperial ? "in" : "mm";
@@ -389,25 +393,23 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
 
         ImGui::BeginDisabled(telemetry.surface_probing_active);
 
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_xmin, &f_xmin, step_slow, step_fast, val_fmt)) {
-            surface_min_x_ = f_xmin * u_unscale;
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_xmax, &f_xmax, step_slow, step_fast, val_fmt)) {
-            surface_max_x_ = f_xmax * u_unscale;
-        }
-
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_ymin, &f_ymin, step_slow, step_fast, val_fmt)) {
-            surface_min_y_ = f_ymin * u_unscale;
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::InputFloat(lbl_ymax, &f_ymax, step_slow, step_fast, val_fmt)) {
-            surface_max_y_ = f_ymax * u_unscale;
-        }
+        // Min and max side by side when both fields still have room next to their labels (AGENTS.md rule 3: the
+        // width set for an input excludes its label, so each column is budgeted for it), else one per line
+        const float grid_gap   = 12.0f;
+        const float grid_col_w = (ImGui::GetContentRegionAvail().x - grid_gap) * 0.5f;
+        const float label_sp   = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float label_w    = std::max(ImGui::CalcTextSize(lbl_xmax).x, ImGui::CalcTextSize(lbl_ymax).x) + label_sp;
+        const bool  grid_2col  = grid_col_w - label_w >= 130.0f;
+        const float grid_field_w = grid_2col ? grid_col_w - label_w : std::max(130.0f, ImGui::GetContentRegionAvail().x - label_w);
+        auto gridField = [&](const char* lbl, float& v, double& target, bool second) {
+            if (second && grid_2col) ImGui::SameLine(0.0f, grid_gap);
+            ImGui::SetNextItemWidth(grid_field_w);
+            if (ImGui::InputFloat(lbl, &v, step_slow, step_fast, val_fmt)) target = v * u_unscale;
+        };
+        gridField(lbl_xmin, f_xmin, surface_min_x_, false);
+        gridField(lbl_xmax, f_xmax, surface_max_x_, true);
+        gridField(lbl_ymin, f_ymin, surface_min_y_, false);
+        gridField(lbl_ymax, f_ymax, surface_max_y_, true);
 
         ImGui::EndDisabled();
 
@@ -417,11 +419,15 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
         if (is_imperial) {
             double span_w_in = span_w * u_scale;
             double span_h_in = span_h * u_scale;
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Area: %.2f in (W) x %.2f in (H)  |  %.2f sq in",
                                 span_w_in, span_h_in, span_w_in * span_h_in);
+            ImGui::PopTextWrapPos();
         } else {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Area: %.1f mm (W) x %.1f mm (H)  |  %.1f cm2",
                                 span_w, span_h, span_w * span_h / 100.0);
+            ImGui::PopTextWrapPos();
         }
 
         ImGui::Spacing();
@@ -542,16 +548,20 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
         double dx = (surface_points_x_ > 1) ? (surface_max_x_ - surface_min_x_) / (surface_points_x_ - 1) : 0.0;
         double dy = (surface_points_y_ > 1) ? (surface_max_y_ - surface_min_y_) / (surface_points_y_ - 1) : 0.0;
 
-        const bool is_imperial = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+        const bool is_imperial = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
         const double u_scale = is_imperial ? (1.0 / 25.4) : 1.0;
 
         ImGui::Spacing();
         if (is_imperial) {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Total Points: %d (%d x %d)  |  dX: %.3f in, dY: %.3f in",
                                 total_pts, surface_points_x_, surface_points_y_, dx * u_scale, dy * u_scale);
+            ImGui::PopTextWrapPos();
         } else {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("Total Points: %d (%d x %d)  |  dX: %.1f mm, dY: %.1f mm",
                                 total_pts, surface_points_x_, surface_points_y_, dx, dy);
+            ImGui::PopTextWrapPos();
         }
     }
     ImGui::EndChild();
@@ -778,7 +788,7 @@ void ProbePanel::renderSurfaceDeck(core::IMotionController& controller,
             ImGui::Text("%d x %d (%zu pts)", shm.points_x, shm.points_y, shm.grid_z.size());
             ImGui::NextColumn();
 
-            const bool is_imperial_shm = (controller.getConfig().linear_units == core::LinearUnits::Imperial);
+            const bool is_imperial_shm = (controller.getConfigShared()->linear_units == core::LinearUnits::Imperial);
             const double shm_scale = is_imperial_shm ? (1.0 / 25.4) : 1.0;
             const char* z_fmt = is_imperial_shm ? "%+.4f in" : "%+.3f mm";
             const char* p2p_fmt = is_imperial_shm ? "%.4f in" : "%.3f mm";

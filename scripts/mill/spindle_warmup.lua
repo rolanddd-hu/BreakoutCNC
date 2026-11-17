@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Spindle Warmup Macro (spindle_warmup.lua)
+-- BreakoutCNC - Spindle Warmup Macro (spindle_warmup.lua)
 -- Gradually brings bearings up to operating temperature
 -- ============================================================================
 

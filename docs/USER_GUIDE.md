@@ -94,7 +94,7 @@ Keyboard:
 
 | Key | Action |
 |---|---|
-| **Esc** | E-stop, whatever has keyboard focus |
+| **Esc** | E-stop while the machine moves or a job is paused, whatever has keyboard focus. At rest, Esc first closes an open dropdown or leaves a text field |
 | Arrow keys | Jog X / Y |
 | Page Up / Page Down | Jog Z |
 | Home / End | Jog A+ / A- (BreakoutMill, when A is not slaved to another axis) |
@@ -110,7 +110,9 @@ Keyboard:
   and the current speed.
 - **Zero X / Y / Z / A** sets the work zero of that axis at the current position (in the active work offset, G54 by
   default). **ZERO ALL** does all axes.
-- **H** homes one axis, **HOME ALL** runs the homing sequence (`scripts/mill/home_all.lua`).
+- **H** homes one axis, **HOME ALL** homes Z, then Y, then X with the built-in homing cycle. With **Home script**
+  ticked (Scripts & Macros, Hooks), HOME ALL runs `scripts/mill/home_all.lua` (BreakoutCut:
+  `scripts/cut/home_all.lua`) instead; the H buttons always use the built-in cycle.
 - **GO TO ZERO** moves to the work zero, **PROBE Z** opens the Z touch-off dialog.
 - **Jog:** *Continuous Hold* moves while a button or key is held, *Step Increment* moves a fixed distance per press.
   **Jog Speed** scales the jog feed. Several axes can be jogged at once from the keyboard. In continuous mode, hold
@@ -199,7 +201,11 @@ Work through them in this order, with the stepper drivers **powered off** until 
 
 ### 5.1 Connect the board
 
-*Connection*: with the board plugged in, untick **Simulator Mode** (or press **Connect
+*Connection* > **Board** selects the motion board: **RNR Eco Motion 2.0**, **GRBL 1.1**, **grblHAL** or **FluidNC**.
+The choice and each board's connection settings are saved. For a GRBL-family board, see
+[GRBL, grblHAL and FluidNC boards](#51a-grbl-grblhal-and-fluidnc-boards) below.
+
+RNR Eco Motion 2.0: with the board plugged in, untick **Simulator Mode** (or press **Connect
 USB**). The yellow line *Simulator (no board)* changes to the board's name. If the board is not found on Linux, check
 the udev rule; on Windows no driver is needed.
 
@@ -207,6 +213,81 @@ While the board is connected, **Step pulse rate** appears under the buttons: 25,
 RNR Mach3 plugin. Each axis is limited to 0.95 × rate ÷ Steps/mm (at 25 kHz and 200 steps/mm: about 7100 mm/min).
 If an axis loses steps at high speed, try 50 or 25 kHz, as long as that limit still covers your rapids. It can be
 changed while the machine is idle.
+
+### 5.1a GRBL, grblHAL and FluidNC boards
+
+These boards plan the motion themselves: BreakoutCNC sends them G-code lines. Mach3-style programs load unchanged;
+the app converts them for the board.
+
+**Connecting**
+1. *Connection* > **Board**: choose GRBL 1.1, grblHAL or FluidNC.
+2. **Connect by**: *USB / serial* (choose the **Port**, normally 115200 baud) or *Network* (the board's address,
+   port 23).
+3. **Reset the board when connecting (DTR)**: leave it on for Arduino-based GRBL boards (they restart when the port
+   opens, which is normal) and off for ESP32 boards (FluidNC), so they do not start their bootloader.
+4. Press **Connect**. The app identifies the firmware, reads the board's settings and shows *Firmware: ...*. If a
+   different flavour answers than the one selected, a message says so.
+5. Press **RESET E-STOP**. If the board was in alarm (for example "homing required"), the reset also unlocks it
+   (`$X`). The **Unlock ($X)** button under the connection settings does the same.
+
+**What is different from the RNR board**
+
+| | RNR Eco Motion 2.0 | GRBL-family board |
+|---|---|---|
+| Steps/mm, speeds, accelerations, travel | *Motors* in the app | *Board Settings* (`$100`-`$132`, or FluidNC's configuration) |
+| Limit and home switches, homing speeds, pull-off | *Limits & Homing* in the app | The board's own settings; **HOME ALL** runs its homing cycle (`$H`) |
+| Single-axis homing (**H** buttons) | Yes | Only when the board supports it; plain GRBL 1.1 usually homes all axes together |
+| Input and output pin assignment | *Inputs & Outputs* | Fixed by the board; polarity in its settings (`$5`, `$6`) |
+| Feed override | 10-250 % | 10-200 %, plus **Rapids** 25 / 50 / 100 % |
+| Corner tolerance, G61 / G64 | Used | The board blends corners with its junction deviation (`$11`) |
+| Jogging during a feed hold | No | No |
+| Plasma torch height control | Yes, by the app | grblHAL with the plasma plugin: by the board. Other boards: switch THC off |
+| Laser | Dynamic power per 25 ms | `M4` dynamic power; needs the board's laser mode (`$32 = 1`) |
+
+**Work offsets stay in the app.** Work offsets, tool lengths, G53 / G28, G68 rotation and height maps are applied by
+BreakoutCNC, which sends the board machine-referenced coordinates. The board's own G54-G59 and G92 are not changed. A
+pendant or web page attached to the board therefore shows a different *work* position than the app; machine
+positions match.
+
+**Board Settings** (appears for these boards) lists the firmware's settings with descriptions. Edit values, then
+**Write all changes**; a value the board refuses shows the reason next to it. **Backup** saves all values to a text
+file next to the application; **Restore...** loads such a file and lists the differences before writing them. On
+FluidNC the panel shows the configuration tree; many of those values only take effect after the board restarts.
+
+**Plasma on grblHAL.** A grblHAL board built with the plasma plugin (`$350` set to a mode other than 0) runs torch
+height control on the board: after `M3` it waits for Arc OK (with its own timeout and retries), and during the cut it
+corrects the torch height from the arc voltage or the THC's up / down signals. BreakoutCut detects the plugin when it
+connects. *Torch Height Control* then shows the board's state (torch, Arc OK, THC active, up / down, anti-dive) and the
+arc voltage; the app's own THC inputs and speeds are not used. The plugin's settings (THC delay, threshold, anti-dive,
+arc fail timeout, retries, ports) are in the *Plasma* group of *Board Settings*. If the torch does not start, the
+board pauses the job: check the torch, then press **CYCLE START** to try again, or **STOP / REWIND**. On GRBL 1.1,
+FluidNC and grblHAL without the plugin, plasma runs without THC.
+
+**Board Console** shows what the app and the board exchange (status reports hidden by default) and takes commands
+such as `$$`, `$#`, `$G` while the machine is idle. **Save board report** asks the board for its build info,
+settings, offsets and modes (nothing is changed) and saves them, with the recent exchange, to a
+`board_report_<board>_<date>.txt` file next to the application. Make one when a new board is connected for the first
+time, or when something behaves unexpectedly, and keep it with your notes or send it along with a problem report.
+
+**4th axis.** grblHAL and FluidNC boards built with an A axis report four axes when they connect; BreakoutMill then
+shows the A row, the A jog buttons and its **H** button. The A axis is set up in the board (`$103`, `$113`, `$123`,
+`$133` on grblHAL; FluidNC's configuration). A program that moves A cannot start on a 3-axis board. Motors ganged on
+one axis (two Y motors) are configured in the board's firmware; the app's *Dual-Motor Gantry* setting is only for
+the RNR board.
+
+**Program check with the board's limits.** After homing, the program check warns about moves beyond the board's
+travel (`$130`-`$133`; GRBL places machine zero at the home switch, so with homing toward the maximum the travel is
+negative, for example X from -300 to 0), about feeds above the board's maximum rates (`$110`-`$113`), and about
+custom outputs the board does not have. These are warnings: the job can still be started.
+
+**Trying it without a board.** Start the application with `--fake-board` (for example
+`BreakoutMill.exe --fake-board`): the three board choices then connect to a built-in emulator instead of hardware.
+Nothing is sent to a real board or VFD, and the normal settings file is not touched. In BreakoutCut the emulated
+grblHAL board has the plasma plugin, so board THC can be tried as well.
+
+**Safety.** The **EMERGENCY STOP** button resets the board at once. If the machine was moving, the board loses its
+position and must be homed again. If the USB cable or network is lost during a job, the board finishes what it has
+buffered (a few moves) and stops with the spindle still on: the hardwired E-stop is the safety device.
 
 ### 5.2 Units and motors
 
@@ -475,7 +556,9 @@ Plasma programs from SheetCam and similar CAM programs use M3 / M5 to fire the t
 
 - *Laser Power:* source type presets, **Dynamic Laser Power (M4)** (power follows the speed, so
   corners do not burn), **Ignore G-Code Z Moves** (fixed focus height), min / max duty and the live power override.
-  Programs use `S0`–`S1000` for 0–100 % power.
+  Programs use `S0`–`S1000` for 0–100 % power; set **S for 100% Power** to 255 if your CAM writes `S0`–`S255`. `S0`
+  switches the beam off (LightBurn and LaserGRBL use it for overscan and white pixels); a program without any S word
+  cuts at full power. The program check warns about S values above the 100 % value.
 - *Laser Alignment & Framing:* **FRAME JOB BOUNDING BOX** traces the job outline, so you can position the
   material: with a low-power beam, the red-dot pointer (OUT2), both, or motion only. **FIRE TEST PULSE** gives a short
   pulse (duration and power set above it) for focusing.
@@ -501,10 +584,23 @@ dialog, or use **Button Color** in the right-click menu (also on pinned buttons)
 
 *Camera & Remote View* (BreakoutMill) / *Remote View* (BreakoutCut): a camera can be
 shown under the toolpath (with calibration so the toolpath lines up with the workpiece), and a small web server can
-stream it (`http://<pc>:8080/stream` by default) together with the job state and a remote E-stop.
+stream it together with the job state and a remote E-stop. Open the **URL** shown in the panel
+(`http://<pc address>:8080` by default) in a browser on the same network.
 
-> The web server has **no password**: enable it only on a network you trust. Uploading G-code from the browser is a
-> separate option and off by default.
+- **Listen on**: *All networks*, only one of the PC's network addresses (for example the shop network but not the
+  office WiFi), or *This PC only*.
+- **Access code**: when set, the page asks for it once per browser session; changing it signs every viewer out. Five
+  wrong codes from one device lock that device out for a minute. The code is stored in the settings file as plain
+  text: it keeps casual visitors out, it is not a strong password. Without a code, anyone who can reach the PC on the
+  selected network can watch the camera and press the remote E-stop.
+- **Allow remote G-code upload** is a separate option and off by default. Uploads are refused while a job is running
+  or paused, and the file name is reduced to safe characters.
+- Other web sites cannot use the server through your browser: it only answers to the PC's address or name, and the
+  E-stop and upload only work from its own page.
+- At most four browsers can watch the camera at once, so the page and the E-stop always get through.
+
+> The remote E-stop depends on the network and the browser: it is **not a safety device**. Keep the machine's own
+> E-stop within reach. Do not make the server reachable from the internet (port forwarding).
 
 ## 12. Troubleshooting and getting help
 

@@ -1,4 +1,5 @@
 #include "ui_common/mach3_migration_dialog.h"
+#include "core/util/utf8_path.h"
 #include "ui_common/theme.h"
 #include "ui_common/file_dialog.h"
 #include "ui_common/app_window.h"
@@ -121,7 +122,7 @@ void Mach3MigrationDialog::loadDemoMach3Profile(const core::MachineConfig& base_
 
 void Mach3MigrationDialog::applyImport(core::IMotionController& controller) {
     if (!has_backup_) {
-        backup_config_ = controller.getConfig();
+        backup_config_ = *controller.getConfigShared();
         has_backup_ = true;
     }
     controller.applyConfig(report_.migrated_config);
@@ -189,7 +190,7 @@ bool Mach3MigrationDialog::render(core::IMotionController& controller, bool is_p
 bool Mach3MigrationDialog::renderImportAuditPhase(core::IMotionController& controller, bool is_plasma_app) {
     bool modified = false;
     // Imports start from the configuration as it was before any import of this session
-    const core::MachineConfig current_cfg = has_backup_ ? backup_config_ : controller.getConfig();
+    const core::MachineConfig current_cfg = has_backup_ ? backup_config_ : *controller.getConfigShared();
 
     auto reimport = [&]() {
         if (!selected_xml_path_.empty()) {
@@ -247,7 +248,7 @@ bool Mach3MigrationDialog::renderImportAuditPhase(core::IMotionController& contr
             ImGui::Spacing();
             ImGui::TextColored(theme::pal().text_info, "Found in C:\\Mach3:");
             for (const auto& p : discovered_profiles_) {
-                std::string fname = std::filesystem::path(p).filename().string();
+                std::string fname = util::pathToUtf8(util::pathFromUtf8(p).filename());
                 if (ImGui::GetContentRegionAvail().x > buttonWidth(fname.c_str()) + 8.0f) ImGui::SameLine();
                 if (ImGui::Button(fname.c_str(), ImVec2(buttonWidth(fname.c_str()), 28.0f))) {
                     selected_xml_path_ = p;
@@ -507,7 +508,7 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
     bool is_plasma_app)
 {
     bool modified = false;
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     const core::TelemetrySnapshot tel = controller.getTelemetry();
 
     const bool is_imp = (cfg.linear_units == core::LinearUnits::Imperial);
@@ -987,7 +988,9 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
                 ImGui::PopStyleColor(2);
             }
             if (tel.simulator_mode) {
+                ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextDisabled("(Simulator Mode active: click any IN1..IN12 button above to simulate a switch press)");
+                ImGui::PopTextWrapPos();
             }
 
             ImGui::Spacing();
@@ -1037,7 +1040,9 @@ bool Mach3MigrationDialog::renderMachineTestPhase(
                 ImGui::Separator();
                 ImGui::Spacing();
                 ImGui::TextColored(theme::pal().text_info, "Spindle Dry-Run Speed Check:");
+                ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextDisabled("Select or type the safe test speed for your spindle (minimum RPM depends on spindle type/cooling):");
+                ImGui::PopTextWrapPos();
 
                 ImGui::SetNextItemWidth(130.0f);
                 if (ImGui::InputInt("Test RPM##SpindleTestInput", &test_spindle_rpm_, 500, 2000)) {

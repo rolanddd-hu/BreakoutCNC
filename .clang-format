@@ -1,0 +1,19 @@
+# The style the code is written in. Apply it to the lines you change (git clang-format), not to whole files at once.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: None
+AlignTrailingComments: true
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+IndentCaseLabels: true
+NamespaceIndentation: None
+FixNamespaceComments: true
+SortIncludes: Never
+SpaceBeforeParens: ControlStatements

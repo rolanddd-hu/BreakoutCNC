@@ -49,6 +49,8 @@ private:
     float step_size_mm_     = 10.0f;
     float jog_speed_pct_    = 50.0f;
     float rendered_height_  = 540.0f;
+    bool  key_hint_hidden_  = false;  // The keyboard hint gives way when the panel is too short for everything
+    float key_hint_h_       = 0.0f;   // Its height when shown (for showing it again)
     float max_height_       = 620.0f;
     float min_height_       = 350.0f;
     float allocated_height_ = -1.0f;

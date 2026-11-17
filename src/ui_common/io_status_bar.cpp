@@ -3,8 +3,12 @@
 #include "core/io/io_map.h"
 #include "ui_common/gcode_panel.h"
 #include "ui_common/diagnostics_report.h"
+#include "ui_common/board_panels.h"
+#include "core/board/io_model.h"
 #include "imgui.h"
+#include <cmath>
 #include <cstdio>
+#include <string>
 #include <algorithm>
 
 namespace rnr::ui {
@@ -68,7 +72,7 @@ void IoStatusBar::renderTopBar(
     }
 
     ImGui::SameLine();
-    if (ImGui::SmallButton("Connect USB")) {
+    if (ImGui::SmallButton("Connect")) {
         controller.connect();
     }
     ImGui::SameLine();
@@ -94,7 +98,8 @@ void IoStatusBar::renderTopBar(
         }
     }
 
-    const auto& cur_cfg = controller.getConfig();
+    const auto cur_cfg_ptr = controller.getConfigShared();
+    const auto& cur_cfg = *cur_cfg_ptr;
     ImGui::SameLine();
     if (cur_cfg.linear_units == core::LinearUnits::Metric) {
         ImGui::TextColored(theme::pal().text_info, "Units: mm");
@@ -369,8 +374,16 @@ void IoStatusBar::renderUsbConnectionSection(
     const core::TelemetrySnapshot& telemetry,
     const std::function<void()>& on_settings_changed)
 {
+    // Row 0: which board, and how to reach it
+    renderBoardSelector(controller, telemetry, on_settings_changed);
+    const bool firmware_board = telemetry.board_firmware_planned;
+
     // Row 1: Connection status badge
-    if (telemetry.usb_connected && !telemetry.simulator_mode) {
+    if (telemetry.usb_connected && !telemetry.simulator_mode && firmware_board) {
+        ImGui::TextColored(telemetry.board_connecting ? theme::pal().text_warn : theme::pal().text_ok,
+                           "%s: %s (%s)", telemetry.board_connecting ? "Connecting" : "Connected",
+                           telemetry.product_name.c_str(), telemetry.serial_number.c_str());
+    } else if (telemetry.usb_connected && !telemetry.simulator_mode) {
         ImGui::TextColored(theme::pal().text_ok,
                            "Connected: %s (SN %s)",
                            telemetry.product_name.c_str(),
@@ -395,7 +408,9 @@ void IoStatusBar::renderUsbConnectionSection(
     ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
 
     // Button 1: Reconnect USB / Connect USB
-    if (ImGui::Button(telemetry.usb_connected ? "Reconnect USB" : "Connect USB", ImVec2(btn_w, btn_h))) {
+    const char* connect_lbl = firmware_board ? (telemetry.usb_connected ? "Reconnect" : "Connect")
+                                             : (telemetry.usb_connected ? "Reconnect USB" : "Connect USB");
+    if (ImGui::Button(connect_lbl, ImVec2(btn_w, btn_h))) {
         controller.connect();
     }
 
@@ -403,7 +418,7 @@ void IoStatusBar::renderUsbConnectionSection(
     ImGui::SameLine();
     const bool can_disconnect = (telemetry.usb_connected && !telemetry.simulator_mode);
     ImGui::BeginDisabled(!can_disconnect);
-    if (ImGui::Button("Disconnect USB", ImVec2(btn_w, btn_h))) {
+    if (ImGui::Button(firmware_board ? "Disconnect" : "Disconnect USB", ImVec2(btn_w, btn_h))) {
         controller.disconnect();
     }
     ImGui::EndDisabled();
@@ -420,6 +435,7 @@ void IoStatusBar::renderUsbConnectionSection(
     }
     ImGui::PopStyleVar(2);
 
+    if (firmware_board) return;
     if (telemetry.usb_connected && !telemetry.simulator_mode) {
         renderPulseRateSetting(controller, telemetry, on_settings_changed);
     }
@@ -434,7 +450,7 @@ void IoStatusBar::renderPulseRateSetting(
     const core::TelemetrySnapshot& telemetry,
     const std::function<void()>& on_settings_changed)
 {
-    core::MachineConfig cfg = controller.getConfig();
+    core::MachineConfig cfg = *controller.getConfigShared();
     const auto& rates = core::MachineConfig::kPulseRatesKhz;
 
     ImGui::Spacing();
@@ -476,6 +492,35 @@ void IoStatusBar::renderPulseRateSetting(
     ImGui::EndChild();
 }
 
+namespace {
+// E-stop banner: the message wraps in the space left of the RESET button (the button sat on top of long messages),
+// and the banner grows to fit it
+struct BannerLayout {
+    std::string text;
+    float  text_w = 0.0f, height = 40.0f;
+    ImVec2 text_pos{}, button_pos{};
+};
+
+BannerLayout bannerLayout(const core::TelemetrySnapshot& t, float width, float btn_w, float btn_h) {
+    constexpr float kPadX = 10.0f, kPadY = 6.0f;
+    BannerLayout l;
+    l.text = "E-STOP: " + (t.active_fault_message.empty() ? std::string("Emergency Stop Active") : t.active_fault_message);
+    l.text_w = std::max(80.0f, width - btn_w - kPadX * 3.0f);
+    const float text_h = ImGui::CalcTextSize(l.text.c_str(), nullptr, false, l.text_w).y;
+    l.height = std::max(40.0f, std::max(text_h, btn_h) + kPadY * 2.0f);
+    l.text_pos = ImVec2(kPadX, std::floor((l.height - text_h) * 0.5f));
+    l.button_pos = ImVec2(width - btn_w - kPadX, std::floor((l.height - btn_h) * 0.5f));
+    return l;
+}
+
+void drawBannerText(const BannerLayout& l) {
+    ImGui::SetCursorPos(l.text_pos);
+    ImGui::PushTextWrapPos(l.text_pos.x + l.text_w);
+    ImGui::TextColored(theme::pal().alarm_text, "%s", l.text.c_str());
+    ImGui::PopTextWrapPos();
+}
+} // namespace
+
 void IoStatusBar::renderGlobalAlarmBanner(
     core::IMotionController& controller,
     const core::TelemetrySnapshot& telemetry)
@@ -490,15 +535,10 @@ void IoStatusBar::renderGlobalAlarmBanner(
         ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
 
-        ImGui::BeginChild("##GlobalAlarmBanner", ImVec2(0.0f, 40.0f), true, ImGuiWindowFlags_NoScrollbar);
-        ImGui::AlignTextToFramePadding();
-        const char* msg = telemetry.active_fault_message.empty()
-                              ? "Emergency Stop Active"
-                              : telemetry.active_fault_message.c_str();
-        ImGui::TextColored(theme::pal().alarm_text, "  E-STOP: %s", msg);
-
-        const float right_x = ImGui::GetWindowWidth() - btn_w - 10.0f;
-        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 10.0f, right_x));
+        const BannerLayout lay = bannerLayout(telemetry, ImGui::GetContentRegionAvail().x, btn_w, btn_h);
+        ImGui::BeginChild("##GlobalAlarmBanner", ImVec2(0.0f, lay.height), true, ImGuiWindowFlags_NoScrollbar);
+        drawBannerText(lay);
+        ImGui::SetCursorPos(lay.button_pos);
 
         ImGui::PushStyleColor(ImGuiCol_Button,        theme::pal().alarm_btn);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pal().alarm_btn_hov);
@@ -526,8 +566,9 @@ void IoStatusBar::renderFloatingAlarmBanner(
         const float btn_w = 140.0f;
         const float btn_h = 28.0f;
 
+        const BannerLayout lay = bannerLayout(telemetry, width, btn_w, btn_h);
         ImGui::SetNextWindowPos(screen_pos);
-        ImGui::SetNextWindowSize(ImVec2(width, 40.0f));
+        ImGui::SetNextWindowSize(ImVec2(width, lay.height));
 
         // 85 % like the other toolpath view overlays, so the toolpath stays faintly visible behind the banner
         ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::pal().alarm_bg);
@@ -544,15 +585,8 @@ void IoStatusBar::renderFloatingAlarmBanner(
                          ImGuiWindowFlags_NoFocusOnAppearing |
                          ImGuiWindowFlags_NoNav))
         {
-            ImGui::AlignTextToFramePadding();
-            const char* msg = telemetry.active_fault_message.empty()
-                                  ? "Emergency Stop Active"
-                                  : telemetry.active_fault_message.c_str();
-            ImGui::TextColored(theme::pal().alarm_text, "  E-STOP: %s", msg);
-
-            const float right_x    = width - btn_w - 10.0f;
-            const float after_tx_x = ImGui::GetCursorPosX() + 10.0f;
-            ImGui::SameLine(std::max(after_tx_x, right_x));
+            drawBannerText(lay);
+            ImGui::SetCursorPos(lay.button_pos);
 
             ImGui::PushStyleColor(ImGuiCol_Button,        theme::pal().alarm_btn);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pal().alarm_btn_hov);
@@ -575,97 +609,141 @@ void IoStatusBar::renderBottomIoStrip(
 {
     ImGui::BeginChild("##BottomIoStrip", ImVec2(0.0f, 40.0f), true, ImGuiWindowFlags_NoScrollbar);
 
-    // Labels from the pin assignment: function or custom name per output / input (full text in the tooltips)
-    const core::MachineConfig cfg = controller.getConfig();
-    const auto mode = cfg.operation_mode;
-    const auto input_uses = core::io::describeInputs(cfg);
-    std::array<std::string, core::kPhysicalOutputCount> out_names;
-    for (int pin = 1; pin <= core::kPhysicalOutputCount; ++pin) {
-        const int ch = core::io::channelForPin(cfg.io, pin);
-        out_names[pin - 1] = ch >= 0 ? core::io::channelShortName(ch, cfg.is_mill, mode) : cfg.io.output_name[pin - 1];
-    }
-    std::array<std::string, core::kInputCount> in_names;
-    for (int i = 0; i < core::kInputCount; ++i) {
-        in_names[i] = core::io::inputShortLabel(input_uses[i], cfg.io.input_name[i]);
-    }
-
-    // Full labels ("OUT1 Spindle", "IN5 Probe") when they fit next to the Diagnostics box, else pin numbers only
-    const ImGuiStyle& st = ImGui::GetStyle();
-    const char* in_title = telemetry.simulator_mode ? "INPUTS (Click to Simulate):" : "INPUTS:";
-    auto pillW = [&](const std::string& text) { return ImGui::CalcTextSize(text.c_str()).x + st.FramePadding.x * 2.0f + st.ItemSpacing.x; };
-    float full_w = ImGui::CalcTextSize("OUTPUTS:").x + ImGui::CalcTextSize(in_title).x + 18.0f + 2.0f * st.ItemSpacing.x;
-    for (int pin = 1; pin <= core::kPhysicalOutputCount; ++pin) {
-        full_w += pillW("OUT" + std::to_string(pin) + (out_names[pin - 1].empty() ? "" : " " + out_names[pin - 1]));
-    }
-    for (int i = 0; i < core::kInputCount; ++i) {
-        full_w += pillW("IN" + std::to_string(i + 1) + (in_names[i].empty() ? "" : " " + in_names[i]));
-    }
-    const bool compact = full_w > ImGui::GetContentRegionAvail().x - 135.0f;
-
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("OUTPUTS:");
-    for (int pin = 1; pin <= core::kPhysicalOutputCount; ++pin) {
-        ImGui::SameLine();
-        const bool on = ((telemetry.physical_outputs_bitmask >> (pin - 1)) & 1U) != 0;
-        const std::string& name = out_names[pin - 1];
-        char lbl[64];
-        if (compact || name.empty()) {
-            std::snprintf(lbl, sizeof(lbl), "OUT%d##Out%d", pin, pin);
-        } else {
-            std::snprintf(lbl, sizeof(lbl), "OUT%d %s##Out%d", pin, name.c_str(), pin);
+    if (telemetry.board_firmware_planned && !telemetry.simulator_mode) {
+        // GRBL-family board: its own fixed terminals, as it reports them (A: and Pn:)
+        const auto& caps = boardCaps(controller, telemetry);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("OUTPUTS:");
+        struct OutPill { const char* label; uint8_t bit; int channel; const char* tip; };
+        const bool mill = controller.getConfigShared()->is_mill;
+        const OutPill outs[] = {
+            {mill ? "Spindle" : "Torch / laser", core::OutputBit::OUT1_TorchOrSpindle, 1, "M3 / M5"},
+            {"Flood", core::OutputBit::OUT3_FloodCoolant, 3, "M8 / M9"},
+            {"Mist", core::OutputBit::OUT4_MistCoolant, 4, "M7 / M9"},
+        };
+        for (const auto& o : outs) {
+            if (o.bit == core::OutputBit::OUT4_MistCoolant && !caps.mist_output) continue;
+            ImGui::SameLine();
+            const bool on = (telemetry.outputs_bitmask & o.bit) != 0;
+            ImGui::PushStyleColor(ImGuiCol_Button, on ? theme::pal().btn_warn : theme::pal().btn_neutral);
+            char lbl[48];
+            std::snprintf(lbl, sizeof(lbl), "%s##FwOut%d", o.label, o.channel);
+            if (ImGui::SmallButton(lbl)) controller.setAuxOutput(static_cast<uint8_t>(o.channel), !on);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s (%s): %s\nClick to switch it %s", o.label, o.tip,
+                                                          on ? "on" : "off", on ? "off" : "on");
         }
-        ImGui::PushStyleColor(ImGuiCol_Button, on ? theme::pal().btn_warn : theme::pal().btn_neutral);
-        if (compact && !name.empty() && !on) ImGui::PushStyleColor(ImGuiCol_Text, theme::pal().text_info);
-        if (ImGui::SmallButton(lbl)) {
-            controller.setPhysicalOutput(static_cast<uint8_t>(pin), !on);
-        }
-        if (compact && !name.empty() && !on) ImGui::PopStyleColor();
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            const int ch = core::io::channelForPin(cfg.io, pin);
-            ImGui::SetTooltip("OUT%d: %s (%s)\nClick to switch it %s", pin,
-                              ch >= 0 ? core::io::channelName(ch, cfg.is_mill, mode)
-                                      : (name.empty() ? "custom output, no name" : name.c_str()),
-                              on ? "on" : "off", on ? "off" : "on");
-        }
-    }
-
-    ImGui::SameLine(0.0f, 18.0f);
-    ImGui::TextDisabled("%s", in_title);
-    for (int i = 0; i < core::kInputCount; ++i) {
-        ImGui::SameLine();
-        const bool in_on = ((telemetry.inputs_bitmask >> i) & 1U) != 0;
-        const std::string& name = in_names[i];
-        char lbl[64];
-        if (compact || name.empty()) {
-            std::snprintf(lbl, sizeof(lbl), "IN%d##In%d", i + 1, i + 1);
-        } else {
-            std::snprintf(lbl, sizeof(lbl), "IN%d %s##In%d", i + 1, name.c_str(), i + 1);
-        }
-        // Used inputs show their state in green; in compact mode an off but used input has blue text
-        ImGui::PushStyleColor(ImGuiCol_Button, in_on ? theme::pal().btn_ok : theme::pal().btn_neutral);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, in_on ? theme::pal().btn_ok_hov : theme::pal().btn_neutral_hov);
-        const bool mark = compact && !name.empty() && !in_on;
-        if (mark) ImGui::PushStyleColor(ImGuiCol_Text, theme::pal().text_info);
-        if (ImGui::SmallButton(lbl) && telemetry.simulator_mode) {
-            const bool sim_pin = ((telemetry.simulated_inputs_bitmask >> i) & 1U) != 0;
-            controller.setSimulatedInputPin(static_cast<uint8_t>(i + 1), !sim_pin);
-        }
-        if (mark) ImGui::PopStyleColor();
-        ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) {
-            std::string tip = "IN" + std::to_string(i + 1) + (in_on ? ": on\n" : ": off\n");
-            if (!input_uses[i].empty()) {
-                for (const auto& u : input_uses[i]) {
-                    tip += u.label + (u.invert ? " (active low)\n" : " (active high)\n");
-                }
-            } else if (!cfg.io.input_name[i].empty()) {
-                tip += "Custom input \"" + cfg.io.input_name[i] + "\"" + (cfg.io.input_invert[i] ? " (inverted)\n" : "\n");
-            } else {
-                tip += "Not used\n";
+        ImGui::SameLine(0.0f, 18.0f);
+        ImGui::TextDisabled("BOARD INPUTS:");
+        for (size_t i = 0; i < caps.io.size() && i < 64; ++i) {
+            const auto& pt = caps.io[i];
+            if (!board::isInput(pt)) continue;
+            ImGui::SameLine();
+            const bool in_on = ((telemetry.board_inputs_mask >> i) & 1ULL) != 0;
+            ImGui::PushStyleColor(ImGuiCol_Button, in_on ? theme::pal().btn_ok : theme::pal().btn_neutral);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, in_on ? theme::pal().btn_ok_hov : theme::pal().btn_neutral_hov);
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl), "%s##FwIn%zu", pt.label.c_str(), i);
+            ImGui::SmallButton(lbl);
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s: %s\nReported by the board (Pn:%c). Its polarity is set in the board's settings.",
+                                  pt.label.c_str(), in_on ? "active" : "not active", pt.status_letter ? pt.status_letter : '?');
             }
-            if (telemetry.simulator_mode) tip += "Click to simulate";
-            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    } else {
+        // Labels from the pin assignment: function or custom name per output / input (full text in the tooltips)
+        const core::MachineConfig cfg = *controller.getConfigShared();
+        const auto mode = cfg.operation_mode;
+        const auto input_uses = core::io::describeInputs(cfg);
+        std::array<std::string, core::kPhysicalOutputCount> out_names;
+        for (int pin = 1; pin <= core::kPhysicalOutputCount; ++pin) {
+            const int ch = core::io::channelForPin(cfg.io, pin);
+            out_names[pin - 1] = ch >= 0 ? core::io::channelShortName(ch, cfg.is_mill, mode) : cfg.io.output_name[pin - 1];
+        }
+        std::array<std::string, core::kInputCount> in_names;
+        for (int i = 0; i < core::kInputCount; ++i) {
+            in_names[i] = core::io::inputShortLabel(input_uses[i], cfg.io.input_name[i]);
+        }
+
+        // Full labels ("OUT1 Spindle", "IN5 Probe") when they fit next to the Diagnostics box, else pin numbers only
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const char* in_title = telemetry.simulator_mode ? "INPUTS (Click to Simulate):" : "INPUTS:";
+        auto pillW = [&](const std::string& text) { return ImGui::CalcTextSize(text.c_str()).x + st.FramePadding.x * 2.0f + st.ItemSpacing.x; };
+        float full_w = ImGui::CalcTextSize("OUTPUTS:").x + ImGui::CalcTextSize(in_title).x + 18.0f + 2.0f * st.ItemSpacing.x;
+        for (int pin = 1; pin <= core::kPhysicalOutputCount; ++pin) {
+            full_w += pillW("OUT" + std::to_string(pin) + (out_names[pin - 1].empty() ? "" : " " + out_names[pin - 1]));
+        }
+        for (int i = 0; i < core::kInputCount; ++i) {
+            full_w += pillW("IN" + std::to_string(i + 1) + (in_names[i].empty() ? "" : " " + in_names[i]));
+        }
+        const bool compact = full_w > ImGui::GetContentRegionAvail().x - 135.0f;
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("OUTPUTS:");
+        for (int pin = 1; pin <= core::kPhysicalOutputCount; ++pin) {
+            ImGui::SameLine();
+            const bool on = ((telemetry.physical_outputs_bitmask >> (pin - 1)) & 1U) != 0;
+            const std::string& name = out_names[pin - 1];
+            char lbl[64];
+            if (compact || name.empty()) {
+                std::snprintf(lbl, sizeof(lbl), "OUT%d##Out%d", pin, pin);
+            } else {
+                std::snprintf(lbl, sizeof(lbl), "OUT%d %s##Out%d", pin, name.c_str(), pin);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Button, on ? theme::pal().btn_warn : theme::pal().btn_neutral);
+            if (compact && !name.empty() && !on) ImGui::PushStyleColor(ImGuiCol_Text, theme::pal().text_info);
+            if (ImGui::SmallButton(lbl)) {
+                controller.setPhysicalOutput(static_cast<uint8_t>(pin), !on);
+            }
+            if (compact && !name.empty() && !on) ImGui::PopStyleColor();
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                const int ch = core::io::channelForPin(cfg.io, pin);
+                ImGui::SetTooltip("OUT%d: %s (%s)\nClick to switch it %s", pin,
+                                  ch >= 0 ? core::io::channelName(ch, cfg.is_mill, mode)
+                                          : (name.empty() ? "custom output, no name" : name.c_str()),
+                                  on ? "on" : "off", on ? "off" : "on");
+            }
+        }
+
+        ImGui::SameLine(0.0f, 18.0f);
+        ImGui::TextDisabled("%s", in_title);
+        for (int i = 0; i < core::kInputCount; ++i) {
+            ImGui::SameLine();
+            const bool in_on = ((telemetry.inputs_bitmask >> i) & 1U) != 0;
+            const std::string& name = in_names[i];
+            char lbl[64];
+            if (compact || name.empty()) {
+                std::snprintf(lbl, sizeof(lbl), "IN%d##In%d", i + 1, i + 1);
+            } else {
+                std::snprintf(lbl, sizeof(lbl), "IN%d %s##In%d", i + 1, name.c_str(), i + 1);
+            }
+            // Used inputs show their state in green; in compact mode an off but used input has blue text
+            ImGui::PushStyleColor(ImGuiCol_Button, in_on ? theme::pal().btn_ok : theme::pal().btn_neutral);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, in_on ? theme::pal().btn_ok_hov : theme::pal().btn_neutral_hov);
+            const bool mark = compact && !name.empty() && !in_on;
+            if (mark) ImGui::PushStyleColor(ImGuiCol_Text, theme::pal().text_info);
+            if (ImGui::SmallButton(lbl) && telemetry.simulator_mode) {
+                const bool sim_pin = ((telemetry.simulated_inputs_bitmask >> i) & 1U) != 0;
+                controller.setSimulatedInputPin(static_cast<uint8_t>(i + 1), !sim_pin);
+            }
+            if (mark) ImGui::PopStyleColor();
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) {
+                std::string tip = "IN" + std::to_string(i + 1) + (in_on ? ": on\n" : ": off\n");
+                if (!input_uses[i].empty()) {
+                    for (const auto& u : input_uses[i]) {
+                        tip += u.label + (u.invert ? " (active low)\n" : " (active high)\n");
+                    }
+                } else if (!cfg.io.input_name[i].empty()) {
+                    tip += "Custom input \"" + cfg.io.input_name[i] + "\"" + (cfg.io.input_invert[i] ? " (inverted)\n" : "\n");
+                } else {
+                    tip += "Not used\n";
+                }
+                if (telemetry.simulator_mode) tip += "Click to simulate";
+                ImGui::SetTooltip("%s", tip.c_str());
+            }
         }
     }
 
@@ -690,7 +768,7 @@ void IoStatusBar::renderBottomIoStrip(
         const double now = ImGui::GetTime();
         if (now - report_time > 1.0) { // Refreshed once a second: getProgram() / glGetString() are not free
             const auto program = controller.getProgram();
-            report = buildDiagnosticsReport(controller.getConfig(), telemetry,
+            report = buildDiagnosticsReport(*controller.getConfigShared(), telemetry,
                                             program->lines.size(), program->segments.size());
             report_time = now;
         }

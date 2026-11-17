@@ -1,5 +1,5 @@
 -- ============================================================================
--- RnRCncController - Plasma Laser Crosshair Offset Macro (laser_offset.lua)
+-- BreakoutCNC - Plasma Laser Crosshair Offset Macro (laser_offset.lua)
 -- Applies physical XY offset from laser crosshair pointer to plasma torch center
 -- ============================================================================
 

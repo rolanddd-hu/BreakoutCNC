@@ -5,8 +5,81 @@
 #include <cassert>
 #include <iomanip>
 #include <cmath>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 using namespace rnr;
+
+// In-memory RS-485 link: every request is answered with its own bytes (a valid frame with the same CRC), and every
+// request is recorded so a test can see what the driver sent
+struct FakeVfdLink {
+    std::mutex m;
+    std::vector<std::vector<uint8_t>> frames;
+    std::deque<uint8_t> rx;
+};
+
+class FakeVfdStream : public transport::IByteStream {
+public:
+    explicit FakeVfdStream(std::shared_ptr<FakeVfdLink> link) : link_(std::move(link)) {}
+    bool open(const transport::ConnectionTarget&, const transport::StreamOptions&, std::string*) override { open_ = true; return true; }
+    void close() override { open_ = false; }
+    bool isOpen() const override { return open_; }
+    long read(uint8_t* buf, size_t max, uint32_t timeout_ms) override {
+        std::lock_guard<std::mutex> lock(link_->m);
+        if (link_->rx.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min<uint32_t>(timeout_ms, 2)));
+            return 0;
+        }
+        size_t n = 0;
+        while (n < max && !link_->rx.empty()) { buf[n++] = link_->rx.front(); link_->rx.pop_front(); }
+        return static_cast<long>(n);
+    }
+    bool write(const uint8_t* data, size_t n) override {
+        std::lock_guard<std::mutex> lock(link_->m);
+        link_->frames.emplace_back(data, data + n);
+        link_->rx.insert(link_->rx.end(), data, data + n);
+        return true;
+    }
+    void flushInput() override { std::lock_guard<std::mutex> lock(link_->m); link_->rx.clear(); }
+    bool accessesRealHardware() const override { return false; }
+private:
+    std::shared_ptr<FakeVfdLink> link_;
+    bool open_ = false;
+};
+
+// Last run / stop control byte written (function 0x03), or -1
+int lastRunControl(FakeVfdLink& link) {
+    std::lock_guard<std::mutex> lock(link.m);
+    for (auto it = link.frames.rbegin(); it != link.frames.rend(); ++it) {
+        if (it->size() >= 4 && (*it)[1] == 0x03 && (*it)[2] == 0x01) return (*it)[3];
+    }
+    return -1;
+}
+
+// A2: switching the VFD off (or closing the app) while the spindle runs sends a stop command first
+void testStopSendsStopFrame() {
+    std::cout << "[TEST] Driver stop while the spindle runs sends a stop frame..." << std::endl;
+    auto link = std::make_shared<FakeVfdLink>();
+    HuanyangVfdController vfd;
+    vfd.setStreamFactory([link] { return std::make_unique<FakeVfdStream>(link); });
+    HuanyangVfdConfig cfg;
+    cfg.enabled = true;
+    cfg.port_name = "FAKE";
+    cfg.max_rpm = 24000;
+    cfg.min_rpm = 6000;
+    assert(vfd.start(cfg));
+    vfd.setRpm(12000);
+    vfd.setRun(true, false);
+    for (int i = 0; i < 200 && lastRunControl(*link) != 0x01; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(lastRunControl(*link) == 0x01);
+    vfd.stop();
+    assert(!vfd.isRunning());
+    assert(lastRunControl(*link) == 0x08);
+    std::cout << "  -> Stop frame sent before the driver ended." << std::endl;
+}
 
 void testCrcCalculation() {
     std::cout << "[TEST] Testing Modbus CRC-16 Calculation..." << std::endl;
@@ -170,6 +243,7 @@ int main() {
     testControllerConfiguration();
     testSpeedMonitor();
     testReadingLimitsAndParameters();
+    testStopSendsStopFrame();
 
     std::cout << "\nALL HUANYANG VFD TESTS PASSED SUCCESSFULLY!" << std::endl;
     return 0;
